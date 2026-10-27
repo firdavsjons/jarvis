@@ -4,6 +4,8 @@ import re
 import unicodedata
 from urllib.parse import urlparse
 
+from core import numbers
+
 DOMAIN_WORDS = {
     "youtube": "ютуб",
     "google": "гугл",
@@ -212,8 +214,12 @@ def prepare_for_speech(text):
     s = _PAREN_URL_RE.sub("", s)
     s = _URL_RE.sub(_replace_keeping_tail(url_for_speech), s)
     s = _PATH_RE.sub(_replace_keeping_tail(path_for_speech), s)
+    s, protected = numbers.protect(s)      # телефоны, версии, даты, время, дроби — цифрами (их читает say)
+    s = numbers.ranges_to_words(s)         # «10–12» -> «от 10 до 12» — до единиц: «до 12°C» в родительном
     s = units_for_speech(s)
     s = _FILE_NAME_RE.sub(lambda m: f"{m.group(1)} точка {extension_for_speech(m.group(2))}", s)
+    s = numbers.numbers_to_words(s)
+    s = numbers.restore(s, protected)
     s = _strip_emoji(s)
     s = _MD_CHARS_RE.sub(" ", s)
     s = _MD_UNDERSCORE_RE.sub(" ", s)

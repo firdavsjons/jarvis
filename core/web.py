@@ -507,10 +507,11 @@ def fetch_page(url, transport_factory=_safe_transport):
     без cookies, авторизации и прокси из окружения."""
     deadline = time.monotonic() + PAGE_TIMEOUT
     current = str(url).strip()
-    headers = {"User-Agent": page_user_agent(), "Accept": "text/html, text/plain;q=0.9",
-               "Accept-Encoding": "identity"}
     for hop in range(MAX_REDIRECTS + 1):
         check_page_url(current)
+        # User-Agent — заново на каждом шаге: контакт только если ЭТОТ адрес на домене Wikimedia
+        headers = {"User-Agent": page_user_agent(current), "Accept": "text/html, text/plain;q=0.9",
+                   "Accept-Encoding": "identity"}
         try:
             left = _remaining(deadline)
             # Таймаут чтения задаётся на весь запрос; короткий — чтобы одно зависшее чтение не съедало дедлайн
@@ -540,12 +541,17 @@ def fetch_page(url, transport_factory=_safe_transport):
     raise WebError(PAGE_FAILED, f"больше {MAX_REDIRECTS} перенаправлений")
 
 
-def page_user_agent():
-    """Сайты вроде Wikipedia требуют контакт в User-Agent (robot policy). PAGE_CONTACT — из .env пользователя."""
-    contact = env_value("PAGE_CONTACT")
+CONTACT_DOMAINS = ("wikipedia.org", "wikimedia.org", "wikidata.org")  # их robot policy требует контакт
+
+
+def page_user_agent(url=""):
+    """User-Agent для read_page. PAGE_CONTACT (из .env) — ТОЛЬКО для доменов Wikimedia; остальным — без контакта."""
     details = "personal macOS voice assistant, reads single pages on user request"
-    if contact and all(c.isprintable() and c not in "()\r\n" for c in contact) and len(contact) <= 100:
-        details += f"; {contact}"
+    host = (urlparse(str(url)).hostname or "").rstrip(".").lower()
+    if any(host == d or host.endswith("." + d) for d in CONTACT_DOMAINS):
+        contact = env_value("PAGE_CONTACT")
+        if contact and all(c.isprintable() and c not in "()\r\n" for c in contact) and len(contact) <= 100:
+            details += f"; {contact}"
     return f"JarvisMac/1.0 ({details}) python-httpx/{httpx.__version__}"
 
 

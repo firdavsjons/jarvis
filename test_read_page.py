@@ -138,7 +138,24 @@ class TestFetch(FetchCase):
         self.assertEqual(sent["accept-encoding"], "identity")
         self.assertNotIn("cookie", sent)
         self.assertNotIn("authorization", sent)
-        self.assertIn("me@example.org", sent["user-agent"])
+        self.assertNotIn("me@example.org", sent["user-agent"])  # контакт — только Википедии (5.2.1)
+
+    def test_contact_only_for_wikimedia(self):
+        contact = "me@example.org"  # тестовое значение, не настоящий PAGE_CONTACT
+        env = patch('core.web.env_value', side_effect=lambda name, default=None, path=None:
+                    contact if name == "PAGE_CONTACT" else default)
+        hops = {"example.com": "https://ru.wikipedia.org/wiki/X", "ru.wikipedia.org": None}
+        with env:
+            self.fetch(lambda r: httpx.Response(302, headers={"location": hops[r.url.host]})
+                       if hops.get(r.url.host) else html_response())
+        first, second = (r.headers["user-agent"] for r in self.requests)
+        self.assertNotIn(contact, first)   # example.com — без email
+        self.assertIn(contact, second)     # ru.wikipedia.org — с email
+        for host, has_contact in [("https://upload.wikimedia.org/a", True), ("https://www.wikidata.org/", True),
+                                  ("https://example.com/", False), ("https://wikipedia.org.evil.example/", False),
+                                  ("https://evilwikipedia.org/", False)]:
+            with env:
+                self.assertEqual(contact in web.page_user_agent(host), has_contact, host)
 
     def test_redirects(self):
         chain = {"/a": "/b", "/b": "https://other.example/c", "/c": "/d"}

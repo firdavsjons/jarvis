@@ -39,11 +39,11 @@ def defaults_only(name, default=None, path=None):
 class TestSigns(unittest.TestCase):
     def test_plus_minus(self):
         self.assertEqual(prepare_for_speech("Сейчас +16 градусов, ночью -3, утром −1."),
-                         "Сейчас плюс 16 градусов, ночью минус 3, утром минус 1.")
-        self.assertEqual(prepare_for_speech("от -2 до +5"), "от минус 2 до плюс 5")
+                         "Сейчас плюс шестнадцать градусов, ночью минус три, утром минус один.")
+        self.assertEqual(prepare_for_speech("от -2 до +5"), "от минус двух до плюс пяти")
 
     def test_not_in_dates_and_words(self):
-        for text in ["Дата 2026-10-27", "диапазон 10-12", "Wi-Fi", "COVID-19", "R2-D2", "счёт 3:2", "a+1"]:
+        for text in ["Дата 2026-10-27", "Wi-Fi", "COVID-19", "R2-D2", "счёт 3:2", "a+1"]:
             self.assertEqual(prepare_for_speech(text), text)
         print("✅ Плюс и минус: OK")
 

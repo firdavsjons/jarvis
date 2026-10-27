@@ -369,7 +369,7 @@ class TestInjectionGuard(unittest.TestCase):
         from core.tools import TOOLS
         descriptions = {t["function"]["name"]: t["function"]["description"] for t in TOOLS}
         for name in ["web_search", "get_weather", "get_exchange_rate", "read_page"]:
-            for phrase in ["по данным Open-Meteo", "числа и единицы — словами", "не нашёл — так и скажи"]:
+            for phrase in ["по данным Open-Meteo", "числа — цифрами", "не нашёл — так и скажи"]:
                 self.assertIn(phrase, descriptions[name], name)
         print("✅ Защита от внедрения инструкций: OK")
 

@@ -64,7 +64,7 @@ JSON_FORMAT = (
     '- list_memory {}; forget_memory {"query": "кофе"}; clear_memory {}\n'
     '- web_search {"query": "..."}; get_weather {"city": "Душанбе"}; get_exchange_rate {"base": "USD", "target": "TJS"}\n'
     '- read_page {"link_number": 1} — страница из последнего поиска\n'
-    "По данным из интернета: 1–3 фразы, источник словами, числа и единицы — словами, не придумывай.\n"
+    "По данным из интернета: 1–3 фразы, источник словами, числа — цифрами, не придумывай.\n"
     "Названия приложений — по-английски, как в macOS. Нельзя выполнить — actions пустой, объясни в response.\n"
     'Пример: {"response": "Открываю Safari.", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}\n'
     'Пример: {"response": "Системные файлы удалять нельзя.", "actions": []}'
