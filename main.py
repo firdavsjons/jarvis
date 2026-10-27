@@ -6,9 +6,10 @@ import tkinter as tk
 from threading import Thread, Lock, Timer, Event
 from dotenv import load_dotenv
 from core.engine import SpeechEngine
-from core.ai import LocalAIClient, describe_action, summarize_results
+from core.ai import AIClient, describe_action, summarize_results
 from core.journal import setup_journal
-from core.logger import setup_logging
+from core.llm import build_default_client
+from core.logger import LOG_DIR, setup_logging
 from core.speech_text import confirmation_question
 from modules.mac_control import MacControl
 
@@ -74,7 +75,7 @@ class VoiceApp:
         self.stop_btn.pack(pady=5)
 
         self.engine = SpeechEngine()
-        self.ai = LocalAIClient()
+        self.ai = AIClient(llm=build_default_client(usage_path=LOG_DIR / "llm_usage.json"))
         self.mac = MacControl()
         self.is_listening = False
         self.stop_event = Event()

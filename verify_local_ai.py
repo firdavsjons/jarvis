@@ -1,25 +1,24 @@
 import sys
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from core.ai import LocalAIClient
+from core.ai import AIClient
+from core.llm import NO_CONNECTION_REPLY, LLMResponse
 
 
-class TestLocalAIClient(unittest.TestCase):
-    def _client_with_reply(self, MockOpenAI, content):
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = content
-        MockOpenAI.return_value.chat.completions.create.return_value = mock_response
-        return LocalAIClient()
+class TestAIClientAsk(unittest.TestCase):
+    def _client_with_reply(self, response):
+        llm = MagicMock()
+        llm.chat.return_value = response
+        return AIClient(llm=llm), llm
 
-    @patch('openai.OpenAI')
-    def test_ask_success(self, MockOpenAI):
+    def test_ask_success(self):
         content = '{"response": "Открываю Safari.", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}'
-        client = self._client_with_reply(MockOpenAI, content)
+        client, llm = self._client_with_reply(LLMResponse(ok=True, text=content, provider="gemini"))
 
         response = client.ask("Открой Сафари")
 
@@ -27,32 +26,36 @@ class TestLocalAIClient(unittest.TestCase):
             "response": "Открываю Safari.",
             "actions": [{"name": "open_app", "args": {"app": "Safari"}}],
         })
+        messages = llm.chat.call_args.args[0]
+        self.assertEqual([m["role"] for m in messages], ["system", "user"])
+        self.assertEqual(messages[1]["content"], "Открой Сафари")
         print("\n✅ Test ask success: Passed")
 
-    @patch('openai.OpenAI')
-    def test_ask_plain_text(self, MockOpenAI):
+    def test_ask_plain_text(self):
         # Модель ответила не JSON — текст становится response, действий нет
-        client = self._client_with_reply(MockOpenAI, "Привет! Я работаю.")
+        client, _ = self._client_with_reply(LLMResponse(ok=True, text="Привет! Я работаю."))
 
         response = client.ask("Привет")
 
         self.assertEqual(response, {"response": "Привет! Я работаю.", "actions": []})
         print("\n✅ Test plain text: Passed")
 
-    @patch('openai.OpenAI')
-    def test_ask_connection_error(self, MockOpenAI):
-        import openai
-        # Mocking the client to raise ConnectionError
-        mock_client_instance = MockOpenAI.return_value
-        mock_client_instance.chat.completions.create.side_effect = openai.APIConnectionError(request=MagicMock())
+    def test_ask_all_providers_down(self):
+        client, _ = self._client_with_reply(LLMResponse(ok=False, text=NO_CONNECTION_REPLY))
 
-        client = LocalAIClient()
         response = client.ask("Привет")
 
-        self.assertIsInstance(response, dict)
+        self.assertEqual(response, {"response": NO_CONNECTION_REPLY, "actions": []})
+        print("\n✅ Test all providers down: Passed")
+
+    def test_ask_unexpected_exception(self):
+        llm = MagicMock()
+        llm.chat.side_effect = RuntimeError("boom")
+        response = AIClient(llm=llm).ask("Привет")
+
         self.assertEqual(response["actions"], [])
-        self.assertIn("LM Studio", response["response"])
-        print("\n✅ Test connection error: Passed")
+        self.assertIn("ошибка", response["response"])
+        print("\n✅ Test unexpected exception: Passed")
 
 
 if __name__ == '__main__':

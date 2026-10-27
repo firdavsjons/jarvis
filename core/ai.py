@@ -1,4 +1,3 @@
-import openai
 import logging
 import subprocess
 import json
@@ -8,6 +7,7 @@ import unicodedata
 from urllib.parse import urlparse
 
 from core import installed_apps, journal, safety
+from core.llm import build_default_client
 
 log = logging.getLogger(__name__)
 
@@ -175,14 +175,10 @@ def summarize_results(results):
     return True, " ".join(r["speech"] for r in results if r["speech"])
 
 
-class LocalAIClient:
-    def __init__(self):
-        # Конфигурация для LM Studio
-        self.client = openai.OpenAI(
-            base_url="http://localhost:1234/v1",
-            api_key="lm-studio"
-        )
-        self.model_name = "local-model"
+class AIClient:
+    def __init__(self, llm=None):
+        # Провайдеры (Gemini → Groq → LM Studio) с запасными вариантами — core/llm, настройки из .env
+        self.llm = llm if llm is not None else build_default_client()
 
         # Системный промпт для JSON
         self.system_prompt = (
@@ -230,23 +226,19 @@ class LocalAIClient:
         )
 
     def ask(self, text):
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": text},
+        ]
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": text}
-                ],
-                temperature=0.3, # Меньше креативности, больше точности
-            )
-            content = response.choices[0].message.content
-            return self._parse_json(content)
-        except openai.APIConnectionError:
-            log.error("❌ Ошибка: Не удалось подключиться к LM Studio.")
-            return {"response": "Ошибка: Локальный сервер Gemma не запущен. Пожалуйста, запустите LM Studio.", "actions": []}
+            response = self.llm.chat(messages)
         except Exception as e:
-            log.error("❌ Ошибка запроса к AI: %s", e)
+            log.error("❌ Ошибка запроса к AI: %s", type(e).__name__)
             return {"response": "Произошла ошибка при обращении к нейросети.", "actions": []}
+        if not response.ok:
+            # Все провайдеры недоступны: фраза для голоса, без действий
+            return {"response": response.text, "actions": []}
+        return self._parse_json(response.text)
 
     def _parse_json(self, content):
         """Пытается извлечь и распарсить JSON из ответа модели."""

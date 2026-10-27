@@ -3,13 +3,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core import installed_apps
-from core.ai import LocalAIClient
+from core.ai import AIClient
 from core.safety import SAFE, classify
 from fixtures_apps import patch_installed
 
@@ -143,7 +143,7 @@ class TestAppActions(unittest.TestCase):
         self.addCleanup(run.stop)
         self.mock_run.return_value.returncode = 0
         with patch('openai.OpenAI'):
-            self.client = LocalAIClient()
+            self.client = AIClient(llm=MagicMock())
 
     def test_read_actions_are_safe(self):
         self.assertEqual(classify({"name": "find_apps", "args": {"query": "tele"}})[0], SAFE)

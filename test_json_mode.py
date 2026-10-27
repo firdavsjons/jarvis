@@ -1,12 +1,12 @@
 import sys
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from core.ai import LocalAIClient
+from core.ai import AIClient
 from fixtures_apps import patch_installed
 from main import parse_confirmation
 
@@ -24,7 +24,7 @@ def tearDownModule():
 class TestLocalAIActions(unittest.TestCase):
     def setUp(self):
         with patch('openai.OpenAI'):
-            self.client = LocalAIClient()
+            self.client = AIClient(llm=MagicMock())
 
     def test_parse_json(self):
         json_response = '{"response": "OK", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}'

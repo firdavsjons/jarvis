@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from core.ai import LocalAIClient
+from core.ai import AIClient
 from core.engine import SpeechEngine, pick_voice, say_command
 from main import normalize_ai_response, parse_confirmation
 
@@ -55,7 +55,7 @@ class TestNormalizeAIResponse(unittest.TestCase):
 
     def test_bad_actions_become_empty_after_split(self):
         with patch('openai.OpenAI'):
-            client = LocalAIClient()
+            client = AIClient(llm=MagicMock())
         _, actions = normalize_ai_response({"response": "Ок", "actions": "rm -rf ~"})
         self.assertEqual(client.split_actions(actions), ([], [], []))
         print("✅ normalize_ai_response: OK")

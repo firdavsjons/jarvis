@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core import journal, safety
-from core.ai import ACTIONS, LocalAIClient
+from core.ai import ACTIONS, AIClient
 from core.safety import BLOCKED, CONFIRM, SAFE, classify, classify_path, classify_url
 from fixtures_apps import patch_installed
 import main
@@ -164,7 +164,7 @@ class TestExecution(FakeHomeMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
         with patch('openai.OpenAI'):
-            self.client = LocalAIClient()
+            self.client = AIClient(llm=MagicMock())
         self.home_patch = patch('core.safety.home_dir', return_value=self.home)
         self.home_patch.start()
 
@@ -222,7 +222,7 @@ class TestJournal(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         journal.setup_journal(Path(self._tmp.name) / "actions.jsonl")
         with patch('openai.OpenAI'):
-            self.client = LocalAIClient()
+            self.client = AIClient(llm=MagicMock())
 
     def tearDown(self):
         journal.JOURNAL_FILE = None
@@ -268,7 +268,7 @@ class TestBlockedReply(unittest.TestCase):
 
     def make_app(self, ai_reply):
         with patch('openai.OpenAI'):
-            client = LocalAIClient()
+            client = AIClient(llm=MagicMock())
         client.ask = MagicMock(return_value=ai_reply)
         app = MagicMock()
         app.ai = client

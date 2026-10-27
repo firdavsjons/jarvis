@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Голосовой и текстовый ассистент для macOS (MacBook M1). Python + Tkinter, распознавание речи через SpeechRecognition, озвучка через системную команду `say`, «мозг» — локальная LLM в LM Studio (OpenAI-совместимый API).
+Голосовой и текстовый ассистент для macOS (MacBook M1). Python + Tkinter, распознавание речи через SpeechRecognition, озвучка через системную команду `say`, «мозг» — облачные LLM (Gemini, Groq) с запасным вариантом — локальная модель в LM Studio (все через OpenAI-совместимый API, `core/llm/`).
 
 ## Как устроен поток команды
 
@@ -14,8 +14,10 @@ VoiceApp.process_command            (main.py)
         │     жёсткие команды по ключевым словам: громкость, mute, браузер, Spotify, калькулятор
         │     вернул строку → озвучить и выйти
         │
-        └─► LocalAIClient.ask(text)    (core/ai.py)
-              LM Studio http://localhost:1234/v1, модель "local-model"
+        └─► AIClient.ask(text)         (core/ai.py)
+              llm.chat → FallbackClient (core/llm): gemini → groq → local из LLM_PROVIDERS;
+              ошибка/429/таймаут 15 с → следующий, упавший на паузе 60 с; ≥90% дневного лимита — пропуск;
+              все упали → «Нет связи с моделью…» без исключения
               ответ — JSON {"response": "...", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}
               │
               └─ actions  → split_actions → safety.classify (core/safety.py)
@@ -32,8 +34,9 @@ VoiceApp.process_command            (main.py)
 
 - `main.py` — окно Tkinter (`VoiceApp`), очередь обновлений окна `ui_queue` + `poll_ui`, цикл прослушивания `background_loop` (Старт/Стоп через `stop_event`), подтверждение команд, `normalize_ai_response`.
 - `core/engine.py` — `SpeechEngine`: STT через `recognize_google` (ru-RU, онлайн), калибровка шума `calibrate()` один раз при старте; TTS через `say` (голос Milena или другой ru_RU, `pick_voice`), прерывание `stop_speaking()`, флаг `speaking`.
-- `core/logger.py` — `setup_logging()`: лог в консоль и в `~/Library/Logs/Jarvis/jarvis.log`.
-- `core/ai.py` — белый список действий `ACTIONS` (`open_app`, `quit_app`, `set_volume`, `open_url`, `trash_file`) и `LocalAIClient`: системный промпт, запрос к LM Studio, парсинг JSON, `split_actions` / `execute_actions` / `reject_actions`.
+- `core/logger.py` — `setup_logging()`: лог в консоль и в `~/Library/Logs/Jarvis/jarvis.log`; `SecretFilter` / `register_secret` / `redact_secrets` — ключи API заменяются на `***` в любом сообщении и трассировке.
+- `core/llm/` — слой LLM: `base.py` (`LLMClient`, `LLMResponse`, `describe_error`), `providers.py` (`load_config` — только файл `.env`, `OpenAICompatProvider`, `build_providers`), `router.py` (`FallbackClient`, `build_default_client`), `usage.py` (`UsageTracker`, `llm_usage.json`, сутки Gemini — по тихоокеанскому времени), `check.py` (проверка связи).
+- `core/ai.py` — белый список действий `ACTIONS` (`open_app`, `quit_app`, `set_volume`, `open_url`, `trash_file`) и `AIClient(llm)`: системный промпт, запрос через `core/llm`, парсинг JSON, `split_actions` / `execute_actions` / `reject_actions`.
 - `core/safety.py` — уровни риска: `classify(action)`, `classify_path` (только внутри дома, без `~/Library` и скрытых файлов верхнего уровня), `classify_url` (по `trusted_domains.txt`), `CAREFUL_APPS`.
 - `core/journal.py` — журнал действий `actions.jsonl`, `redact()` скрывает пароли и токены. Включается `setup_journal()` только при запуске `main.py`.
 - `core/speech_text.py` — `prepare_for_speech` (вызывается в `speak`: ссылки → «ютуб точка ком», пути → «отчёт точка тэ-экс-тэ, с рабочего стола», без Markdown и эмодзи) и короткие вопросы `confirmation_question`.
@@ -48,14 +51,17 @@ VoiceApp.process_command            (main.py)
 - `test_speech_text.py` — `prepare_for_speech` и вопросы подтверждения.
 - `test_installed_apps.py` — поиск приложений на временной папке с `*.app`, `find_apps` / `list_apps`.
 - `fixtures_apps.py` — `patch_installed()`: фиксированный список «установленных» приложений для тестов (не `test*.py`, поэтому не запускается сам).
-- `verify_local_ai.py` — `LocalAIClient.ask` возвращает dict (успех, не-JSON ответ, нет связи с LM Studio).
+- `verify_local_ai.py` — `AIClient.ask` возвращает dict (успех, не-JSON ответ, все провайдеры недоступны, исключение).
+- `test_llm.py` — цепочка провайдеров (429, таймаут, 5xx, 401/404, пустой ответ), пауза 60 с, лимиты, чтение `.env`, ключи не утекают (без сети).
 
 ## Запуск
 
 ```bash
 brew install portaudio          # нужен для pyaudio
 pip install -r requirements.txt
-# LM Studio: загрузить модель → Developer → Start Server (порт 1234)
+cp .env.example .env            # вписать GEMINI_API_KEY и GROQ_API_KEY
+python -m core.llm.check        # связь с провайдерами (--models — список моделей, --provider groq — один)
+# LM Studio (запасной вариант): загрузить модель → Developer → Start Server (порт 1234)
 python main.py
 ```
 
@@ -83,7 +89,7 @@ python -m unittest verify_local_ai.py # не подходит под шабло�
 - **Логирование.** `logging.getLogger(__name__)`, не `print`. `setup_logging()` вызывается только в `main.py` при запуске.
 - **Сопоставление слов.** В `MacControl` и при подтверждении («да»/«нет») сравнивать целые слова, а не подстроки: `"да" in text` срабатывает на «когда», «надо».
 - **Язык.** Интерфейс, ответы ассистента, системный промпт и комментарии — на русском.
-- **Конфигурация и секреты.** Настройки читаются из `.env` через `python-dotenv`. `.env` не коммитить.
+- **Конфигурация и секреты.** Настройки LLM читаются только из файла `.env` (`dotenv_values`, не из окружения терминала); имена переменных и значения по умолчанию — в `.env.example` (ключи там пустые). Ключи никогда не печатать: ни в консоль, ни в лог, ни в журнал, ни в тесты, ни в сообщения об ошибках — в лог пишется только `describe_error` (класс и HTTP-код). Новый секрет — через `register_secret`. `.env` не коммитить; перед коммитом проверять diff на значения ключей.
 
 ## План проекта
 
