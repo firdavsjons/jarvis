@@ -9,6 +9,7 @@ from core.engine import SpeechEngine
 from core.ai import BLOCKED_REPLY, AIClient, describe_action, normalize_ai_response, summarize_results
 from core.cache import CACHE_FILE, CLEARED_REPLY, CommandCache, is_forget_cache_command
 from core.history import FORGET_REPLY, is_forget_command
+from core.links import parse_link_command
 from core.memory import MEMORY_FILE, UserMemory, is_clear_memory_command
 from core.journal import setup_journal
 from core.llm import build_default_client
@@ -68,6 +69,8 @@ class VoiceApp:
         self.engine = SpeechEngine()
         self.ai = AIClient(llm=build_default_client(usage_path=LOG_DIR / "llm_usage.json"),
                            memory=UserMemory(MEMORY_FILE), cache=CommandCache(CACHE_FILE))
+        # «Секунду, ищу.» — из таймера, параллельно с медленным веб-инструментом
+        self.ai.on_slow_tool = self.engine.speak
         self.mac = MacControl()
         self.is_listening = False
         self.stop_event = Event()
@@ -242,6 +245,12 @@ class VoiceApp:
             self.ask_confirmation(pending, text)
             return
 
+        # «Открой первую ссылку» — адрес из сохранённого результата поиска, не от модели
+        link_number = parse_link_command(text)
+        if link_number is not None:
+            self.deliver(self.ai.open_search_link(link_number, text), text)
+            return
+
         # 2. Проверяем жесткие системные команды (громкость и т.д.)
         sys_response = self.mac.execute(text)
         if sys_response:
@@ -251,8 +260,10 @@ class VoiceApp:
 
         # 3. Модель: инструменты (или JSON у моделей без них) — решение и честный текст строит ai.respond
         self.update_status("Думаю...", "blue")
-        turn = self.ai.respond(text)
+        self.deliver(self.ai.respond(text), text)
 
+    def deliver(self, turn, text):
+        """Озвучить итог Turn: отказ, результаты, вопрос на подтверждение."""
         if turn.blocked:
             self.update_log("⛔ Отклонено: " + ", ".join(describe_action(a) if isinstance(a, dict) else str(a)
                                                           for a in turn.blocked))

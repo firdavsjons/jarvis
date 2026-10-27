@@ -76,6 +76,7 @@ class TestWithoutInternet(unittest.TestCase):
         self.app.mac = MacControl()
         self.app.has_pending.return_value = False
         self.app.report_result = lambda results: main.VoiceApp.report_result(self.app, results)
+        self.app.deliver = lambda turn, text: main.VoiceApp.deliver(self.app, turn, text)
 
     def say(self, text):
         self.app.engine.speak.reset_mock()

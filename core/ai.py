@@ -3,13 +3,16 @@ import subprocess
 import json
 import re
 import os
+import threading
 import unicodedata
 from dataclasses import dataclass, field
+from functools import partial
 from urllib.parse import urlparse
 
 from core import installed_apps, journal, prompts, safety, web
 from core.cache import cacheable_actions
 from core.history import ConversationHistory
+from core.links import NO_LINK_REPLY, SearchLinks
 from core.memory import SECRET_REFUSAL, MemoryRefused, UserMemory, asked_to_remember, contains_secret
 from core.llm import build_default_client
 from core.speech_text import confirmation_question, url_for_speech
@@ -40,6 +43,9 @@ WEB_ACTIONS = {"web_search", "get_weather", "get_exchange_rate"}
 RESTRICTED_AFTER_WEB = {"remember", "remember_alias", "forget_memory", "clear_memory", "open_url", "trash_file",
                         "quit_app"}
 WEB_RESTRICTED_SHORT = "в ответе были данные из интернета"
+WEB_REFUSAL_REPLY = "Ссылки из поиска я без вашей команды не открываю. Скажите: открой первую ссылку."
+SLOW_TOOL_REPLY = "Секунду, ищу."
+SLOW_TOOL_AFTER = 2.0  # веб-инструмент дольше — «Секунду, ищу.» (один раз за фразу, не блокируя инструмент)
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
@@ -61,11 +67,12 @@ class Done:
     """Результат действия: message — в лог и окно, speech — сказать пользователю (для действий-чтений),
     for_model — что вернуть модели (если короче окна), web — данные из интернета (не инструкции)."""
 
-    def __init__(self, message, speech=None, for_model=None, web=False):
+    def __init__(self, message, speech=None, for_model=None, web=False, links=()):
         self.message = message
         self.speech = speech
         self.for_model = for_model
         self.web = web
+        self.links = list(links)  # ссылки результата поиска — для «открой первую ссылку»
 
 
 def _run(args):
@@ -179,11 +186,13 @@ def _web(call, *args):
         raise ActionError(str(e), e.short)
 
 
-def web_search(query):
-    """Только чтение: поиск в интернете (ddgs). Модели — сжато, в окно — со ссылками."""
-    for_model, window = _web(web.search, query)
+def web_search(query, news_hint=False):
+    """Только чтение: поиск в интернете (ddgs). Новостной запрос (по фразе пользователя или запросу) —
+    сначала новости. Модели — сжато и без ссылок, в окно — со ссылками."""
+    news = news_hint or web.is_news_request(query)
+    for_model, window, links = _web(web.search, query, news)
     first = for_model.split("\n", 1)[0].split(". ", 1)[-1]
-    return Done(f"Поиск «{query}»:\n{window}", f"Нашёл: {first}", for_model=for_model, web=True)
+    return Done(f"Поиск «{query}»:\n{window}", f"Нашёл: {first}", for_model=for_model, web=True, links=links)
 
 
 def get_weather(city=None):
@@ -302,6 +311,9 @@ class AIClient:
         self.memory.on_change = self._memory_changed
         installed_apps.set_user_aliases(self.memory.aliases)
         self.cache = cache  # None — кэш команд выключен (тесты); в приложении — CommandCache с файлом
+        self.links = SearchLinks()  # ссылки последнего поиска — только в памяти процесса
+        self.on_slow_tool = None    # callback(фраза) — main озвучивает «Секунду, ищу.»
+        self._slow_said = threading.Event()
 
     def _memory_changed(self, aliases_changed):
         installed_apps.set_user_aliases(self.memory.aliases)
@@ -325,6 +337,7 @@ class AIClient:
 
     def respond(self, text):
         """Фраза пользователя -> Turn. Сначала кэш команд; иначе модель (инструменты или режим JSON)."""
+        self._slow_said.clear()  # «Секунду, ищу.» — не больше одного раза за фразу
         turn = self._from_cache(text)
         if turn is None:
             turn = self._respond_model(text)
@@ -413,12 +426,12 @@ class AIClient:
             # ссылки, удаление и закрытие: текст из интернета мог подсказать модели такие вызовы
             web_seen = web_seen or any(a and a.get("name") in WEB_ACTIONS for _, a, _ in calls)
             if web_seen and any(a and a.get("name") in RESTRICTED_AFTER_WEB for _, a, _ in calls):
-                self.reject_actions([a for _, a, _ in calls if a and a.get("name") in RESTRICTED_AFTER_WEB],
-                                    text, WEB_RESTRICTED_SHORT)
-                calls = [(c, None, WEB_RESTRICTED_SHORT) if a and a.get("name") in RESTRICTED_AFTER_WEB else (c, a, e)
-                         for c, a, e in calls]
-                actions = [a for _, a, _ in calls if a is not None]
-                safe, confirm, _ = self.split_actions(actions, phrase=text)
+                # Модели причину не отдаём и больше её не спрашиваем: полученные данные + готовая фраза
+                restricted = [a for _, a, _ in calls if a and a.get("name") in RESTRICTED_AFTER_WEB]
+                self.reject_actions(restricted, text, WEB_RESTRICTED_SHORT)
+                allowed, _, _ = self.split_actions([a for a in actions if a not in restricted], phrase=text)
+                executed += self.run_actions(allowed, phrase=text)
+                return self._finish(text, self._web_refusal_turn(executed))
             if confirm:
                 # SAFE — сейчас, CONFIRM — после «да»; модели ничего не возвращаем, пока пользователь не ответит
                 results = self.run_actions(safe, phrase=text)
@@ -482,8 +495,7 @@ class AIClient:
             restricted = [a for a in actions if isinstance(a, dict) and a.get("name") in RESTRICTED_AFTER_WEB]
             if restricted:
                 self.reject_actions(restricted, text, WEB_RESTRICTED_SHORT)
-                safe = [a for a in safe if a not in restricted]
-                confirm = [a for a in confirm if a not in restricted]
+                return self._web_refusal_turn(self.run_actions([a for a in safe if a not in restricted], phrase=text))
         if not safe:
             if not confirm and not actions and _PROMISE_RE.search(response_text):
                 return Turn(PROMISE_FAIL_REPLY)  # «Открываю Safari» без единого действия
@@ -553,6 +565,33 @@ class AIClient:
             return Done(message, speech)
         return run
 
+    def _say_slow(self):
+        if self.on_slow_tool and not self._slow_said.is_set():
+            self._slow_said.set()
+            self.on_slow_tool(SLOW_TOOL_REPLY)
+
+    def _web_refusal_turn(self, executed):
+        """Запрещённое действие после веб-данных: уже полученные данные + готовая фраза, без модели."""
+        data = " ".join(r["speech"] for r in executed if r.get("ok") and r.get("web") and r.get("speech"))
+        return Turn(" ".join(p for p in [data, WEB_REFUSAL_REPLY] if p), results=executed)
+
+    def open_search_link(self, number, phrase):
+        """«Открой N-ю ссылку»: адрес — из сохранённого результата поиска, не от модели. Дальше обычный путь:
+        classify (доверенный — SAFE, иначе CONFIRM «Открыть сайт …?»), журнал, open_url."""
+        url = self.links.get(number)
+        if url is None:
+            return self._finish(phrase, Turn(NO_LINK_REPLY))
+        action = {"name": "open_url", "args": {"url": url}}
+        level, _ = safety.classify(action)
+        if level == safety.BLOCKED:
+            self.reject_actions([action], phrase, "ссылка из поиска")
+            return self._finish(phrase, Turn(BLOCKED_REPLY, blocked=[action]))
+        if level == safety.CONFIRM:
+            return self._finish(phrase, Turn(pending=[action]))
+        results = self.run_actions([action], phrase=phrase)
+        ok, summary = summarize_results(results)
+        return self._finish(phrase, Turn(template_speech(results) if ok else summary, results=results))
+
     def split_actions(self, actions, phrase=None):
         """Делит действия по уровню риска: (SAFE, CONFIRM, BLOCKED).
 
@@ -606,19 +645,31 @@ class AIClient:
             else:
                 func = self._memory_action(action["name"], phrase, confirmed) if action["name"] in MEMORY_ACTIONS \
                     else ACTIONS[action["name"]]
+                if action["name"] == "web_search":
+                    # Новостной запрос узнаём и по РЕАЛЬНОЙ фразе пользователя: модель могла переформулировать
+                    func = partial(func, news_hint=web.is_news_request(phrase))
                 args = action.get("args") or {}
                 log.info("▶ Действие: %s %s", action["name"], args)
+                slow = threading.Timer(SLOW_TOOL_AFTER, self._say_slow) if action["name"] in WEB_ACTIONS else None
                 try:
                     if not isinstance(args, dict):
                         raise ActionError(f"args должен быть объектом: {args!r}", "неверные параметры")
+                    if slow:
+                        slow.daemon = True
+                        slow.start()
                     out = func(**args)
                     done = out if isinstance(out, Done) else Done(out)
                     ok, message, speech = True, f"✅ {done.message}", done.speech
                     result_text, web_data = done.for_model or done.message, done.web
+                    if done.links:
+                        self.links.store(done.links)
                 except TypeError as e:
                     message, short = f"⛔ Отклонено (неверные аргументы): {action} — {e}", "неверные параметры"
                 except ActionError as e:
                     message, short, reply = f"⛔ Отклонено: {action} — {e}", e.short, e.reply
+                finally:
+                    if slow:
+                        slow.cancel()
 
             results.append({"action": action, "level": level, "ok": ok, "message": message,
                             "short": short, "speech": speech, "result": result_text, "reply": reply,

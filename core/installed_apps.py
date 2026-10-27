@@ -20,7 +20,8 @@ EXTRA_APPS = ["/System/Library/CoreServices/Finder.app"]  # Finder не лежи
 CACHE_SECONDS = 600
 FUZZY_CUTOFF = 0.75   # resolve_app_name: только уверенные совпадения
 FUZZY_MARGIN = 0.05   # и лучший вариант должен опережать второй хотя бы на столько
-SEARCH_CUTOFF = 0.6   # find_apps: поиск может быть мягче
+SEARCH_CUTOFF = 0.75  # find_apps: тот же порог, что и при открытии (apple не находит AppCleaner и Sapphire)
+MIN_PREFIX = 4        # начало слова засчитывается, только если запрос не короче 4 символов («sap» — нет)
 FIND_LIMIT = 10
 LIST_LIMIT = 30
 
@@ -134,15 +135,23 @@ def resolve_app_name(name, use_user_aliases=True):
 
 
 def find_apps(query, limit=FIND_LIMIT):
-    """До limit установленных приложений, похожих на запрос: точные, по слову/подстроке, нечёткие."""
+    """До limit установленных приложений, похожих на запрос.
+
+    Засчитывается: точное совпадение (и через словарь), запрос равен слову названия («chrome» — Google Chrome),
+    запрос от 4 символов — начало слова или всего названия («tele» — Telegram), нечёткое сходство ≥ 0.75.
+    Подстрока в середине слова не считается: «apple» не находит AppCleaner и Sapphire."""
     query = query.strip()
     keys = {query.casefold(), resolve_app(query).casefold()}
     scored = []
     for app in list_installed_apps():
         key = app.casefold()
+        app_words = re.findall(r"\w+", key)
         if key in keys:
             score = 3.0
-        elif any(k in key or _words(k) & _words(key) for k in keys):
+        elif any(_words(k) and _words(k) <= set(app_words) for k in keys):
+            score = 2.5
+        elif any(len(k) >= MIN_PREFIX and (key.startswith(k) or any(w.startswith(k) for w in app_words))
+                 for k in keys):
             score = 2.0
         else:
             score = max(difflib.SequenceMatcher(None, k, key).ratio() for k in keys)

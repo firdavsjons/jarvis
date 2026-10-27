@@ -9,6 +9,8 @@ import time
 import unicodedata
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from threading import Lock
 from urllib.parse import urlparse
 
@@ -230,7 +232,23 @@ def exchange_rate(base, target):
     return _clip(f"1 {base} = {_format_rate(rate)} {target}{when}, по данным {name}.", MAX_RATE_CHARS)
 
 
-# --- Поиск (ddgs) ---
+# --- Поиск и новости (ddgs) ---
+
+SEARCH_BACKEND = "duckduckgo"  # живой замер 5.1.1 на «погода Душанбе»: 2,6 с (yandex 2,9, bing 6,1, остальные — ошибка)
+NEWS_BACKEND = "bing"          # живой замер 5.1.1 на «новости Душанбе»: 0,8 с (duckduckgo 1,8, yahoo — ошибка)
+SEARCH_TIMEOUT = 8             # на весь вызов ddgs, а не на каждый его запрос
+SEARCH_SLOW = "поиск не успел ответить"
+NEWS_TITLE_CHARS = 100
+NEWS_SNIPPET_CHARS = 150
+NEWS_WORDS_RE = re.compile(r"(?<!\w)(новост\w*|что случилось|что происходит)(?!\w)", re.IGNORECASE)
+
+logging.getLogger("primp").setLevel(logging.WARNING)  # шумные INFO-логи HTTP-клиента ddgs
+_search_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ddgs")
+
+
+def is_news_request(text):
+    return bool(NEWS_WORDS_RE.search(str(text or "")))
+
 
 def _domain(url):
     try:
@@ -240,21 +258,93 @@ def _domain(url):
     return host[4:] if host.startswith("www.") else host
 
 
-def _search_raw(query):
+def _ddgs_call(kind, query):
+    """Один поисковик и общий таймаут на весь вызов. Поток Python не прервать: при превышении он
+    доработает в фоне, но его результат выбрасывается."""
     try:
         from ddgs import DDGS
     except ImportError:
         raise WebError(SEARCH_FAILED, "ddgs не установлен")
+    backend = env_value("NEWS_BACKEND" if kind == "news" else "SEARCH_BACKEND",
+                        NEWS_BACKEND if kind == "news" else SEARCH_BACKEND)
+    future = _search_pool.submit(lambda: getattr(DDGS(timeout=TIMEOUT), kind)(
+        query, region="ru-ru", safesearch="on", max_results=SEARCH_RESULTS, backend=backend))
     try:
-        return list(DDGS(timeout=TIMEOUT).text(query, region="ru-ru", safesearch="on",
-                                               max_results=SEARCH_RESULTS) or [])
+        return list(future.result(timeout=SEARCH_TIMEOUT) or [])
+    except FutureTimeout:
+        future.cancel()
+        raise WebError(SEARCH_SLOW, f"{kind}: больше {SEARCH_TIMEOUT} с")
     except Exception as e:  # сеть, блокировка, капча, изменения на стороне поисковика
         raise WebError(SEARCH_FAILED, type(e).__name__)
 
 
-def search(query):
-    """-> (сжато для модели ≤1200 символов, подробно для окна со ссылками)."""
+def _search_raw(query):
+    return _ddgs_call("text", query)
+
+
+def _news_raw(query):
+    return _ddgs_call("news", query)
+
+
+def news_date(value, now=None):
+    """ISO или Unix-время -> «сегодня», «вчера», «27 октября»; непонятное — как есть, коротко."""
+    now = now or datetime.now().astimezone()
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            when = datetime.fromtimestamp(float(value)).astimezone()
+        else:
+            when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            when = when.astimezone() if when.tzinfo else when.replace(tzinfo=now.tzinfo)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return _clip(value, 20)
+    days = (now.date() - when.date()).days
+    if days == 0:
+        return "сегодня"
+    if days == 1:
+        return "вчера"
+    months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября",
+              "ноября", "декабря"]
+    return f"{when.day} {months[when.month - 1]}"
+
+
+def _join_limited(lines):
+    out = []
+    for line in lines:
+        if len("\n".join(out + [line])) > MAX_SEARCH_CHARS:
+            break
+        out.append(line)
+    return "\n".join(out)  # строки обрезаны по отдельности; _clip тут склеил бы пункты в одну строку
+
+
+def _news_items(query):
+    try:
+        raw = _news_raw(query)
+    except WebError as e:
+        log.info("Новости недоступны (%s), обычный поиск", e)
+        return []
+    items = []
+    for r in raw[:SEARCH_RESULTS]:
+        if isinstance(r, dict) and r.get("title"):
+            items.append((_clip(r.get("title"), NEWS_TITLE_CHARS), _clip(r.get("source") or _domain(r.get("url")), 40),
+                          news_date(r.get("date")), _clip(r.get("body"), NEWS_SNIPPET_CHARS), str(r.get("url") or "")))
+    return items
+
+
+def search(query, news=False):
+    """-> (сжато для модели ≤1200 символов без ссылок, подробно для окна со ссылками, до 5 ссылок).
+
+    news=True — сначала ddgs.news(): «Заголовок — источник, сегодня — фрагмент»; нет новостей — обычный поиск."""
     query = _check_text(query, MAX_QUERY_CHARS, "запрос")
+    if news:
+        items = _news_items(query)
+        if items:
+            for_model = _join_limited(
+                [f"{i}. {title} — {source}, {date}" + (f" — {snippet}" if snippet else "")
+                 for i, (title, source, date, snippet, _) in enumerate(items, 1)])
+            window = "\n".join(f"{i}. {title} ({source}, {date})\n   {url}"
+                               for i, (title, source, date, _, url) in enumerate(items, 1))
+            return for_model, window, [url for *_, url in items if url]
+
     items = []
     for r in _search_raw(query)[:SEARCH_RESULTS]:
         if not isinstance(r, dict):
@@ -264,14 +354,7 @@ def search(query):
             items.append((title, snippet, _domain(url), str(url or "")))
     if not items:
         raise WebError("не нашёл")
-
-    lines = []
-    for i, (title, snippet, domain, _) in enumerate(items, 1):
-        line = f"{i}. {title} — {snippet} ({domain})"
-        if len("\n".join(lines + [line])) > MAX_SEARCH_CHARS:
-            break
-        lines.append(line)
-    # Строки уже обрезаны по отдельности; _clip тут нельзя — он склеил бы пункты в одну строку
-    for_model = "\n".join(lines) if lines else _clip(items[0][1], MAX_SEARCH_CHARS)
+    for_model = _join_limited([f"{i}. {title} — {snippet} ({domain})" for i, (title, snippet, domain, _)
+                               in enumerate(items, 1)]) or _clip(items[0][1], MAX_SEARCH_CHARS)
     window = "\n".join(f"{i}. {title}\n   {url}" for i, (title, _, _, url) in enumerate(items, 1))
-    return for_model, window
+    return for_model, window, [url for *_, url in items if url]

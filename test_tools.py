@@ -216,6 +216,7 @@ class TestConfirmFlow(RunMock):
         app.ai = AIClient(llm=llm)
         app.has_pending.return_value = False
         app.report_result = lambda results: main.VoiceApp.report_result(app, results)
+        app.deliver = lambda turn, text: main.VoiceApp.deliver(app, turn, text)
         app.ask_confirmation = lambda pending, phrase: main.VoiceApp.ask_confirmation(app, pending, phrase)
         return app
 

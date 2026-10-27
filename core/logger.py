@@ -6,6 +6,7 @@ from threading import Lock
 LOG_DIR = Path.home() / "Library" / "Logs" / "Jarvis"
 LOG_FILE = LOG_DIR / "jarvis.log"
 
+QUIET_LOGGERS = ("primp", "httpx", "httpcore")
 MIN_SECRET_LENGTH = 8  # короче — не секрет, а риск заменить обычные слова
 
 _secrets = set()
@@ -63,4 +64,7 @@ def setup_logging(level=logging.INFO):
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers = [console, file_handler]
+    # Шумные INFO-логи HTTP-клиентов: строка на каждый запрос (в том числе к LLM)
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     return LOG_FILE

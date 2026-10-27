@@ -74,7 +74,8 @@ def check_web(out=sys.stdout):
 
     checks = [("get_weather", lambda: get_weather()),
               ("get_exchange_rate", lambda: get_exchange_rate("USD", "TJS")),
-              ("web_search", lambda: web_search("погода Душанбе"))]
+              ("web_search", lambda: web_search("погода Душанбе")),
+              ("web_search (новости)", lambda: web_search("новости Душанбе"))]
     results = []
     for name, run in checks:
         started = time.monotonic()
@@ -84,7 +85,7 @@ def check_web(out=sys.stdout):
         except ActionError as e:
             status, text = f"ошибка: {e.short}", ""
         elapsed = time.monotonic() - started
-        _print(f"{name:<18} {status:<32} {elapsed:4.1f} с   {text[:80]}", out)
+        _print(f"{name:<22} {status:<32} {elapsed:4.1f} с   {text[:80]}", out)
         results.append(status == "OK")
     return results
 

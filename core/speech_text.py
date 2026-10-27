@@ -126,10 +126,16 @@ _UNIT_RULES = [
 ]
 
 
+# «+16» -> «плюс 16», «-5»/«−5» -> «минус 5». Не трогаем даты (2026-10-27), диапазоны (10-12), Wi-Fi, COVID-19:
+# перед знаком не должно быть буквы, цифры или знака, после — цифра
+_SIGN_RE = re.compile(r"(?<![\w+\-−.,/:])([+\-−])(?=\d)")
+
+
 def units_for_speech(text):
     """«+18°C» -> «плюс 18 градусов Цельсия», «3 м/с» -> «3 метра в секунду», «10,93 TJS» -> «10,93 сомони»."""
     for pattern, replace in _UNIT_RULES:
         text = pattern.sub(replace, text)
+    text = _SIGN_RE.sub(lambda m: "плюс " if m.group(1) == "+" else "минус ", text)
     return re.sub(r"\s=\s", " равно ", text)
 
 
