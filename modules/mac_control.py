@@ -1,7 +1,19 @@
 import logging
+import re
 import subprocess
 
 log = logging.getLogger(__name__)
+
+OPEN_VERBS = {"открой", "открыть", "запусти", "включи"}
+CLOSE_VERBS = {"закрой", "закрыть", "выйди", "выключи"}
+
+# (слова приложения, команда, ответ)
+APPS = [
+    ({"калькулятор"}, ["open", "-a", "Calculator"], "Калькулятор открыт"),
+    ({"спотифай", "музыка", "музыку"}, ["open", "-a", "Spotify"], "Открываю музыку"),
+    # open с URL открывает браузер по умолчанию
+    ({"браузер", "интернет"}, ["open", "https://www.google.com"], "Открываю браузер"),
+]
 
 
 def _run(args):
@@ -14,36 +26,33 @@ def _run(args):
 
 class MacControl:
     def execute(self, command):
-        cmd = command.lower()
+        # Сравниваем целые слова: «закрой калькулятор» не должно открывать калькулятор
+        words = set(re.findall(r"\w+", command.lower()))
 
-        if "громче" in cmd:
+        if words & {"громче", "погромче"}:
             # AppleScript: set volume output volume (current + 10)
             _run(["osascript", "-e", "set volume output volume (output volume of (get volume settings) + 10)"])
             return "Сделал громче"
 
-        elif "тише" in cmd:
+        elif words & {"тише", "потише"}:
             _run(["osascript", "-e", "set volume output volume (output volume of (get volume settings) - 10)"])
             return "Сделал тише"
 
-        elif "выключи звук" in cmd:
+        elif {"выключи", "звук"} <= words:
             _run(["osascript", "-e", "set volume output muted true"])
             return "Звук выключен"
 
-        elif "включи звук" in cmd:
+        elif {"включи", "звук"} <= words:
             _run(["osascript", "-e", "set volume output muted false"])
             return "Звук включен"
 
-        elif "браузер" in cmd or "интернет" in cmd:
-            # open с URL открывает браузер по умолчанию
-            _run(["open", "https://www.google.com"])
-            return "Открываю браузер"
-
-        elif "спотифай" in cmd or "музык" in cmd:
-            _run(["open", "-a", "Spotify"])
-            return "Открываю музыку"
-
-        elif "калькулятор" in cmd:
-            _run(["open", "-a", "Calculator"])
-            return "Калькулятор открыт"
+        for app_words, args, reply in APPS:
+            if not words & app_words:
+                continue
+            # Закрытие — через нейросеть (quit_app с подтверждением); без глагола открытия — тоже не перехватываем
+            if words & CLOSE_VERBS or not words & OPEN_VERBS:
+                return None
+            _run(args)
+            return reply
 
         return None

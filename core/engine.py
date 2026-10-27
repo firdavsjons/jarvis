@@ -95,7 +95,7 @@ class SpeechEngine:
 
     def listen(self):
         with self.microphone as source:
-            log.info("🎤 Слушаю...")
+            log.debug("🎤 Слушаю...")
             try:
                 audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
                 text = self.recognizer.recognize_google(audio, language="ru-RU")
