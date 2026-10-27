@@ -177,7 +177,8 @@ class TestAliasesAndForget(MemoryCase):
         self.assertEqual(self.memory.aliases, {})
         self.assertIsNone(installed_apps.resolve_app_name("мой браузер"))
         nothing = self.run_one(act("forget_memory", query="пиво"), "забудь про пиво")
-        self.assertEqual(nothing["speech"], "Ничего такого я не помню.")
+        self.assertFalse(nothing["ok"])  # «в памяти нет» — неудача (4.4)
+        self.assertEqual(summarize_results([nothing]), (False, "Не получилось: не нашёл."))
 
     def test_list_memory(self):
         self.assertEqual(self.run_one(act("list_memory"), "что ты обо мне знаешь")["speech"],

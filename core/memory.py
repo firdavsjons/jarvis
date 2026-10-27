@@ -222,7 +222,7 @@ class UserMemory:
             if removed:
                 self._save(aliases_changed)
         if not removed:
-            return f"В памяти нет «{query}»", "Ничего такого я не помню."
+            raise MemoryRefused("не нашёл")  # «в памяти нет» — неудача, не успех
         return f"Забыто: {'; '.join(removed)}", f"Забыл: {'; '.join(removed[:3])}."
 
     def clear(self):

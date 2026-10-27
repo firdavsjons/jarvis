@@ -16,6 +16,7 @@ TEMPERATURE = 0.3     # меньше креативности, больше то
 
 DEFAULTS = {
     "LLM_PROVIDERS": "gemini,groq,local",
+    "LLM_RATE_LIMIT_PAUSE_MIN": "15",  # пауза после 3 ответов 429 подряд за 10 минут
     "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "GEMINI_MODEL": "gemini-2.5-flash",
     "GEMINI_DAILY_LIMIT": "200",

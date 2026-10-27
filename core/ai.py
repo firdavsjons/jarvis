@@ -10,9 +10,9 @@ from urllib.parse import urlparse
 from core import installed_apps, journal, prompts, safety
 from core.cache import cacheable_actions
 from core.history import ConversationHistory
-from core.memory import MemoryRefused, UserMemory, asked_to_remember
+from core.memory import SECRET_REFUSAL, MemoryRefused, UserMemory, asked_to_remember, contains_secret
 from core.llm import build_default_client
-from core.speech_text import confirmation_question
+from core.speech_text import confirmation_question, url_for_speech
 from core.tools import TOOLS, assistant_message, call_to_action, tool_message
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,10 @@ _PROMISE_RE = re.compile(r"(?<!\w)(открываю|закрываю|запус�
 MEMORY_ACTIONS = {"remember", "remember_alias", "list_memory", "forget_memory", "clear_memory"}
 REMEMBER_ACTIONS = {"remember", "remember_alias"}
 NOT_ASKED_SHORT = "запоминаю только по вашей просьбе со словом «запомни»"
+NOT_FOUND_SHORT = "не нашёл"
+# Простые действия: при успехе модели результат не возвращаем — фраза по шаблону, на 1 запрос меньше
+TEMPLATE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url"}
+MAX_TEMPLATE_PARTS = 3
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
@@ -147,8 +151,8 @@ def find_apps(query):
         raise ActionError("пустой запрос", "не указано, что искать")
     found = installed_apps.find_apps(query)
     if not found:
-        return Done(f"По запросу «{query.strip()}» ничего не найдено",
-                    f"Не нашёл приложений по запросу {query.strip()}.")
+        # «Не найдено» — неудача: модель и страховка от неправды не объявят успех
+        raise ActionError(f"по запросу «{query.strip()}» ничего не найдено", NOT_FOUND_SHORT)
     return Done(f"Найдено: {', '.join(found)}", f"Нашёл: {_spoken_list(found)}.")
 
 
@@ -190,6 +194,10 @@ def describe_action(action):
     if name == "trash_file":
         _, _, resolved = safety.classify_path(args.get("path"))
         return f"переместить в Корзину {resolved or args.get('path')}"
+    if name == "remember":
+        return f"запомнить: {args.get('text')}"
+    if name == "remember_alias":
+        return f"запомнить: {args.get('spoken')} — это {args.get('app')}"
     return str(name)
 
 
@@ -208,6 +216,21 @@ def summarize_results(results):
         parts = ([f"Не получилось: {', '.join(failed)}."] if failed else []) + replies
         return False, " ".join(parts)
     return True, " ".join(r["speech"] for r in results if r["speech"])
+
+
+def _template_part(result):
+    action = result["action"]
+    if action.get("name") == "open_url":
+        return f"Открыта ссылка {url_for_speech(str((action.get('args') or {}).get('url', '')))}"
+    return result.get("result") or "Готово"
+
+
+def template_speech(results):
+    """«Открыто приложение Telegram.», «Открыто приложение Telegram, громкость 50.», больше 3 — «Готово.»."""
+    if not results or len(results) > MAX_TEMPLATE_PARTS:
+        return "Готово."
+    parts = [_template_part(r) for r in results]
+    return ", ".join([parts[0]] + [p[:1].lower() + p[1:] for p in parts[1:]]) + "."
 
 
 def normalize_ai_response(data):
@@ -343,7 +366,7 @@ class AIClient:
                 action, error = call_to_action(call)
                 calls.append((call, action, error))
             actions = [a for _, a, _ in calls if a is not None]
-            safe, confirm, blocked = self.split_actions(actions)
+            safe, confirm, blocked = self.split_actions(actions, phrase=text)
 
             if blocked:
                 self.reject_actions(actions, text, "в ответе есть опасное действие")
@@ -356,7 +379,12 @@ class AIClient:
                 return self._finish(text, Turn(summary, pending=confirm, results=executed))
 
             tool_rounds += 1
-            results = iter(self.run_actions(safe, phrase=text))
+            round_results = self.run_actions(safe, phrase=text)
+            if self._template_ok(calls, round_results):
+                # Всё простое и успешное — фраза по шаблону, второй запрос к модели не нужен
+                executed += round_results
+                return self._finish(text, Turn(template_speech(round_results), results=executed))
+            results = iter(round_results)
             messages = messages + [assistant_message(response)]
             for call, action, error in calls:
                 if action is None:
@@ -368,6 +396,11 @@ class AIClient:
                 executed.append(result)
                 messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
                                              error=result["short"]))
+
+    @staticmethod
+    def _template_ok(calls, results):
+        return (all(action is not None for _, action, _ in calls) and bool(results)
+                and all(r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS for r in results))
 
     def _honest(self, final_text, executed):
         """Страховка: инструмент упал, а модель говорит как об успехе — говорим правду сами."""
@@ -393,7 +426,7 @@ class AIClient:
     def _json_turn(self, text, content):
         """Как до шага 4.2: SAFE — выполнить, потом сказать; CONFIRM — вопрос; BLOCKED — отказ."""
         response_text, actions = normalize_ai_response(self._parse_json(content))
-        safe, confirm, blocked = self.split_actions(actions)
+        safe, confirm, blocked = self.split_actions(actions, phrase=text)
         if blocked:
             self.reject_actions(actions, text, "в ответе есть опасное действие")
             return Turn(BLOCKED_REPLY, blocked=blocked)
@@ -444,11 +477,15 @@ class AIClient:
             log.warning("⚠️ Ошибка парсинга JSON: %s", content)
             return {"response": content, "actions": []}
 
-    def _memory_action(self, name, phrase):
+    def _memory_action(self, name, phrase, confirmed=False):
         """Действие памяти. phrase — исходная фраза ПОЛЬЗОВАТЕЛЯ (не аргументы модели): запись в память
-        только если в ней есть «запомни», «запиши» или «учти» — текст со страниц и ответы модели не в счёт."""
+        только если в ней есть «запомни», «запиши» или «учти», либо пользователь ответил «да» на вопрос
+        «Запомнить: …?» (confirmed). Текст со страниц и ответы модели не в счёт."""
         def run(**args):
-            if name in REMEMBER_ACTIONS and not asked_to_remember(phrase):
+            # Секрет — отказ сразу и с понятной фразой, ещё до проверки «запомни»
+            if name in REMEMBER_ACTIONS and any(contains_secret(v) for v in args.values() if isinstance(v, str)):
+                raise ActionError(f"{name}: секрет", "такое я запоминать не буду", SECRET_REFUSAL)
+            if name in REMEMBER_ACTIONS and not asked_to_remember(phrase) and not confirmed:
                 raise ActionError(f"{name} без просьбы пользователя: {phrase!r}", NOT_ASKED_SHORT)
             method = {"remember": self.memory.remember, "remember_alias": self.memory.remember_alias,
                       "list_memory": self.memory.list_memory, "forget_memory": self.memory.forget,
@@ -462,15 +499,28 @@ class AIClient:
             return Done(message, speech)
         return run
 
-    def split_actions(self, actions):
-        """Делит действия по уровню риска: (SAFE, CONFIRM, BLOCKED)."""
+    def split_actions(self, actions, phrase=None):
+        """Делит действия по уровню риска: (SAFE, CONFIRM, BLOCKED).
+
+        phrase — исходная фраза пользователя: remember / remember_alias без «запомни» в ней становятся
+        CONFIRM («Запомнить: …?»). Секреты остаются SAFE, чтобы сразу получить отказ, без вопроса.
+        """
         if not isinstance(actions, list):
             return [], [], []
         groups = {safety.SAFE: [], safety.CONFIRM: [], safety.BLOCKED: []}
         for action in actions:
             level, _ = safety.classify(action)
+            if level == safety.SAFE and phrase is not None and self._needs_remember_confirmation(action, phrase):
+                level = safety.CONFIRM
             groups[level].append(action)
         return groups[safety.SAFE], groups[safety.CONFIRM], groups[safety.BLOCKED]
+
+    @staticmethod
+    def _needs_remember_confirmation(action, phrase):
+        if action.get("name") not in REMEMBER_ACTIONS or asked_to_remember(phrase):
+            return False
+        args = action.get("args") if isinstance(action.get("args"), dict) else {}
+        return not any(contains_secret(v) for v in args.values() if isinstance(v, str))
 
     def reject_actions(self, actions, phrase, reason, confirmed=None):
         """Записывает в журнал действия, которые не будут выполнены (опасный ответ, «нет», таймаут)."""
@@ -489,7 +539,8 @@ class AIClient:
         results = []
         for action in actions:
             level, reason = safety.classify(action)
-            journal_confirmed = confirmed if level == safety.CONFIRM else None
+            remember_confirmed = isinstance(action, dict) and action.get("name") in REMEMBER_ACTIONS and confirmed
+            journal_confirmed = confirmed if level == safety.CONFIRM or remember_confirmed else None
             ok, short, speech, result_text, reply = False, None, None, None, None
 
             if level == safety.BLOCKED:
@@ -499,7 +550,7 @@ class AIClient:
             elif level == safety.CONFIRM and not confirmed:
                 message, short = f"⛔ Нужно подтверждение: {action} — {reason}", "нужно подтверждение"
             else:
-                func = self._memory_action(action["name"], phrase) if action["name"] in MEMORY_ACTIONS \
+                func = self._memory_action(action["name"], phrase, confirmed) if action["name"] in MEMORY_ACTIONS \
                     else ACTIONS[action["name"]]
                 args = action.get("args") or {}
                 log.info("▶ Действие: %s %s", action["name"], args)

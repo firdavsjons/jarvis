@@ -118,7 +118,8 @@ class TestToolLoop(RunMock):
     def test_success_is_spoken_after_execution(self):
         llm = ScriptedLLM(tools_reply(call("open_app", {"app": "Safari"})), final("Открыла Safari."))
         turn = AIClient(llm=llm).respond("Открой сафари")
-        self.assertEqual(turn.speech, "Открыла Safari.")
+        self.assertEqual(turn.speech, "Открыто приложение Safari.")  # шаблон, без второго запроса (4.4)
+        self.assertEqual(len(llm.requests), 1)
         self.mock_run.assert_called_once_with(["open", "-a", "Safari"], capture_output=True, text=True, timeout=10)
         self.assertTrue(turn.results[0]["ok"])
 
@@ -179,7 +180,8 @@ class TestPromiseWithoutAction(RunMock):
         llm = ScriptedLLM(final("Открываю Safari."), tools_reply(call("open_app", {"app": "Safari"})),
                           final("Открыла Safari."))
         turn = AIClient(llm=llm).respond("открой сафари")
-        self.assertEqual(turn.speech, "Открыла Safari.")
+        self.assertEqual(turn.speech, "Открыто приложение Safari.")
+        self.assertEqual(len(llm.requests), 2)  # обещание + повтор с вызовом; результат модели не нужен
         self.assertEqual(llm.requests[1]["messages"][-1], {"role": "user", "content": PROMISE_RETRY_NOTE})
         self.mock_run.assert_called_once()
 
@@ -195,8 +197,9 @@ class TestPromiseWithoutAction(RunMock):
         self.assertEqual(AIClient(llm=llm).respond("убери файл").speech, "Не могу: укажите, какой файл.")
 
     def test_promise_after_real_tool_call_is_fine(self):
-        llm = ScriptedLLM(tools_reply(call("open_app", {"app": "Safari"})), final("Открываю Safari."))
-        self.assertEqual(AIClient(llm=llm).respond("открой сафари").speech, "Открываю Safari.")
+        # Инструмент с данными уже вызван — «Выполняю» в финальном тексте не считается пустым обещанием
+        llm = ScriptedLLM(tools_reply(call("get_time")), final("Выполняю: сейчас вечер."))
+        self.assertEqual(AIClient(llm=llm).respond("который час").speech, "Выполняю: сейчас вечер.")
         self.assertEqual(len(llm.requests), 2)
 
     def test_json_mode_promise_without_actions(self):

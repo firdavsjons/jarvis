@@ -154,8 +154,8 @@ class TestAppActions(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["speech"], "Нашёл: Microsoft Excel, Microsoft Word.")
         [result] = self.client.run_actions([{"name": "find_apps", "args": {"query": "qwertyuiop"}}])
-        self.assertTrue(result["ok"])
-        self.assertIn("Не нашёл", result["speech"])
+        self.assertFalse(result["ok"])  # «не найдено» — неудача (4.4)
+        self.assertEqual(result["short"], "не нашёл")
         [result] = self.client.run_actions([{"name": "find_apps", "args": {"query": ""}}])
         self.assertFalse(result["ok"])
         self.mock_run.assert_not_called()  # только чтение

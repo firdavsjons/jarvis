@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger(__name__)
 
 SWITCH_SHARE = 0.9  # на 90% дневного лимита переходим к следующему провайдеру заранее
+LOG_EVERY = 10      # раз в столько запросов — строка «запросы сегодня: …» в лог
 
 
 class UsageTracker:
@@ -21,6 +22,7 @@ class UsageTracker:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
         self._warned = set()  # (провайдер, дата) — предупреждение раз в сутки
+        self._session_requests = 0
         self._data = self._load()
 
     def _today(self, name):
@@ -58,6 +60,10 @@ class UsageTracker:
         with self._lock:
             self._entry(name)["count"] += 1
             self._save()
+            self._session_requests += 1
+            if self._session_requests % LOG_EVERY == 0:
+                names = list(self.limits) or list(self._data)
+                log.info("запросы сегодня: %s", ", ".join(f"{n} {self._entry(n)['count']}" for n in names))
 
     def _load(self):
         if not self.path:

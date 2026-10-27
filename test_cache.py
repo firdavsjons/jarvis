@@ -159,12 +159,12 @@ class TestCacheInAIClient(unittest.TestCase):
 
     def test_hit_skips_model(self, mock_run):
         mock_run.return_value.returncode = 0
-        client, llm = self.client(tools_reply(call("open_app", {"app": "Telegram"})), final("Открыла Telegram."))
+        client, llm = self.client(tools_reply(call("open_app", {"app": "Telegram"})))
 
-        self.assertEqual(client.respond("Открой Telegram").speech, "Открыла Telegram.")
-        self.assertEqual(llm.requests, 2)
+        self.assertEqual(client.respond("Открой Telegram").speech, "Открыто приложение Telegram.")
+        self.assertEqual(llm.requests, 1)  # простое действие — без второго запроса (4.4)
         turn = client.respond("открой, пожалуйста, telegram!")
-        self.assertEqual(llm.requests, 2)  # без модели
+        self.assertEqual(llm.requests, 1)  # из кэша — без модели
         self.assertEqual(turn.speech, "Открыто приложение Telegram.")
         self.assertEqual(mock_run.call_count, 2)  # действие выполнено обычным путём
         self.assertEqual(client.history.messages()[-1]["content"],

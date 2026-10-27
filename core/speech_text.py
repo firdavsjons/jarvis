@@ -182,6 +182,10 @@ def action_for_speech(action):
         return f"закрыть {args.get('app')}"
     if name == "clear_memory":
         return "удалить всё, что я о вас помню"
+    if name == "remember":
+        return f"запомнить: {str(args.get('text', '')).strip().rstrip('.!?')}"
+    if name == "remember_alias":
+        return f"запомнить: {args.get('spoken')} — это {args.get('app')}"
     return str(name)
 
 
