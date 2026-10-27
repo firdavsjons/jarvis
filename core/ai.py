@@ -1,9 +1,12 @@
 import openai
+import logging
 import subprocess
 import json
 import re
 import unicodedata
 from urllib.parse import urlparse
+
+log = logging.getLogger(__name__)
 
 TIMEOUT = 10
 
@@ -179,10 +182,10 @@ class LocalAIClient:
             content = response.choices[0].message.content
             return self._parse_json(content)
         except openai.APIConnectionError:
-            print("❌ Ошибка: Не удалось подключиться к LM Studio.")
+            log.error("❌ Ошибка: Не удалось подключиться к LM Studio.")
             return {"response": "Ошибка: Локальный сервер Gemma не запущен. Пожалуйста, запустите LM Studio.", "actions": []}
         except Exception as e:
-            print(f"❌ Ошибка запроса к AI: {e}")
+            log.error("❌ Ошибка запроса к AI: %s", e)
             return {"response": "Произошла ошибка при обращении к нейросети.", "actions": []}
 
     def _parse_json(self, content):
@@ -201,7 +204,7 @@ class LocalAIClient:
             except:
                 pass
 
-            print(f"⚠️ Ошибка парсинга JSON: {content}")
+            log.warning("⚠️ Ошибка парсинга JSON: %s", content)
             return {"response": content, "actions": []}
 
     def split_actions(self, actions):
@@ -230,7 +233,7 @@ class LocalAIClient:
 
             func, _ = ACTIONS[action["name"]]
             args = action.get("args") or {}
-            print(f"▶ Действие: {action['name']} {args}")
+            log.info("▶ Действие: %s %s", action["name"], args)
             try:
                 if not isinstance(args, dict):
                     raise ActionError(f"args должен быть объектом: {args!r}")

@@ -1,4 +1,7 @@
+import logging
 import subprocess
+
+log = logging.getLogger(__name__)
 
 
 def _run(args):
@@ -6,7 +9,7 @@ def _run(args):
     try:
         subprocess.run(args, timeout=10)
     except (subprocess.SubprocessError, OSError) as e:
-        print(f"❌ Ошибка команды {args}: {e}")
+        log.error("❌ Ошибка команды %s: %s", args, e)
 
 
 class MacControl:

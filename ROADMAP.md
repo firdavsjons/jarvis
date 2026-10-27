@@ -14,7 +14,7 @@
 
 ## Этап 0. Подготовка
 - [x] `git init`, `.gitignore` (.env, .venv, .idea, .DS_Store, __pycache__), первый коммит
-- [ ] Отозвать ключ Gemini из `.env`, удалить `GEMINI_API_KEY`
+- [x] Отозвать ключ Gemini из `.env`, удалить `GEMINI_API_KEY` (не требуется, решено не отзывать)
 - [x] Принять `CLAUDE.md` (уже написан)
 - [x] Положить этот файл в корень проекта как `ROADMAP.md`
 
@@ -25,12 +25,12 @@
 - [x] Тесты обновлены, `python -m unittest` проходит
 
 ## Этап 2. Стабильность и озвучка
-- [ ] Обновление окна только из главного потока (очередь + `root.after`)
-- [ ] Озвучка через `say -v Milena` с Lock, убрать pyttsx3 (временное решение до этапа 9)
-- [ ] Микрофон на паузе, пока ассистент говорит
-- [ ] Кнопка «Стоп», калибровка шума один раз
-- [ ] Заменить `print` на `logging` (файл лога в `~/Library/Logs/Jarvis/`)
-- [ ] Удалить мёртвые файлы Gemini: test_gemini_fix.py, test_model_latest.py, list_models.py, check_env.py; переписать verify_local_ai.py
+- [x] Обновление окна только из главного потока (очередь + `root.after`)
+- [x] Озвучка через `say -v Milena` с Lock, убрать pyttsx3 (временное решение до этапа 9)
+- [x] Микрофон на паузе, пока ассистент говорит
+- [x] Кнопка «Стоп», калибровка шума один раз
+- [x] Заменить `print` на `logging` (файл лога в `~/Library/Logs/Jarvis/`)
+- [x] Удалить мёртвые файлы Gemini: test_gemini_fix.py, test_model_latest.py, list_models.py, check_env.py; переписать verify_local_ai.py
 
 ## Этап 3. Уровни риска (главное требование безопасности)
 - [ ] Модуль `core/safety.py`: каждое действие получает уровень **SAFE / CONFIRM / BLOCKED**

@@ -4,24 +4,40 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 # Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core.ai import LocalAIClient
 
+
 class TestLocalAIClient(unittest.TestCase):
+    def _client_with_reply(self, MockOpenAI, content):
+        mock_response = MagicMock()
+        mock_response.choices[0].message.content = content
+        MockOpenAI.return_value.chat.completions.create.return_value = mock_response
+        return LocalAIClient()
+
     @patch('openai.OpenAI')
     def test_ask_success(self, MockOpenAI):
-        # Mocking the client and response
-        mock_client_instance = MockOpenAI.return_value
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = "Привет! Я работаю."
-        mock_client_instance.chat.completions.create.return_value = mock_response
+        content = '{"response": "Открываю Safari.", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}'
+        client = self._client_with_reply(MockOpenAI, content)
 
-        client = LocalAIClient()
-        response = client.ask("Привет")
-        
-        self.assertEqual(response, "Привет! Я работаю.")
+        response = client.ask("Открой Сафари")
+
+        self.assertEqual(response, {
+            "response": "Открываю Safari.",
+            "actions": [{"name": "open_app", "args": {"app": "Safari"}}],
+        })
         print("\n✅ Test ask success: Passed")
+
+    @patch('openai.OpenAI')
+    def test_ask_plain_text(self, MockOpenAI):
+        # Модель ответила не JSON — текст становится response, действий нет
+        client = self._client_with_reply(MockOpenAI, "Привет! Я работаю.")
+
+        response = client.ask("Привет")
+
+        self.assertEqual(response, {"response": "Привет! Я работаю.", "actions": []})
+        print("\n✅ Test plain text: Passed")
 
     @patch('openai.OpenAI')
     def test_ask_connection_error(self, MockOpenAI):
@@ -32,10 +48,12 @@ class TestLocalAIClient(unittest.TestCase):
 
         client = LocalAIClient()
         response = client.ask("Привет")
-        
-        expected_error = "Ошибка: Локальный сервер Gemma не запущен. Пожалуйста, запустите LM Studio и нажмите Start Server."
-        self.assertEqual(response, expected_error)
+
+        self.assertIsInstance(response, dict)
+        self.assertEqual(response["actions"], [])
+        self.assertIn("LM Studio", response["response"])
         print("\n✅ Test connection error: Passed")
+
 
 if __name__ == '__main__':
     unittest.main()

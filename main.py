@@ -1,14 +1,21 @@
-import tkinter as tk
-from threading import Thread, Lock, Timer
+import logging
+import queue
 import re
+import time
+import tkinter as tk
+from threading import Thread, Lock, Timer, Event
 from dotenv import load_dotenv
 from core.engine import SpeechEngine
 from core.ai import LocalAIClient, describe_action
+from core.logger import setup_logging
 from modules.mac_control import MacControl
+
+log = logging.getLogger(__name__)
 
 CONFIRM_WORDS = {"да", "подтверждаю", "выполняй"}
 CANCEL_WORDS = {"нет", "отмена"}
 CONFIRM_TIMEOUT = 15  # секунд на подтверждение, потом действия отменяются
+UI_POLL_MS = 100  # как часто главный поток забирает обновления окна из очереди
 
 
 def parse_confirmation(text):
@@ -24,13 +31,24 @@ def parse_confirmation(text):
     return None
 
 
+def normalize_ai_response(data):
+    """(текст ответа, действия) из результата ai.ask. Неожиданный формат — пустой ответ."""
+    if not isinstance(data, dict):
+        log.warning("Ответ AI не словарь: %r", data)
+        return "", []
+    response_text = data.get("response")
+    if not isinstance(response_text, str):
+        response_text = ""
+    return response_text, data.get("actions", [])
+
+
 class VoiceApp:
     def __init__(self, root):
         load_dotenv()
 
         self.root = root
         self.root.title("Jarvis (Mac M1 - Terminal AI)")
-        self.root.geometry("400x300")
+        self.root.geometry("400x340")
 
         self.status_label = tk.Label(root, text="Нажми 'Старт'", font=("Helvetica", 16))
         self.status_label.pack(pady=10)
@@ -49,28 +67,65 @@ class VoiceApp:
         self.btn = tk.Button(root, text="Старт (Голос)", command=self.start_listening)
         self.btn.pack(pady=10)
 
+        self.stop_btn = tk.Button(root, text="Стоп", command=self.stop_listening)
+        self.stop_btn.pack(pady=5)
+
         self.engine = SpeechEngine()
         self.ai = LocalAIClient()
         self.mac = MacControl()
         self.is_listening = False
+        self.stop_event = Event()
+        self.listen_thread = None
         self.pending_actions = [] # Действия, ждущие подтверждения
         self.pending_timer = None
         self.pending_lock = Lock()
 
+        # Виджеты меняет только главный поток: остальные кладут сообщения в очередь
+        self.ui_queue = queue.Queue()
+        self.root.after(UI_POLL_MS, self.poll_ui)
+
     def start_listening(self):
-        if not self.is_listening:
-            self.is_listening = True
-            self.status_label.config(text="Слушаю...", fg="black")
-            Thread(target=self.background_loop, daemon=True).start()
+        if self.is_listening:
+            return
+        if self.listen_thread and self.listen_thread.is_alive():
+            # Старый цикл ещё ждёт окончания listen() и держит микрофон
+            self.update_status("Подождите, микрофон освобождается...", "gray")
+            return
+        self.is_listening = True
+        self.stop_event.clear()
+        self.update_status("Калибрую микрофон...", "gray")
+        self.listen_thread = Thread(target=self.background_loop, daemon=True)
+        self.listen_thread.start()
+
+    def stop_listening(self):
+        self.is_listening = False
+        self.stop_event.set()
+        self.engine.stop_speaking()
+        self.update_status("Остановлено", "black")
+
+    # --- Обновление окна (из любого потока) ---
 
     def update_status(self, text, color="black"):
-        self.status_label.config(text=text, fg=color)
+        self.ui_queue.put(("status", text, color))
 
     def set_idle_status(self):
         self.update_status("Слушаю..." if self.is_listening else "Готово", "black")
 
     def update_log(self, text):
-        self.log_label.config(text=text)
+        self.ui_queue.put(("log", text))
+
+    def poll_ui(self):
+        """Главный поток: применяет накопленные обновления окна."""
+        try:
+            while True:
+                message = self.ui_queue.get_nowait()
+                if message[0] == "status":
+                    self.status_label.config(text=message[1], fg=message[2])
+                elif message[0] == "log":
+                    self.log_label.config(text=message[1])
+        except queue.Empty:
+            pass
+        self.root.after(UI_POLL_MS, self.poll_ui)
 
     def on_submit(self):
         text = self.entry.get()
@@ -113,7 +168,7 @@ class VoiceApp:
                 return
             self.pending_actions = []
             self.pending_timer = None
-        print(f"⌛ Подтверждение не получено за {CONFIRM_TIMEOUT} с, отменено: {actions}")
+        log.info("⌛ Подтверждение не получено за %s с, отменено: %s", CONFIRM_TIMEOUT, actions)
         self.engine.speak("Время вышло, отменено.")
         self.set_idle_status()
 
@@ -130,15 +185,19 @@ class VoiceApp:
         if answer:
             self.update_status("Выполняю...", "green")
             self.engine.speak("Выполняю.")
-            print(self.ai.execute_actions(actions))
+            self.report_result(self.ai.execute_actions(actions))
             self.engine.speak("Готово.")
         else:
             self.engine.speak("Отменено.")
         self.set_idle_status()
 
+    def report_result(self, result_log):
+        log.info("Результат действий:\n%s", result_log)
+        self.update_log(result_log)
+
     def process_command(self, text, source="voice"):
         """Единая точка входа для обработки команд (голос или текст)."""
-        print(f"Обработка ({source}): {text}")
+        log.info("Обработка (%s): %s", source, text)
 
         # 0. Если ждём подтверждения — это ответ на вопрос
         if self.has_pending():
@@ -154,11 +213,8 @@ class VoiceApp:
 
         # 2. Спрашиваем AI
         self.update_status("Думаю...", "blue")
-        ai_data = self.ai.ask(text)
-
-        # Обработка ответа
-        response_text = ai_data.get("response", "")
-        immediate, to_confirm = self.ai.split_actions(ai_data.get("actions", []))
+        response_text, actions = normalize_ai_response(self.ai.ask(text))
+        immediate, to_confirm = self.ai.split_actions(actions)
 
         if response_text:
             self.engine.speak(response_text)
@@ -166,7 +222,7 @@ class VoiceApp:
         # Открытие приложений и громкость — сразу, без подтверждения
         if immediate:
             self.update_status("Выполняю...", "green")
-            print(self.ai.execute_actions(immediate))
+            self.report_result(self.ai.execute_actions(immediate))
 
         # Закрытие приложений и ссылки — только после подтверждения
         if to_confirm:
@@ -178,14 +234,39 @@ class VoiceApp:
             self.set_idle_status()
 
     def background_loop(self):
-        while True:
-            text = self.engine.listen()
+        try:
+            self.engine.calibrate()
+        except Exception as e:
+            log.error("Не удалось открыть микрофон: %s", e)
+            self.is_listening = False
+            self.update_status("Ошибка микрофона", "red")
+            return
+        self.set_idle_status()
 
-            if text:
-                self.process_command(text, source="voice")
+        while not self.stop_event.is_set():
+            # Пока ассистент говорит, микрофон не слушаем
+            if self.engine.speaking.is_set():
+                time.sleep(0.1)
+                continue
+
+            started = time.monotonic()
+            text = self.engine.listen()
+            if self.stop_event.is_set():
+                break
+            if not text:
+                continue
+            if self.engine.speech_overlaps(started):
+                # Во время записи ассистент заговорил — микрофон мог услышать его самого
+                log.info("Отброшено (ассистент говорил во время записи): %s", text)
+                continue
+
+            self.process_command(text, source="voice")
+        log.info("Цикл прослушивания остановлен")
 
 
 if __name__ == "__main__":
+    log_file = setup_logging()
+    log.info("Jarvis запущен, лог: %s", log_file)
     root = tk.Tk()
     app = VoiceApp(root)
     root.mainloop()

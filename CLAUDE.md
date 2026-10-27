@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Голосовой и текстовый ассистент для macOS (MacBook M1). Python + Tkinter, распознавание речи через SpeechRecognition, озвучка через pyttsx3, «мозг» — локальная LLM в LM Studio (OpenAI-совместимый API).
+Голосовой и текстовый ассистент для macOS (MacBook M1). Python + Tkinter, распознавание речи через SpeechRecognition, озвучка через системную команду `say`, «мозг» — локальная LLM в LM Studio (OpenAI-совместимый API).
 
 ## Как устроен поток команды
 
@@ -29,12 +29,14 @@ VoiceApp.process_command            (main.py)
 
 ## Структура
 
-- `main.py` — окно Tkinter (`VoiceApp`), фоновый цикл прослушивания `background_loop`, логика подтверждения команд.
-- `core/engine.py` — `SpeechEngine`: STT через `recognize_google` (ru-RU, онлайн), TTS через pyttsx3 с драйвером `nsss`.
+- `main.py` — окно Tkinter (`VoiceApp`), очередь обновлений окна `ui_queue` + `poll_ui`, цикл прослушивания `background_loop` (Старт/Стоп через `stop_event`), подтверждение команд, `normalize_ai_response`.
+- `core/engine.py` — `SpeechEngine`: STT через `recognize_google` (ru-RU, онлайн), калибровка шума `calibrate()` один раз при старте; TTS через `say` (голос Milena или другой ru_RU, `pick_voice`), прерывание `stop_speaking()`, флаг `speaking`.
+- `core/logger.py` — `setup_logging()`: лог в консоль и в `~/Library/Logs/Jarvis/jarvis.log`.
 - `core/ai.py` — белый список действий `ACTIONS` (`open_app`, `quit_app`, `set_volume`, `open_url`) и `LocalAIClient`: системный промпт, запрос к LM Studio, парсинг JSON, `split_actions` / `execute_actions`.
 - `modules/mac_control.py` — `MacControl`: быстрые команды через `osascript` / `open` (subprocess со списком аргументов).
-- `test_json_mode.py` — рабочие unit-тесты: парсинг JSON, белый список, проверка аргументов, подтверждение по целым словам (с моками).
-- Устаревшее, не работает: `verify_local_ai.py` (ожидает строку, а `ask` возвращает dict), `test_gemini_fix.py`, `test_model_latest.py`, `list_models.py` (ссылаются на удалённый `GeminiClient` / Gemini API), `check_env.py` (отладочный скрипт).
+- `test_json_mode.py` — парсинг JSON, белый список, проверка аргументов, подтверждение по целым словам.
+- `test_main.py` — `parse_confirmation`, `normalize_ai_response`, выбор голоса, `say` с текстом после `--`, прерывание речи.
+- `verify_local_ai.py` — `LocalAIClient.ask` возвращает dict (успех, не-JSON ответ, нет связи с LM Studio).
 
 ## Запуск
 
@@ -50,16 +52,19 @@ python main.py
 ## Тесты
 
 ```bash
-python -m unittest test_json_mode.py
+python -m unittest                    # находит test_*.py
+python -m unittest verify_local_ai.py # не подходит под шаблон test*.py, запускать отдельно
 ```
 
-Тесты мокают `openai.OpenAI` и `subprocess.run` — LM Studio и микрофон не нужны.
+Тесты мокают `openai.OpenAI`, `subprocess` и микрофон — LM Studio, звук и микрофон не нужны. Лог приложения: `~/Library/Logs/Jarvis/jarvis.log` (в тестах не пишется).
 
 ## Правила при изменении кода
 
 - **Безопасность команд.** LLM не выполняет shell — только действия из `ACTIONS` в `core/ai.py`. Новое действие = отдельная функция, которая проверяет аргументы (бросает `ActionError`) и вызывает `_run([...])` со списком аргументов; добавить её в `ACTIONS` с флагом подтверждения и описать в системном промпте. Никогда не использовать `shell=True` и не подставлять пользовательские строки в текст AppleScript (передавать через `argv`). Всё, что закрывает, удаляет или открывает внешнее, — с подтверждением.
-- **Потоки и Tkinter.** Обработка идёт в фоновых `Thread`. Виджеты Tkinter менять только из главного потока — через `root.after(0, ...)`, а не напрямую из потока.
-- **TTS.** `pyttsx3.runAndWait()` на macOS не потокобезопасен: не вызывать `speak` одновременно из нескольких потоков (нужен Lock или `say` через subprocess).
+- **Потоки и Tkinter.** Обработка идёт в фоновых `Thread` и `Timer`. Виджеты не трогать из них напрямую: только `update_status` / `update_log`, которые кладут сообщение в `ui_queue`; виджеты меняет `poll_ui` в главном потоке.
+- **Озвучка.** Только через `SpeechEngine.speak` (Lock, одна фраза за раз). Команду собирает `say_command`: текст всегда после `--`, иначе текст, начинающийся с `-`, станет опцией `say` (а без текста `say` зависает, читая stdin).
+- **Микрофон.** Цикл не слушает, пока `engine.speaking` установлен, и отбрасывает фразу, если ассистент заговорил во время записи (`speech_overlaps`). Циклы — по флагу/Event (`stop_event`), не `while True`.
+- **Логирование.** `logging.getLogger(__name__)`, не `print`. `setup_logging()` вызывается только в `main.py` при запуске.
 - **Сопоставление слов.** В `MacControl` и при подтверждении («да»/«нет») сравнивать целые слова, а не подстроки: `"да" in text` срабатывает на «когда», «надо».
 - **Язык.** Интерфейс, ответы ассистента, системный промпт и комментарии — на русском.
 - **Конфигурация и секреты.** Настройки читаются из `.env` через `python-dotenv`. `.env` не коммитить.

@@ -1,44 +1,110 @@
-import speech_recognition as sr
-import pyttsx3
+import logging
+import subprocess
 import threading
+import time
+
+import speech_recognition as sr
+
+log = logging.getLogger(__name__)
+
+PREFERRED_VOICE = "Milena"
+
+
+def pick_voice(say_voices_output):
+    """Голос из вывода `say -v '?'`: Milena, иначе любой ru_RU, иначе None (системный)."""
+    russian = []
+    for line in say_voices_output.splitlines():
+        # Формат строки: "Milena              ru_RU    # Здравствуйте! Меня зовут Милена."
+        head = line.split("#", 1)[0].split()
+        if len(head) < 2:
+            continue
+        name, locale = " ".join(head[:-1]), head[-1]
+        if locale.replace("-", "_").lower().startswith("ru_"):
+            russian.append(name)
+    if PREFERRED_VOICE in russian:
+        return PREFERRED_VOICE
+    return russian[0] if russian else None
+
+
+def say_command(text, voice):
+    """Аргументы для say. Текст после "--", чтобы "-v ..." в тексте не стал опцией."""
+    args = ["say"]
+    if voice:
+        args += ["-v", voice]
+    return args + ["--", text]
+
+
+def _detect_voice():
+    try:
+        result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError) as e:
+        log.warning("Не удалось получить список голосов: %s", e)
+        return None
+    return pick_voice(result.stdout)
 
 
 class SpeechEngine:
     def __init__(self):
-        # На Mac используется драйвер 'nsss' (NSSpeechSynthesizer)
-        self.engine = pyttsx3.init('nsss')
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
 
-        # Настройка голоса (попытка найти русский)
-        voices = self.engine.getProperty('voices')
-        for voice in voices:
-            if 'ru' in voice.languages or 'Russian' in voice.name:
-                self.engine.setProperty('voice', voice.id)
-                break
+        self.voice = _detect_voice()
+        log.info("Голос озвучки: %s", self.voice or "системный по умолчанию")
 
-        # Скорость речи (на Mac лучше ставить чуть медленнее стандартной)
-        self.engine.setProperty('rate', 170)
+        self._speak_lock = threading.Lock()  # одновременно звучит только одна фраза
+        self._proc = None
+        self._stop_generation = 0  # растёт при stop_speaking: фразы в очереди отменяются
+        self._last_speech_end = 0.0
+        self.speaking = threading.Event()
 
     def speak(self, text):
-        print(f"🗣 Assistant: {text}")
-        # pyttsx3 на Mac иногда капризничает в потоках, используем блокировку
-        self.engine.say(text)
-        self.engine.runAndWait()
+        if not text:
+            return
+        generation = self._stop_generation
+        with self._speak_lock:
+            if generation != self._stop_generation:
+                return  # речь прервали, пока фраза ждала своей очереди
+            log.info("🗣 Assistant: %s", text)
+            self.speaking.set()
+            try:
+                # Popen, а не run: процесс нужен, чтобы stop_speaking мог его прервать
+                self._proc = subprocess.Popen(say_command(text, self.voice))
+                self._proc.wait()
+            except OSError as e:
+                log.error("Ошибка озвучки: %s", e)
+            finally:
+                self._proc = None
+                self._last_speech_end = time.monotonic()
+                self.speaking.clear()
+
+    def stop_speaking(self):
+        """Прерывает текущую фразу и отменяет ждущие."""
+        self._stop_generation += 1
+        proc = self._proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+    def speech_overlaps(self, since):
+        """Говорил ли ассистент после момента since (time.monotonic())."""
+        return self.speaking.is_set() or self._last_speech_end > since
+
+    def calibrate(self):
+        """Калибровка шума — один раз при старте прослушивания."""
+        with self.microphone as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
 
     def listen(self):
         with self.microphone as source:
-            print("🎤 Слушаю...")
-            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            log.info("🎤 Слушаю...")
             try:
                 audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
                 text = self.recognizer.recognize_google(audio, language="ru-RU")
-                print(f"👤 Вы: {text}")
+                log.info("👤 Вы: %s", text)
                 return text.lower()
             except sr.WaitTimeoutError:
                 return None
             except sr.UnknownValueError:
                 return None
             except Exception as e:
-                print(f"Ошибка микрофона: {e}")
+                log.error("Ошибка микрофона: %s", e)
                 return None
