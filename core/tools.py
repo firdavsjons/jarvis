@@ -1,0 +1,69 @@
+"""Действия белого списка как function-tools в формате OpenAI и разбор вызовов модели."""
+import json
+
+
+def _tool(name, description, properties=None, required=()):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties or {}, "required": list(required)},
+        },
+    }
+
+
+_APP = {"app": {"type": "string", "description": "Название приложения как в macOS, по-английски: Safari, Telegram"}}
+
+TOOLS = [
+    _tool("open_app", "Открыть установленное приложение.", _APP, ["app"]),
+    _tool("quit_app", "Закрыть приложение.", _APP, ["app"]),
+    _tool("set_volume", "Установить громкость звука.",
+          {"level": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Громкость 0–100"}}, ["level"]),
+    _tool("open_url", "Открыть сайт в браузере.",
+          {"url": {"type": "string", "description": "Ссылка http или https"}}, ["url"]),
+    _tool("trash_file", "Переместить файл или папку пользователя в Корзину (не удаляет навсегда).",
+          {"path": {"type": "string", "description": "Полный путь от / или ~, например ~/Desktop/отчёт.txt"}},
+          ["path"]),
+    _tool("find_apps", "Найти установленные приложения по названию или его части.",
+          {"query": {"type": "string", "description": "Что искать, например telegram"}}, ["query"]),
+    _tool("list_apps", "Список установленных приложений, популярные первыми."),
+    _tool("get_time", "Текущие дата, время и день недели."),
+]
+
+TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+
+
+def tools_subset(names):
+    return [t for t in TOOLS if t["function"]["name"] in names]
+
+
+def call_to_action(call):
+    """{"id", "name", "arguments"} -> ({"name", "args"}, None) или (None, «неверные параметры»)."""
+    raw = call.get("arguments") or "{}"
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return None, "неверные параметры"
+    if not isinstance(args, dict):
+        return None, "неверные параметры"
+    return {"name": call.get("name"), "args": args}, None
+
+
+def assistant_message(response):
+    """Сообщение модели с вызовами инструментов — чтобы вернуть ей результаты следующим кругом."""
+    return {
+        "role": "assistant",
+        "content": response.text or None,
+        "tool_calls": [{"id": c["id"], "type": "function",
+                        "function": {"name": c["name"], "arguments": c.get("arguments") or "{}"}}
+                       for c in response.tool_calls],
+    }
+
+
+HONESTY_NOTE = "Действие НЕ выполнено. Ответь пользователю честно, что не получилось, и не утверждай успех."
+
+
+def tool_message(call_id, ok, result=None, error=None):
+    payload = {"ok": True, "result": result} if ok else {"ok": False, "error": error, "note": HONESTY_NOTE}
+    return {"role": "tool", "tool_call_id": call_id, "content": json.dumps(payload, ensure_ascii=False)}

@@ -10,22 +10,28 @@
         ▼
 VoiceApp.process_command            (main.py)
         │
-        ├─► MacControl.execute(text)   (modules/mac_control.py)
-        │     жёсткие команды по ключевым словам: громкость, mute, браузер, Spotify, калькулятор
-        │     вернул строку → озвучить и выйти
+        ├─► «забудь разговор» → история очищена (core/history.py)
         │
-        └─► AIClient.ask(text)         (core/ai.py)
+        ├─► MacControl.execute(text)   (modules/mac_control.py)
+        │     короткие фразы: громкость, mute, браузер, Spotify, калькулятор; вернул строку → озвучить и выйти
+        │
+        └─► AIClient.respond(text) → Turn(speech, pending, blocked, results)   (core/ai.py)
+              промпт (core/prompts.py: дата/время + характер Jarvis) + история (6 сообщений, ≤2000 симв.)
               llm.chat → FallbackClient (core/llm): gemini → groq → local из LLM_PROVIDERS;
-              ошибка/429/таймаут 15 с → следующий, упавший на паузе 60 с; ≥90% дневного лимита — пропуск;
-              все упали → «Нет связи с моделью…» без исключения
-              ответ — JSON {"response": "...", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}
+              ошибка/429/таймаут (облако 15 с, LOCAL_TIMEOUT 45 с) → следующий, пауза 60 с; ≥90% лимита — пропуск
               │
-              └─ actions  → split_actions → safety.classify (core/safety.py)
-                   есть BLOCKED → весь ответ отклонён (и текст модели), «Это слишком опасно…», журнал
-                   SAFE    → озвучить response, execute_actions сразу
-                             (open_app, set_volume, quit_app кроме CAREFUL_APPS, доверенные сайты)
-                   CONFIRM → вопрос голосом, затем таймер 20 с; «да» → execute_actions(confirmed=True)
-                             (trash_file, сайты не из trusted_domains.txt, quit_app для CAREFUL_APPS)
+              ├─ модель с инструментами (*_TOOLS=true): tool_calls (core/tools.py) → safety.classify
+              │    есть BLOCKED → весь ответ отклонён, «Это слишком опасно…», журнал
+              │    есть CONFIRM → SAFE выполнить, про CONFIRM — вопрос, модели ничего не возвращать
+              │    только SAFE  → выполнить, результат — модели ролью tool (при ошибке — «ответь честно»),
+              │                   до 3 кругов, дальше «Не получилось завершить запрос»
+              │    финальный текст; если инструмент упал, а текст похож на успех → «Не получилось: …»
+              │
+              └─ модель без инструментов (LOCAL_TOOLS=false): старый режим JSON {"response", "actions"}
+                   (во 2-м круге её пропускаем — ответ строится по результатам действий без модели)
+              SAFE: open_app, set_volume, find_apps, list_apps, get_time, quit_app кроме CAREFUL_APPS, доверенные сайты
+              CONFIRM: trash_file, сайты не из trusted_domains.txt, quit_app для CAREFUL_APPS
+                       → вопрос, таймер 20 с; «да» → execute_actions(confirmed=True) → «Готово» / «Не получилось: …»
 ```
 
 Если есть отложенные действия, следующая фраза (голос или текст) в `process_command` считается ответом на подтверждение (`parse_confirmation`, целые слова). `execute_actions` перепроверяет уровень прямо перед запуском: BLOCKED не выполняется никогда, CONFIRM — только с `confirmed=True`. Каждое действие (выполнено, отклонено, «нет», таймаут) пишется в `~/Library/Logs/Jarvis/actions.jsonl`.
@@ -36,7 +42,10 @@ VoiceApp.process_command            (main.py)
 - `core/engine.py` — `SpeechEngine`: STT через `recognize_google` (ru-RU, онлайн), калибровка шума `calibrate()` один раз при старте; TTS через `say` (голос Milena или другой ru_RU, `pick_voice`), прерывание `stop_speaking()`, флаг `speaking`.
 - `core/logger.py` — `setup_logging()`: лог в консоль и в `~/Library/Logs/Jarvis/jarvis.log`; `SecretFilter` / `register_secret` / `redact_secrets` — ключи API заменяются на `***` в любом сообщении и трассировке.
 - `core/llm/` — слой LLM: `base.py` (`LLMClient`, `LLMResponse`, `describe_error`), `providers.py` (`load_config` — только файл `.env`, `OpenAICompatProvider`, `build_providers`), `router.py` (`FallbackClient`, `build_default_client`), `usage.py` (`UsageTracker`, `llm_usage.json`, сутки Gemini — по тихоокеанскому времени), `check.py` (проверка связи).
-- `core/ai.py` — белый список действий `ACTIONS` (`open_app`, `quit_app`, `set_volume`, `open_url`, `trash_file`) и `AIClient(llm)`: системный промпт, запрос через `core/llm`, парсинг JSON, `split_actions` / `execute_actions` / `reject_actions`.
+- `core/ai.py` — белый список действий `ACTIONS` (`open_app`, `quit_app`, `set_volume`, `open_url`, `trash_file`, `find_apps`, `list_apps`, `get_time`) и `AIClient(llm)`: `respond()` (цикл инструментов, режим JSON, страховка от неправды, история), `run_actions` / `split_actions` / `reject_actions`, `ask()` (один запрос в режиме JSON).
+- `core/tools.py` — схемы инструментов OpenAI (`TOOLS`), разбор вызовов, сообщения `assistant`/`tool`.
+- `core/prompts.py` — характер Jarvis (`tools_prompt` ≤1200 символов, `json_prompt` для моделей без инструментов), `describe_now`.
+- `core/history.py` — `ConversationHistory` (6 сообщений, ≤2000 символов, только память), `is_forget_command`.
 - `core/safety.py` — уровни риска: `classify(action)`, `classify_path` (только внутри дома, без `~/Library` и скрытых файлов верхнего уровня), `classify_url` (по `trusted_domains.txt`), `CAREFUL_APPS`.
 - `core/journal.py` — журнал действий `actions.jsonl`, `redact()` скрывает пароли и токены. Включается `setup_journal()` только при запуске `main.py`.
 - `core/speech_text.py` — `prepare_for_speech` (вызывается в `speak`: ссылки → «ютуб точка ком», пути → «отчёт точка тэ-экс-тэ, с рабочего стола», без Markdown и эмодзи) и короткие вопросы `confirmation_question`.
@@ -53,6 +62,7 @@ VoiceApp.process_command            (main.py)
 - `fixtures_apps.py` — `patch_installed()`: фиксированный список «установленных» приложений для тестов (не `test*.py`, поэтому не запускается сам).
 - `verify_local_ai.py` — `AIClient.ask` возвращает dict (успех, не-JSON ответ, все провайдеры недоступны, исключение).
 - `test_llm.py` — цепочка провайдеров (429, таймаут, 5xx, 401/404, пустой ответ), пауза 60 с, лимиты, чтение `.env`, ключи не утекают (без сети).
+- `test_tools.py` — цикл инструментов на мок-LLM: SAFE → результат модели, ошибка → честный ответ, BLOCKED, CONFIRM до/после «да», 3 круга, история, режим JSON, флаги и таймауты, `get_time`, промпт.
 
 ## Запуск
 
@@ -60,7 +70,8 @@ VoiceApp.process_command            (main.py)
 brew install portaudio          # нужен для pyaudio
 pip install -r requirements.txt
 cp .env.example .env            # вписать GEMINI_API_KEY и GROQ_API_KEY
-python -m core.llm.check        # связь с провайдерами (--models — список моделей, --provider groq — один)
+python -m core.llm.check        # связь с провайдерами (--models — список моделей, --provider groq — один,
+                                #   --tools — «Который час?» с get_time, 2 запроса на провайдера)
 # LM Studio (запасной вариант): загрузить модель → Developer → Start Server (порт 1234)
 python main.py
 ```
@@ -81,6 +92,7 @@ python -m unittest verify_local_ai.py # не подходит под шабло�
 - **Безопасность команд.** LLM не выполняет shell — только действия из `ACTIONS` в `core/ai.py`. Новое действие = отдельная функция, которая проверяет аргументы (бросает `ActionError`) и вызывает `_run([...])` со списком аргументов; добавить её в `ACTIONS`, имя — в `safety.ACTION_NAMES`, правило уровня — в `safety.classify`, описание — в системный промпт, тесты — в `test_safety.py`. Никогда не использовать `shell=True` и не подставлять пользовательские строки в текст AppleScript (передавать через `argv`).
 - **Уровни риска.** Решает только `core/safety.py`. Удаление — только `trash_file` (Корзина через Finder), никогда `rm`/`os.remove`/`shutil.rmtree`. Пути — через `classify_path` (expanduser + realpath, сравнение без учёта регистра). В тестах `subprocess.run` всегда мок, реальное удаление не запускать.
 - **Приложения.** Имя приложения — только через `installed_apps.resolve_app_name` (и при выполнении, и в `safety.classify`), чтобы уровень и действие относились к одному приложению. Тесты, где есть `open_app` / `quit_app`, используют `fixtures_apps.patch_installed()` и не зависят от того, что установлено на Mac.
+- **Инструменты.** Новое действие = функция в `ACTIONS` + уровень в `safety` + схема в `core/tools.py` (тест сверяет наборы имён) + строка в `prompts.JSON_FORMAT`. Модели возвращать только `ok` и короткий результат/причину, без ключей и путей вне нужного. Промпт `tools_prompt` держать ≤1200 символов (тест), список приложений в промпт не добавлять — для этого `find_apps` / `list_apps`.
 - **Честный результат.** SAFE: сначала выполнить, потом сказать (ответ модели — только при успехе). CONFIRM: вопрос → «Выполняю» → результат; ответ модели до подтверждения не озвучивать. «Готово» — только если все действия успешны, иначе «Не получилось: <ActionError.short>».
 - **MacControl.** Перехватывает только короткие фразы (глагол + приложение или команда громкости, плюс «пожалуйста», «мне», «а») и только если команда реально выполнилась; иначе `None` — решает нейросеть.
 - **Потоки и Tkinter.** Обработка идёт в фоновых `Thread` и `Timer`. Виджеты не трогать из них напрямую: только `update_status` / `update_log`, которые кладут сообщение в `ui_queue`; виджеты меняет `poll_ui` в главном потоке.

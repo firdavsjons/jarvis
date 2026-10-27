@@ -185,8 +185,10 @@ class TestAppActions(unittest.TestCase):
         self.assertEqual(result["short"], "нужно подтверждение")
         self.mock_run.assert_not_called()
 
-    def test_prompt_lists_installed_apps(self):
-        self.assertIn("Установленные приложения: Safari, Telegram, Google Chrome", self.client.system_prompt)
+    def test_prompt_points_to_find_apps(self):
+        # С шага 4.2 списка приложений в промпте нет: его дают find_apps / list_apps
+        self.assertNotIn("Установленные приложения", self.client.system_prompt)
+        self.assertNotIn("Telegram, Google Chrome", self.client.system_prompt)
         self.assertIn("find_apps", self.client.system_prompt)
         print("✅ Действия с приложениями: OK")
 

@@ -47,10 +47,33 @@ def check_provider(provider, show_models=False, out=sys.stdout):
     return status == "OK"
 
 
+TOOLS_PROMPT = "Который час?"
+
+
+def check_tools(provider, out=sys.stdout):
+    """Живая проверка tool calling: «Который час?» с единственным инструментом get_time.
+    Выполнить модель может только get_time (только чтение) — на Mac ничего не меняется."""
+    from core.ai import AIClient
+    from core.llm.router import FallbackClient
+    from core.tools import tools_subset
+
+    client = AIClient(llm=FallbackClient([provider]), tools=tools_subset({"get_time"}),
+                      allowed_actions={"get_time"})
+    started = time.monotonic()
+    turn = client.respond(TOOLS_PROMPT)
+    elapsed = time.monotonic() - started
+    called = any(isinstance(r.get("action"), dict) and r["action"].get("name") == "get_time" and r.get("ok")
+                 for r in turn.results)
+    _print(f"{provider.name:<7} get_time: {'да' if called else 'нет':<4} {elapsed:5.1f} с   «{turn.speech}»", out)
+    return called
+
+
 def main(argv=None, config=None, out=sys.stdout):
     parser = argparse.ArgumentParser(description="Проверка связи с LLM-провайдерами")
     parser.add_argument("--models", action="store_true", help="показать доступные модели")
     parser.add_argument("--provider", help="проверить только этого провайдера (gemini, groq, local)")
+    parser.add_argument("--tools", action="store_true",
+                        help="живая проверка tool calling: «Который час?» с get_time (2 запроса на провайдера)")
     args = parser.parse_args(argv)
 
     config = load_config() if config is None else config
@@ -62,7 +85,10 @@ def main(argv=None, config=None, out=sys.stdout):
         if name in PROVIDER_SPECS and name not in configured:
             _print(f"{name:<7} пропущен: в .env не задан {PROVIDER_SPECS[name].key_var}", out)
 
-    results = [check_provider(p, args.models, out) for p in providers]
+    if args.tools:
+        results = [check_tools(p, out) for p in providers if p.supports_tools]
+    else:
+        results = [check_provider(p, args.models, out) for p in providers]
     return 0 if any(results) else 1
 
 

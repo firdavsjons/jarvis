@@ -6,7 +6,8 @@ import tkinter as tk
 from threading import Thread, Lock, Timer, Event
 from dotenv import load_dotenv
 from core.engine import SpeechEngine
-from core.ai import AIClient, describe_action, summarize_results
+from core.ai import BLOCKED_REPLY, AIClient, describe_action, normalize_ai_response, summarize_results
+from core.history import FORGET_REPLY, is_forget_command
 from core.journal import setup_journal
 from core.llm import build_default_client
 from core.logger import LOG_DIR, setup_logging
@@ -18,7 +19,6 @@ log = logging.getLogger(__name__)
 CONFIRM_WORDS = {"да", "подтверждаю", "выполняй"}
 CANCEL_WORDS = {"нет", "отмена"}
 CONFIRM_TIMEOUT = 20  # секунд на подтверждение после вопроса, потом действия отменяются
-BLOCKED_REPLY = "Это слишком опасно, я этого не сделаю."
 UI_POLL_MS = 100  # как часто главный поток забирает обновления окна из очереди
 
 
@@ -33,17 +33,6 @@ def parse_confirmation(text):
     if words & CONFIRM_WORDS:
         return True
     return None
-
-
-def normalize_ai_response(data):
-    """(текст ответа, действия) из результата ai.ask. Неожиданный формат — пустой ответ."""
-    if not isinstance(data, dict):
-        log.warning("Ответ AI не словарь: %r", data)
-        return "", []
-    response_text = data.get("response")
-    if not isinstance(response_text, str):
-        response_text = ""
-    return response_text, data.get("actions", [])
 
 
 class VoiceApp:
@@ -184,6 +173,7 @@ class VoiceApp:
             self.pending_timer = None
         log.info("⌛ Подтверждение не получено за %s с, отменено: %s", CONFIRM_TIMEOUT, actions)
         self.ai.reject_actions(actions, phrase, f"нет ответа за {CONFIRM_TIMEOUT} с", confirmed=False)
+        self.ai.remember("(нет ответа)", "Время вышло, отменено.")
         self.engine.speak("Время вышло, отменено.")
         self.set_idle_status()
 
@@ -200,10 +190,14 @@ class VoiceApp:
         if answer:
             self.update_status("Выполняю...", "green")
             self.engine.speak("Выполняю.")
-            ok, summary = self.report_result(self.ai.run_actions(actions, phrase=phrase, confirmed=True))
-            self.engine.speak(summary if not ok else (summary or "Готово."))
+            results = self.ai.run_actions(actions, phrase=phrase, confirmed=True)
+            ok, summary = self.report_result(results)
+            reply = summary if not ok else (summary or "Готово.")
+            self.ai.remember(text, reply, results)
+            self.engine.speak(reply)
         else:
             self.ai.reject_actions(actions, phrase, "отменено пользователем", confirmed=False)
+            self.ai.remember(text, "Отменено.")
             self.engine.speak("Отменено.")
         self.set_idle_status()
 
@@ -224,49 +218,44 @@ class VoiceApp:
             self.handle_confirmation(text)
             return
 
-        # 1. Проверяем жесткие системные команды (громкость и т.д.)
+        # 1. «Забудь разговор» — до MacControl и до модели
+        if is_forget_command(text):
+            self.ai.forget()
+            self.engine.speak(FORGET_REPLY)
+            self.set_idle_status()
+            return
+
+        # 2. Проверяем жесткие системные команды (громкость и т.д.)
         sys_response = self.mac.execute(text)
         if sys_response:
             self.engine.speak(sys_response)
             self.set_idle_status()
             return
 
-        # 2. Спрашиваем AI
+        # 3. Модель: инструменты (или JSON у моделей без них) — решение и честный текст строит ai.respond
         self.update_status("Думаю...", "blue")
-        response_text, actions = normalize_ai_response(self.ai.ask(text))
-        immediate, to_confirm, blocked = self.ai.split_actions(actions)
+        turn = self.ai.respond(text)
 
-        # Хоть одно опасное действие — отклоняем весь ответ, включая текст модели
-        if blocked:
-            self.ai.reject_actions(actions, text, "в ответе есть опасное действие")
+        if turn.blocked:
             self.update_log("⛔ Отклонено: " + ", ".join(describe_action(a) if isinstance(a, dict) else str(a)
-                                                          for a in blocked))
-            self.engine.speak(BLOCKED_REPLY)
+                                                          for a in turn.blocked))
+            self.engine.speak(turn.speech or BLOCKED_REPLY)
             self.set_idle_status()
             return
 
-        # SAFE — сначала выполнить, потом сказать правду. Ответ модели («Открываю Telegram») звучит,
-        # только если всё получилось и ничего не ждёт подтверждения: иначе он мог бы быть неправдой
-        if immediate:
-            self.update_status("Выполняю...", "green")
-            ok, summary = self.report_result(self.ai.run_actions(immediate, phrase=text))
-            if not ok:
-                self.engine.speak(summary)
-            elif to_confirm:
-                if summary:
-                    self.engine.speak(summary)  # результаты find_apps / list_apps
-            else:
-                self.engine.speak(" ".join(p for p in (response_text, summary) if p) or "Готово.")
-        elif response_text and not to_confirm:
-            self.engine.speak(response_text)
+        if turn.results:
+            self.report_result(turn.results)
+        # Звучит только после выполнения инструментов; при ошибке — «Не получилось: …»
+        if turn.speech:
+            self.engine.speak(turn.speech)
 
         # CONFIRM — только после «да»; таймер ожидания стартует после вопроса
-        if to_confirm:
-            self.set_pending(to_confirm, text)
+        if turn.pending:
+            self.set_pending(turn.pending, text)
             self.update_status("Подтвердите действия...", "orange")
-            self.update_log("Подтвердите: " + "; ".join(describe_action(a) for a in to_confirm))
-            self.engine.speak(confirmation_question(to_confirm))
-            self.start_pending_timer(to_confirm)
+            self.update_log("Подтвердите: " + "; ".join(describe_action(a) for a in turn.pending))
+            self.engine.speak(confirmation_question(turn.pending))
+            self.start_pending_timer(turn.pending)
         else:
             self.set_idle_status()
 

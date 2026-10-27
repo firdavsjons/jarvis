@@ -23,10 +23,16 @@ class FallbackClient(LLMClient):
         self._clock = clock
         self._down_until = {}  # провайдер -> до какого момента не пробовать
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, json_messages=None):
+        """tools — инструменты; провайдер без их поддержки получает json_messages (старый режим JSON),
+        а если json_messages нет (2-й круг с результатами инструментов) — пропускается."""
         for provider in self.providers:
             if self._clock() < self._down_until.get(provider.name, 0):
                 log.debug("LLM %s пропущен: недавно падал", provider.name)
+                continue
+            use_json = bool(tools) and not getattr(provider, "supports_tools", True)
+            if use_json and json_messages is None:
+                log.debug("LLM %s пропущен: без инструментов, а нужен ответ на их результаты", provider.name)
                 continue
             if self.usage.near_limit(provider.name):
                 continue
@@ -34,7 +40,11 @@ class FallbackClient(LLMClient):
             self.usage.record(provider.name)
             started = self._clock()
             try:
-                response = provider.chat(messages, tools)
+                if use_json:
+                    response = provider.chat(json_messages)
+                    response.mode = "json"
+                else:
+                    response = provider.chat(messages, tools)
             except Exception as e:
                 reason = describe_error(e)
                 self._down_until[provider.name] = self._clock() + COOLDOWN_SECONDS

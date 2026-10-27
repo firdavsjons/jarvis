@@ -12,6 +12,7 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from core import journal, safety
 from core.ai import ACTIONS, AIClient
 from core.safety import BLOCKED, CONFIRM, SAFE, classify, classify_path, classify_url
+from core.llm import LLMResponse
 from fixtures_apps import patch_installed
 import main
 
@@ -267,9 +268,10 @@ class TestBlockedReply(unittest.TestCase):
     """VoiceApp.process_command без окна: self — мок, ai — настоящий."""
 
     def make_app(self, ai_reply):
-        with patch('openai.OpenAI'):
-            client = AIClient(llm=MagicMock())
-        client.ask = MagicMock(return_value=ai_reply)
+        # Модель без инструментов (режим JSON): отвечает JSON-текстом
+        llm = MagicMock()
+        llm.chat.return_value = LLMResponse(ok=True, text=json.dumps(ai_reply, ensure_ascii=False), mode="json")
+        client = AIClient(llm=llm)
         app = MagicMock()
         app.ai = client
         app.has_pending.return_value = False

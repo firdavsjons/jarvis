@@ -16,7 +16,8 @@ CONFIRM = "CONFIRM"
 BLOCKED = "BLOCKED"
 
 # Белый список: всё остальное (sudo, shell, rm, форматирование, настройки безопасности...) — BLOCKED
-ACTION_NAMES = {"open_app", "quit_app", "set_volume", "open_url", "trash_file", "find_apps", "list_apps"}
+ACTION_NAMES = {"open_app", "quit_app", "set_volume", "open_url", "trash_file", "find_apps", "list_apps",
+                "get_time"}
 
 # Закрыть можно сразу (macOS сама спросит про несохранённое), кроме этих приложений
 CAREFUL_APPS = {"Terminal", "iTerm", "iTerm2", "Visual Studio Code", "Code", "Xcode", "PyCharm",
@@ -120,7 +121,7 @@ def classify(action, trusted=None, home=None):
 
     if name in ("open_app", "set_volume"):
         return SAFE, "безопасное действие"
-    if name in ("find_apps", "list_apps"):
+    if name in ("find_apps", "list_apps", "get_time"):
         return SAFE, "только чтение"
     if name == "quit_app":
         app = args.get("app")

@@ -9,9 +9,10 @@ NO_CONNECTION_REPLY = "Нет связи с моделью. Попробуйте
 class LLMResponse:
     ok: bool
     text: str = ""
-    tool_calls: list = field(default_factory=list)  # для tool calling (шаг 4.2)
+    tool_calls: list = field(default_factory=list)  # [{"id", "name", "arguments": str JSON}]
     provider: str = None
     model: str = None
+    mode: str = "text"  # "tools" — запрос с инструментами, "json" — старый режим JSON в тексте
 
 
 class LLMClient:

@@ -4,15 +4,27 @@ import json
 import re
 import os
 import unicodedata
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from core import installed_apps, journal, safety
+from core import installed_apps, journal, prompts, safety
+from core.history import ConversationHistory
 from core.llm import build_default_client
+from core.speech_text import confirmation_question
+from core.tools import TOOLS, assistant_message, call_to_action, tool_message
 
 log = logging.getLogger(__name__)
 
 TIMEOUT = 10
 SPOKEN_LIST_LIMIT = 10  # сколько названий читать вслух, остальное — в окне
+MAX_TOOL_ROUNDS = 3     # кругов «модель вызвала инструменты -> мы вернули результаты»
+
+BLOCKED_REPLY = "Это слишком опасно, я этого не сделаю."
+TOO_MANY_ROUNDS_REPLY = "Не получилось завершить запрос."
+AI_ERROR_REPLY = "Произошла ошибка при обращении к нейросети."
+# Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
+_ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
+                                re.IGNORECASE)
 
 
 class ActionError(ValueError):
@@ -138,6 +150,12 @@ def list_apps():
     return Done(f"Установлены: {', '.join(apps)}", f"Установлены: {_spoken_list(apps)}.")
 
 
+def get_time():
+    """Только чтение: текущие дата, время и день недели (системный часовой пояс)."""
+    now = prompts.describe_now()
+    return Done(f"Сейчас {now}", f"Сейчас {now}.")
+
+
 # Белый список: имя -> функция. Уровень риска — в core/safety.py
 ACTIONS = {
     "open_app": open_app,
@@ -147,6 +165,7 @@ ACTIONS = {
     "trash_file": trash_file,
     "find_apps": find_apps,
     "list_apps": list_apps,
+    "get_time": get_time,
 }
 
 
@@ -175,66 +194,155 @@ def summarize_results(results):
     return True, " ".join(r["speech"] for r in results if r["speech"])
 
 
+def normalize_ai_response(data):
+    """(текст ответа, действия) из ответа модели в режиме JSON. Неожиданный формат — пустой ответ."""
+    if not isinstance(data, dict):
+        log.warning("Ответ AI не словарь: %r", data)
+        return "", []
+    response_text = data.get("response")
+    if not isinstance(response_text, str):
+        response_text = ""
+    return response_text, data.get("actions", [])
+
+
+@dataclass
+class Turn:
+    """Итог одной фразы пользователя: что сказать сейчас и что ждёт подтверждения."""
+    speech: str = ""
+    pending: list = field(default_factory=list)  # CONFIRM-действия: main задаёт вопрос
+    blocked: list = field(default_factory=list)  # BLOCKED: весь ответ отклонён
+    results: list = field(default_factory=list)  # выполненные действия — для окна и лога
+
+
 class AIClient:
-    def __init__(self, llm=None):
+    def __init__(self, llm=None, tools=TOOLS, allowed_actions=None):
         # Провайдеры (Gemini → Groq → LM Studio) с запасными вариантами — core/llm, настройки из .env
         self.llm = llm if llm is not None else build_default_client()
+        self.tools = tools
+        self.allowed_actions = allowed_actions  # None — весь белый список (подмножество — для проверки связи)
+        self.history = ConversationHistory()
 
-        # Системный промпт для JSON
-        self.system_prompt = (
-            "Ты — голосовой ассистент для macOS. Ты управляешь компьютером только через действия из списка ниже.\n"
-            "Shell-команд нет: никакие другие действия выполнить нельзя.\n"
-            "Формат ответа СТРОГО JSON. Не пиши никакого лишнего текста, только JSON объект.\n"
-            "Структура JSON:\n"
-            "{\n"
-            '  "response": "Текст, который нужно произнести пользователю (на русском).",\n'
-            '  "actions": [\n'
-            '    {"name": "имя действия", "args": {...}}\n'
-            '  ]\n'
-            "}\n"
-            "Доступные действия:\n"
-            '- open_app: открыть приложение. args: {"app": "Safari"}\n'
-            '- quit_app: закрыть приложение. args: {"app": "Safari"}\n'
-            '- set_volume: установить громкость 0-100. args: {"level": 50}\n'
-            '- open_url: открыть ссылку http/https в браузере. args: {"url": "https://example.com"}\n'
-            '- trash_file: переместить файл или папку пользователя в Корзину. args: {"path": "~/Desktop/отчёт.txt"}\n'
-            '- find_apps: найти установленные приложения по названию или части. args: {"query": "telegram"}\n'
-            "- list_apps: список установленных приложений. args: {}\n"
-            "Названия приложений передавай по-английски, как они называются в macOS: "
-            "Calculator, Safari, Telegram, Google Chrome, Notes.\n"
-            f"Установленные приложения: {', '.join(installed_apps.popular_first(installed_apps.list_installed_apps(), 40))}.\n"
-            "Если пользователь просит открыть приложение, которого нет в этом списке, сначала вызови find_apps "
-            "и не обещай открыть его в response.\n"
-            "Удалять файлы можно ТОЛЬКО через trash_file: это перемещение в Корзину, файл можно восстановить. "
-            "Путь — полный, от / или ~. Удалять можно только файлы пользователя в домашней папке. "
-            "Системные папки (/System, /Library, /Applications, ~/Library, скрытые файлы) и домашнюю папку целиком "
-            "удалять нельзя: вежливо откажи и оставь actions пустым.\n"
-            "Если действий не требуется или запрос нельзя выполнить этими действиями, оставь массив actions пустым "
-            "и объясни это в response.\n"
-            "В response не пиши ссылки, пути к файлам и Markdown: текст будет прочитан вслух.\n"
-            "Примеры:\n"
-            'Пользователь: "Привет"\n'
-            'Ответ: {"response": "Привет! Чем могу помочь?", "actions": []}\n'
-            'Пользователь: "Открой Сафари и сделай громкость на половину"\n'
-            'Ответ: {"response": "Открываю Safari и ставлю громкость 50.", "actions": '
-            '[{"name": "open_app", "args": {"app": "Safari"}}, {"name": "set_volume", "args": {"level": 50}}]}\n'
-            'Пользователь: "Удали файл отчёт с рабочего стола"\n'
-            'Ответ: {"response": "Перемещаю отчёт в Корзину.", "actions": '
-            '[{"name": "trash_file", "args": {"path": "~/Desktop/отчёт.txt"}}]}\n'
-            'Пользователь: "Удали папку System"\n'
-            'Ответ: {"response": "Системные файлы удалять нельзя.", "actions": []}\n'
-        )
+    @property
+    def system_prompt(self):
+        return prompts.tools_prompt()
+
+    def forget(self):
+        self.history.clear()
+
+    def remember(self, user_text, assistant_text, results=()):
+        self.history.add_exchange(user_text, assistant_text, results)
+
+    # --- Режим инструментов ---
+
+    def respond(self, text):
+        """Фраза пользователя -> Turn. Инструменты: SAFE — выполнить и вернуть модели результат (до 3 кругов),
+        CONFIRM — вопрос пользователю, BLOCKED — отклонить весь ответ. Модели без инструментов — режим JSON."""
+        history = self.history.messages()
+        user = {"role": "user", "content": text}
+        messages = [{"role": "system", "content": prompts.tools_prompt()}, *history, user]
+        json_messages = [{"role": "system", "content": prompts.json_prompt()}, *history, user]
+        executed = []
+
+        for round_no in range(MAX_TOOL_ROUNDS + 1):
+            try:
+                # json_messages только в первом круге: без инструментов результаты им не вернуть
+                response = self.llm.chat(messages, tools=self.tools,
+                                         json_messages=json_messages if round_no == 0 else None)
+            except Exception as e:
+                log.error("❌ Ошибка запроса к AI: %s", type(e).__name__)
+                return self._finish(text, self._results_turn(executed, AI_ERROR_REPLY))
+            if not response.ok:
+                # Нет связи — или остался только провайдер без инструментов: ответ по результатам, без модели
+                return self._finish(text, self._results_turn(executed, response.text))
+            if response.mode == "json":
+                return self._finish(text, self._json_turn(text, response.text))
+            if not response.tool_calls:
+                return self._finish(text, Turn(self._honest(response.text, executed), results=executed))
+            if round_no == MAX_TOOL_ROUNDS:
+                log.warning("LLM: больше %s кругов с инструментами — прерываю", MAX_TOOL_ROUNDS)
+                return self._finish(text, Turn(TOO_MANY_ROUNDS_REPLY, results=executed))
+
+            calls = []  # (вызов, действие или None, ошибка разбора)
+            for call in response.tool_calls:
+                action, error = call_to_action(call)
+                calls.append((call, action, error))
+            actions = [a for _, a, _ in calls if a is not None]
+            safe, confirm, blocked = self.split_actions(actions)
+
+            if blocked:
+                self.reject_actions(actions, text, "в ответе есть опасное действие")
+                return self._finish(text, Turn(BLOCKED_REPLY, blocked=blocked, results=executed))
+            if confirm:
+                # SAFE — сейчас, CONFIRM — после «да»; модели ничего не возвращаем, пока пользователь не ответит
+                results = self.run_actions(safe, phrase=text)
+                executed += results
+                ok, summary = summarize_results(results)
+                return self._finish(text, Turn(summary, pending=confirm, results=executed))
+
+            results = iter(self.run_actions(safe, phrase=text))
+            messages = messages + [assistant_message(response)]
+            for call, action, error in calls:
+                if action is None:
+                    executed.append({"action": {"name": call.get("name"), "args": {}}, "ok": False,
+                                     "short": error, "speech": None, "message": f"⛔ {error}"})
+                    messages.append(tool_message(call["id"], False, error=error))
+                    continue
+                result = next(results)
+                executed.append(result)
+                messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
+                                             error=result["short"]))
+
+        return self._finish(text, Turn(TOO_MANY_ROUNDS_REPLY, results=executed))
+
+    def _honest(self, final_text, executed):
+        """Страховка: инструмент упал, а модель говорит как об успехе — говорим правду сами."""
+        ok, summary = summarize_results(executed)
+        if not ok and not _ADMITS_FAILURE_RE.search(final_text or ""):
+            log.warning("LLM: ответ похож на успех после ошибки инструмента — заменяю: %s", final_text)
+            return summary
+        return final_text
+
+    def _results_turn(self, executed, fallback_text):
+        if not executed:
+            return Turn(fallback_text)
+        ok, summary = summarize_results(executed)
+        return Turn(summary if not ok else (summary or "Готово."), results=executed)
+
+    def _finish(self, text, turn):
+        said = " ".join(p for p in [turn.speech, confirmation_question(turn.pending) if turn.pending else ""] if p)
+        self.remember(text, said, turn.results)
+        return turn
+
+    # --- Режим JSON (модели без tool calling) ---
+
+    def _json_turn(self, text, content):
+        """Как до шага 4.2: SAFE — выполнить, потом сказать; CONFIRM — вопрос; BLOCKED — отказ."""
+        response_text, actions = normalize_ai_response(self._parse_json(content))
+        safe, confirm, blocked = self.split_actions(actions)
+        if blocked:
+            self.reject_actions(actions, text, "в ответе есть опасное действие")
+            return Turn(BLOCKED_REPLY, blocked=blocked)
+        if not safe:
+            return Turn("" if confirm else response_text, pending=confirm)
+
+        results = self.run_actions(safe, phrase=text)
+        ok, summary = summarize_results(results)
+        if not ok or confirm:
+            # Ответ модели («Открываю…», «Перемещаю…») мог быть неправдой — не озвучиваем
+            return Turn(summary, pending=confirm, results=results)
+        return Turn(" ".join(p for p in (response_text, summary) if p) or "Готово.", results=results)
 
     def ask(self, text):
+        """Один запрос в режиме JSON: {"response", "actions"}."""
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": prompts.json_prompt()},
             {"role": "user", "content": text},
         ]
         try:
             response = self.llm.chat(messages)
         except Exception as e:
             log.error("❌ Ошибка запроса к AI: %s", type(e).__name__)
-            return {"response": "Произошла ошибка при обращении к нейросети.", "actions": []}
+            return {"response": AI_ERROR_REPLY, "actions": []}
         if not response.ok:
             # Все провайдеры недоступны: фраза для голоса, без действий
             return {"response": response.text, "actions": []}
@@ -287,10 +395,12 @@ class AIClient:
         for action in actions:
             level, reason = safety.classify(action)
             journal_confirmed = confirmed if level == safety.CONFIRM else None
-            ok, short, speech = False, None, None
+            ok, short, speech, result_text = False, None, None, None
 
             if level == safety.BLOCKED:
                 message, short = f"⛔ Заблокировано: {action} — {reason}", "это запрещено"
+            elif self.allowed_actions is not None and action["name"] not in self.allowed_actions:
+                message, short = f"⛔ Не разрешено в этом режиме: {action}", "это действие сейчас недоступно"
             elif level == safety.CONFIRM and not confirmed:
                 message, short = f"⛔ Нужно подтверждение: {action} — {reason}", "нужно подтверждение"
             else:
@@ -302,14 +412,14 @@ class AIClient:
                         raise ActionError(f"args должен быть объектом: {args!r}", "неверные параметры")
                     out = func(**args)
                     done = out if isinstance(out, Done) else Done(out)
-                    ok, message, speech = True, f"✅ {done.message}", done.speech
+                    ok, message, speech, result_text = True, f"✅ {done.message}", done.speech, done.message
                 except TypeError as e:
                     message, short = f"⛔ Отклонено (неверные аргументы): {action} — {e}", "неверные параметры"
                 except ActionError as e:
                     message, short = f"⛔ Отклонено: {action} — {e}", e.short
 
             results.append({"action": action, "level": level, "ok": ok, "message": message,
-                            "short": short, "speech": speech})
+                            "short": short, "speech": speech, "result": result_text})
             journal.record(phrase, action, level, journal_confirmed, ok, message)
 
         return results
