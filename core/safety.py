@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from core.apps import resolve_app
+from core.installed_apps import resolve_app_name
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ CONFIRM = "CONFIRM"
 BLOCKED = "BLOCKED"
 
 # Белый список: всё остальное (sudo, shell, rm, форматирование, настройки безопасности...) — BLOCKED
-ACTION_NAMES = {"open_app", "quit_app", "set_volume", "open_url", "trash_file"}
+ACTION_NAMES = {"open_app", "quit_app", "set_volume", "open_url", "trash_file", "find_apps", "list_apps"}
 
 # Закрыть можно сразу (macOS сама спросит про несохранённое), кроме этих приложений
 CAREFUL_APPS = {"Terminal", "iTerm", "iTerm2", "Visual Studio Code", "Code", "Xcode", "PyCharm",
@@ -119,10 +120,15 @@ def classify(action, trusted=None, home=None):
 
     if name in ("open_app", "set_volume"):
         return SAFE, "безопасное действие"
+    if name in ("find_apps", "list_apps"):
+        return SAFE, "только чтение"
     if name == "quit_app":
         app = args.get("app")
-        if isinstance(app, str) and resolve_app(app.strip()).casefold() in {a.casefold() for a in CAREFUL_APPS}:
-            return CONFIRM, f"закрытие {resolve_app(app.strip())} требует подтверждения"
+        if isinstance(app, str) and app.strip():
+            # Имя определяется так же, как при выполнении: «Terminl» -> Terminal
+            resolved = resolve_app_name(app) or resolve_app(app.strip())
+            if resolved.casefold() in {a.casefold() for a in CAREFUL_APPS}:
+                return CONFIRM, f"закрытие {resolved} требует подтверждения"
         return SAFE, "закрытие приложения"
     if name == "open_url":
         return classify_url(args.get("url"), trusted)

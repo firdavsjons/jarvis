@@ -7,16 +7,31 @@ import os
 import unicodedata
 from urllib.parse import urlparse
 
-from core import journal, safety
-from core.apps import resolve_app
+from core import installed_apps, journal, safety
 
 log = logging.getLogger(__name__)
 
 TIMEOUT = 10
+SPOKEN_LIST_LIMIT = 10  # сколько названий читать вслух, остальное — в окне
 
 
 class ActionError(ValueError):
-    """Действие отклонено: неверные аргументы или ошибка выполнения."""
+    """Действие отклонено: неверные аргументы или ошибка выполнения.
+
+    short — короткая причина по-русски для голоса и окна («файл не найден»).
+    """
+
+    def __init__(self, message, short="команда завершилась с ошибкой"):
+        super().__init__(message)
+        self.short = short
+
+
+class Done:
+    """Результат действия: message — в лог и окно, speech — сказать пользователю (для действий-чтений)."""
+
+    def __init__(self, message, speech=None):
+        self.message = message
+        self.speech = speech
 
 
 def _run(args):
@@ -24,23 +39,32 @@ def _run(args):
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise ActionError(f"таймаут {TIMEOUT} с")
+        raise ActionError(f"таймаут {TIMEOUT} с", "команда не ответила вовремя")
     except OSError as e:
-        raise ActionError(str(e))
+        raise ActionError(str(e), "команда не запустилась")
     if result.returncode != 0:
         raise ActionError(result.stderr.strip() or f"код возврата {result.returncode}")
 
 
 def _check_app(app):
-    """Название приложения: непустое, не начинается с '-', без управляющих символов."""
+    """Название приложения: непустое, не начинается с '-', без управляющих символов, установлено."""
     if not isinstance(app, str) or not app.strip():
-        raise ActionError("пустое название приложения")
+        raise ActionError("пустое название приложения", "не указано приложение")
     app = app.strip()
     if app.startswith("-"):
-        raise ActionError(f"название приложения начинается с '-': {app!r}")
+        raise ActionError(f"название приложения начинается с '-': {app!r}", "неверное название приложения")
     if any(unicodedata.category(c) == "Cc" for c in app):
-        raise ActionError(f"управляющие символы в названии приложения: {app!r}")
-    return resolve_app(app)
+        raise ActionError(f"управляющие символы в названии приложения: {app!r}", "неверное название приложения")
+    resolved = installed_apps.resolve_app_name(app)
+    if resolved is None:
+        raise ActionError(f"приложение {app} не найдено среди установленных", f"приложение {app} не найдено")
+    return resolved
+
+
+def _spoken_list(names):
+    spoken = ", ".join(names[:SPOKEN_LIST_LIMIT])
+    rest = len(names) - SPOKEN_LIST_LIMIT
+    return f"{spoken} и ещё {rest}" if rest > 0 else spoken
 
 
 # --- Белый список действий ---
@@ -61,11 +85,11 @@ def quit_app(app):
 
 def set_volume(level):
     if isinstance(level, bool):
-        raise ActionError(f"громкость должна быть числом: {level!r}")
+        raise ActionError(f"громкость должна быть числом: {level!r}", "громкость должна быть числом")
     try:
         level = int(level)
     except (TypeError, ValueError, OverflowError):
-        raise ActionError(f"громкость должна быть числом: {level!r}")
+        raise ActionError(f"громкость должна быть числом: {level!r}", "громкость должна быть числом")
     level = max(0, min(100, level))
     _run(["osascript", "-e", f"set volume output volume {level}"])
     return f"Громкость {level}"
@@ -73,10 +97,10 @@ def set_volume(level):
 
 def open_url(url):
     if not isinstance(url, str) or any(unicodedata.category(c) == "Cc" for c in url):
-        raise ActionError(f"некорректная ссылка: {url!r}")
+        raise ActionError(f"некорректная ссылка: {url!r}", "некорректная ссылка")
     parsed = urlparse(url.strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ActionError(f"разрешены только http/https ссылки: {url!r}")
+        raise ActionError(f"разрешены только http/https ссылки: {url!r}", "некорректная ссылка")
     _run(["open", url.strip()])
     return f"Открыта ссылка {url.strip()}"
 
@@ -85,14 +109,33 @@ def trash_file(path):
     """Перемещает файл или папку в Корзину через Finder. Никогда не rm."""
     level, reason, resolved = safety.classify_path(path)
     if level == safety.BLOCKED:
-        raise ActionError(reason)
+        raise ActionError(reason, "это запрещено")
     if not os.path.lexists(resolved):
-        raise ActionError(f"файл не найден: {resolved}")
+        raise ActionError(f"файл не найден: {resolved}", "файл не найден")
     # Путь передаётся аргументом argv, а не вставляется в текст AppleScript
     _run(["osascript", "-e", "on run argv", "-e",
           'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)',
           "-e", "end run", resolved])
     return f"Перемещено в Корзину: {resolved}"
+
+
+def find_apps(query):
+    """Только чтение: до 10 установленных приложений по запросу."""
+    if not isinstance(query, str) or not query.strip():
+        raise ActionError("пустой запрос", "не указано, что искать")
+    found = installed_apps.find_apps(query)
+    if not found:
+        return Done(f"По запросу «{query.strip()}» ничего не найдено",
+                    f"Не нашёл приложений по запросу {query.strip()}.")
+    return Done(f"Найдено: {', '.join(found)}", f"Нашёл: {_spoken_list(found)}.")
+
+
+def list_apps():
+    """Только чтение: до 30 установленных приложений, популярные первыми."""
+    apps = installed_apps.popular_first(installed_apps.list_installed_apps())
+    if not apps:
+        return Done("Список приложений пуст", "Не удалось получить список приложений.")
+    return Done(f"Установлены: {', '.join(apps)}", f"Установлены: {_spoken_list(apps)}.")
 
 
 # Белый список: имя -> функция. Уровень риска — в core/safety.py
@@ -102,6 +145,8 @@ ACTIONS = {
     "set_volume": set_volume,
     "open_url": open_url,
     "trash_file": trash_file,
+    "find_apps": find_apps,
+    "list_apps": list_apps,
 }
 
 
@@ -117,6 +162,17 @@ def describe_action(action):
         _, _, resolved = safety.classify_path(args.get("path"))
         return f"переместить в Корзину {resolved or args.get('path')}"
     return str(name)
+
+
+def summarize_results(results):
+    """(всё ли успешно, что сказать). Ошибка -> «Не получилось: …», без «Готово»."""
+    failed = []
+    for r in results:
+        if not r["ok"] and r["short"] not in failed:
+            failed.append(r["short"])
+    if failed:
+        return False, f"Не получилось: {', '.join(failed)}."
+    return True, " ".join(r["speech"] for r in results if r["speech"])
 
 
 class LocalAIClient:
@@ -146,8 +202,13 @@ class LocalAIClient:
             '- set_volume: установить громкость 0-100. args: {"level": 50}\n'
             '- open_url: открыть ссылку http/https в браузере. args: {"url": "https://example.com"}\n'
             '- trash_file: переместить файл или папку пользователя в Корзину. args: {"path": "~/Desktop/отчёт.txt"}\n'
+            '- find_apps: найти установленные приложения по названию или части. args: {"query": "telegram"}\n'
+            "- list_apps: список установленных приложений. args: {}\n"
             "Названия приложений передавай по-английски, как они называются в macOS: "
             "Calculator, Safari, Telegram, Google Chrome, Notes.\n"
+            f"Установленные приложения: {', '.join(installed_apps.popular_first(installed_apps.list_installed_apps(), 40))}.\n"
+            "Если пользователь просит открыть приложение, которого нет в этом списке, сначала вызови find_apps "
+            "и не обещай открыть его в response.\n"
             "Удалять файлы можно ТОЛЬКО через trash_file: это перемещение в Корзину, файл можно восстановить. "
             "Путь — полный, от / или ~. Удалять можно только файлы пользователя в домашней папке. "
             "Системные папки (/System, /Library, /Applications, ~/Library, скрытые файлы) и домашнюю папку целиком "
@@ -224,32 +285,43 @@ class LocalAIClient:
             log.info("⛔ Не выполнено: %s — %s", action, result)
             journal.record(phrase, action, level, confirmed, False, result)
 
-    def execute_actions(self, actions, phrase="", confirmed=False):
+    def run_actions(self, actions, phrase="", confirmed=False):
         """Выполняет действия из белого списка. Уровень проверяется заново прямо перед запуском:
-        BLOCKED — никогда, CONFIRM — только при confirmed=True."""
+        BLOCKED — никогда, CONFIRM — только при confirmed=True.
+
+        Возвращает по словарю на действие: ok, message (лог/окно), short (причина отказа), speech.
+        """
         results = []
         for action in actions:
             level, reason = safety.classify(action)
             journal_confirmed = confirmed if level == safety.CONFIRM else None
+            ok, short, speech = False, None, None
 
             if level == safety.BLOCKED:
-                message = f"⛔ Заблокировано: {action} — {reason}"
+                message, short = f"⛔ Заблокировано: {action} — {reason}", "это запрещено"
             elif level == safety.CONFIRM and not confirmed:
-                message = f"⛔ Нужно подтверждение: {action} — {reason}"
+                message, short = f"⛔ Нужно подтверждение: {action} — {reason}", "нужно подтверждение"
             else:
                 func = ACTIONS[action["name"]]
                 args = action.get("args") or {}
                 log.info("▶ Действие: %s %s", action["name"], args)
                 try:
                     if not isinstance(args, dict):
-                        raise ActionError(f"args должен быть объектом: {args!r}")
-                    message = f"✅ {func(**args)}"
+                        raise ActionError(f"args должен быть объектом: {args!r}", "неверные параметры")
+                    out = func(**args)
+                    done = out if isinstance(out, Done) else Done(out)
+                    ok, message, speech = True, f"✅ {done.message}", done.speech
                 except TypeError as e:
-                    message = f"⛔ Отклонено (неверные аргументы): {action} — {e}"
+                    message, short = f"⛔ Отклонено (неверные аргументы): {action} — {e}", "неверные параметры"
                 except ActionError as e:
-                    message = f"⛔ Отклонено: {action} — {e}"
+                    message, short = f"⛔ Отклонено: {action} — {e}", e.short
 
-            results.append(message)
-            journal.record(phrase, action, level, journal_confirmed, message.startswith("✅"), message)
+            results.append({"action": action, "level": level, "ok": ok, "message": message,
+                            "short": short, "speech": speech})
+            journal.record(phrase, action, level, journal_confirmed, ok, message)
 
-        return "\n".join(results)
+        return results
+
+    def execute_actions(self, actions, phrase="", confirmed=False):
+        """То же, что run_actions, но одной строкой для лога."""
+        return "\n".join(r["message"] for r in self.run_actions(actions, phrase, confirmed))

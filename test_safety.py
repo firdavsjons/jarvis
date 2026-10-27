@@ -12,7 +12,18 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from core import journal, safety
 from core.ai import ACTIONS, LocalAIClient
 from core.safety import BLOCKED, CONFIRM, SAFE, classify, classify_path, classify_url
+from fixtures_apps import patch_installed
 import main
+
+_installed = patch_installed()
+
+
+def setUpModule():
+    _installed.start()
+
+
+def tearDownModule():
+    _installed.stop()
 
 
 def trash(path):
@@ -263,7 +274,11 @@ class TestBlockedReply(unittest.TestCase):
         app.ai = client
         app.has_pending.return_value = False
         app.mac.execute.return_value = None
+        app.report_result = lambda results: main.VoiceApp.report_result(app, results)
         return app
+
+    def spoken(self, app):
+        return [c.args[0] for c in app.engine.speak.call_args_list]
 
     @patch('core.ai.subprocess.run')
     def test_any_blocked_rejects_whole_reply(self, mock_run):
@@ -288,6 +303,75 @@ class TestBlockedReply(unittest.TestCase):
         mock_run.assert_not_called()
         self.assertEqual(main.CONFIRM_TIMEOUT, 20)
         print("✅ Ответ с BLOCKED и порядок подтверждения: OK")
+
+    @patch('core.ai.subprocess.run')
+    def test_model_response_not_spoken_before_confirmation(self, mock_run):
+        app = self.make_app({"response": "Перемещаю отчёт в Корзину.", "actions": [trash("~/Desktop/отчёт.txt")]})
+        main.VoiceApp.process_command(app, "удали отчёт")
+        self.assertEqual(self.spoken(app), ["Переместить в Корзину файл отчёт с рабочего стола?"])
+
+
+class TestHonestResult(FakeHomeMixin, unittest.TestCase):
+    """После выполнения — правда: «Готово» только если всё получилось."""
+
+    def setUp(self):
+        super().setUp()
+        self.home_patch = patch('core.safety.home_dir', return_value=self.home)
+        self.home_patch.start()
+
+    def tearDown(self):
+        self.home_patch.stop()
+        super().tearDown()
+
+    make_app = TestBlockedReply.make_app
+    spoken = TestBlockedReply.spoken
+
+    @patch('core.ai.subprocess.run')
+    def test_safe_success(self, mock_run):
+        mock_run.return_value.returncode = 0
+        app = self.make_app({"response": "", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]})
+        main.VoiceApp.process_command(app, "открой сафари")
+        self.assertEqual(self.spoken(app), ["Готово."])
+
+        app = self.make_app({"response": "Открываю Safari.", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]})
+        main.VoiceApp.process_command(app, "открой сафари")
+        self.assertEqual(self.spoken(app), ["Открываю Safari."])
+
+    @patch('core.ai.subprocess.run')
+    def test_safe_failure(self, mock_run):
+        app = self.make_app({"response": "Открываю Spotify.", "actions": [{"name": "open_app", "args": {"app": "Spotify"}}]})
+        main.VoiceApp.process_command(app, "открой спотифай")
+
+        self.assertEqual(self.spoken(app), ["Не получилось: приложение Spotify не найдено."])
+        self.assertFalse(any("Готово" in s or "Открываю" in s for s in self.spoken(app)))
+        mock_run.assert_not_called()
+        self.assertIn("Не получилось", app.update_log.call_args.args[0])
+
+    @patch('core.ai.subprocess.run')
+    def test_command_error_is_failure(self, mock_run):
+        mock_run.return_value.returncode = 1
+        mock_run.return_value.stderr = "boom"
+        app = self.make_app({"response": "Ставлю громкость.", "actions": [{"name": "set_volume", "args": {"level": 30}}]})
+        main.VoiceApp.process_command(app, "громкость 30")
+        self.assertEqual(self.spoken(app), ["Не получилось: команда завершилась с ошибкой."])
+
+    @patch('core.ai.subprocess.run')
+    def test_confirmed_success(self, mock_run):
+        mock_run.return_value.returncode = 0
+        app = self.make_app({})
+        app.take_pending.return_value = ([trash(str(self.report))], "удали отчёт")
+        main.VoiceApp.handle_confirmation(app, "да")
+        self.assertEqual(self.spoken(app), ["Выполняю.", "Готово."])
+
+    @patch('core.ai.subprocess.run')
+    def test_confirmed_failure(self, mock_run):
+        app = self.make_app({})
+        app.take_pending.return_value = ([trash(os.path.join(self.home, "Desktop", "нет.txt"))], "удали")
+        main.VoiceApp.handle_confirmation(app, "да")
+
+        self.assertEqual(self.spoken(app), ["Выполняю.", "Не получилось: файл не найден."])
+        mock_run.assert_not_called()
+        print("✅ Честный результат: OK")
 
 
 if __name__ == '__main__':

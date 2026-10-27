@@ -7,7 +7,18 @@ from unittest.mock import patch
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core.ai import LocalAIClient
+from fixtures_apps import patch_installed
 from main import parse_confirmation
+
+_installed = patch_installed()
+
+
+def setUpModule():
+    _installed.start()
+
+
+def tearDownModule():
+    _installed.stop()
 
 
 class TestLocalAIActions(unittest.TestCase):
@@ -42,12 +53,17 @@ class TestLocalAIActions(unittest.TestCase):
     def test_app_aliases(self, mock_run):
         mock_run.return_value.returncode = 0
         cases = [("калькулятор", "Calculator"), ("Сафари", "Safari"), ("Xcode", "Xcode"),
-                 ("калькулятора", "Calculator"), ("файндер", "Finder"), ("Финдер", "Finder"),
-                 ("хрома", "хрома")]  # короткий ключ «хром» — только точное совпадение
+                 ("калькулятора", "Calculator"), ("файндер", "Finder"), ("Финдер", "Finder")]
         for app, expected in cases:
             mock_run.reset_mock()
             self.client.execute_actions([{"name": "open_app", "args": {"app": app}}])
             mock_run.assert_called_once_with(["open", "-a", expected], capture_output=True, text=True, timeout=10)
+
+        # Короткий ключ «хром» — только точное совпадение; «хрома» не установлено -> отклонено
+        mock_run.reset_mock()
+        log = self.client.execute_actions([{"name": "open_app", "args": {"app": "хрома"}}])
+        self.assertIn("не найдено", log)
+        mock_run.assert_not_called()
 
         # quit_app тоже использует словарь
         mock_run.reset_mock()

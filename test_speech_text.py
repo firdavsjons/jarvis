@@ -34,6 +34,25 @@ class TestPrepareForSpeech(unittest.TestCase):
         self.assertEqual(prepare_for_speech("Файл /Users/test/Documents/план.docx готов"),
                          "Файл план точка ворд, из документов готов")
 
+    def test_path_with_spaces(self):
+        self.assertEqual(prepare_for_speech("Сохранил в /Users/x/Projects All/a.txt."),
+                         "Сохранил в a точка тэ-экс-тэ, из папки Projects All.")
+        self.assertEqual(prepare_for_speech("Файл /Users/x/Desktop/мой отчёт.pdf готов"),
+                         "Файл мой отчёт точка пэ-дэ-эф, с рабочего стола готов")
+        self.assertEqual(prepare_for_speech("Файлы /Users/x/Desktop/a.txt и /Users/x/Downloads/b.pdf"),
+                         "Файлы a точка тэ-экс-тэ, с рабочего стола и b точка пэ-дэ-эф, из загрузок")
+
+    def test_file_name_extension(self):
+        self.assertEqual(prepare_for_speech("Открой test.txt"), "Открой test точка тэ-экс-тэ")
+        self.assertEqual(prepare_for_speech("Файл report.PDF готов."), "Файл report точка пэ-дэ-эф готов.")
+        # Не имя файла: домен без схемы, число
+        self.assertEqual(prepare_for_speech("Сайт youtube.com, версия 3.5"), "Сайт youtube.com, версия 3.5")
+
+    def test_underscore_inside_names_kept(self):
+        self.assertEqual(prepare_for_speech("Переменная snake_case и my_file"), "Переменная snake_case и my_file")
+        self.assertEqual(prepare_for_speech("Файл my_file.py"), "Файл my_file точка пэ-игрек")
+        self.assertEqual(prepare_for_speech("Это _важно_ и __очень__"), "Это важно и очень")
+
     def test_markdown(self):
         self.assertEqual(prepare_for_speech("**Готово!** Вот `код` и # заголовок, _курсив_."),
                          "Готово! Вот код и заголовок, курсив.")

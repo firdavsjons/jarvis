@@ -38,6 +38,7 @@ VoiceApp.process_command            (main.py)
 - `core/journal.py` — журнал действий `actions.jsonl`, `redact()` скрывает пароли и токены. Включается `setup_journal()` только при запуске `main.py`.
 - `core/speech_text.py` — `prepare_for_speech` (вызывается в `speak`: ссылки → «ютуб точка ком», пути → «отчёт точка тэ-экс-тэ, с рабочего стола», без Markdown и эмодзи) и короткие вопросы `confirmation_question`.
 - `core/apps.py` — `APP_ALIASES` / `resolve_app`: русские названия приложений → имена в macOS.
+- `core/installed_apps.py` — установленные приложения (`os.scandir` по `/Applications`, `/System/Applications`, `~/Applications` и др., кэш 10 мин), `resolve_app_name` (словарь → точно → по слову → нечётко, неоднозначно → `None`), `find_apps`, `popular_first`.
 - `trusted_domains.txt` — сайты, которые открываются без подтверждения (с поддоменами).
 - `modules/mac_control.py` — `MacControl`: быстрые команды через `osascript` / `open` (subprocess со списком аргументов).
 - `test_json_mode.py` — парсинг JSON, белый список, проверка аргументов, подтверждение по целым словам.
@@ -45,6 +46,8 @@ VoiceApp.process_command            (main.py)
 - `test_mac_control.py` — `MacControl` по целым словам.
 - `test_safety.py` — опасные пути и действия обязаны быть BLOCKED, уровни сайтов и приложений, выполнение (только мок subprocess), журнал, отклонение всего ответа с BLOCKED.
 - `test_speech_text.py` — `prepare_for_speech` и вопросы подтверждения.
+- `test_installed_apps.py` — поиск приложений на временной папке с `*.app`, `find_apps` / `list_apps`.
+- `fixtures_apps.py` — `patch_installed()`: фиксированный список «установленных» приложений для тестов (не `test*.py`, поэтому не запускается сам).
 - `verify_local_ai.py` — `LocalAIClient.ask` возвращает dict (успех, не-JSON ответ, нет связи с LM Studio).
 
 ## Запуск
@@ -71,6 +74,9 @@ python -m unittest verify_local_ai.py # не подходит под шабло�
 
 - **Безопасность команд.** LLM не выполняет shell — только действия из `ACTIONS` в `core/ai.py`. Новое действие = отдельная функция, которая проверяет аргументы (бросает `ActionError`) и вызывает `_run([...])` со списком аргументов; добавить её в `ACTIONS`, имя — в `safety.ACTION_NAMES`, правило уровня — в `safety.classify`, описание — в системный промпт, тесты — в `test_safety.py`. Никогда не использовать `shell=True` и не подставлять пользовательские строки в текст AppleScript (передавать через `argv`).
 - **Уровни риска.** Решает только `core/safety.py`. Удаление — только `trash_file` (Корзина через Finder), никогда `rm`/`os.remove`/`shutil.rmtree`. Пути — через `classify_path` (expanduser + realpath, сравнение без учёта регистра). В тестах `subprocess.run` всегда мок, реальное удаление не запускать.
+- **Приложения.** Имя приложения — только через `installed_apps.resolve_app_name` (и при выполнении, и в `safety.classify`), чтобы уровень и действие относились к одному приложению. Тесты, где есть `open_app` / `quit_app`, используют `fixtures_apps.patch_installed()` и не зависят от того, что установлено на Mac.
+- **Честный результат.** SAFE: сначала выполнить, потом сказать (ответ модели — только при успехе). CONFIRM: вопрос → «Выполняю» → результат; ответ модели до подтверждения не озвучивать. «Готово» — только если все действия успешны, иначе «Не получилось: <ActionError.short>».
+- **MacControl.** Перехватывает только короткие фразы (глагол + приложение или команда громкости, плюс «пожалуйста», «мне», «а») и только если команда реально выполнилась; иначе `None` — решает нейросеть.
 - **Потоки и Tkinter.** Обработка идёт в фоновых `Thread` и `Timer`. Виджеты не трогать из них напрямую: только `update_status` / `update_log`, которые кладут сообщение в `ui_queue`; виджеты меняет `poll_ui` в главном потоке.
 - **Озвучка.** Только через `SpeechEngine.speak` (Lock, одна фраза за раз). Команду собирает `say_command`: текст всегда после `--`, иначе текст, начинающийся с `-`, станет опцией `say` (а без текста `say` зависает, читая stdin).
 - **Микрофон.** Цикл не слушает, пока `engine.speaking` установлен, и отбрасывает фразу, если ассистент заговорил во время записи (`speech_overlaps`). Циклы — по флагу/Event (`stop_event`), не `while True`.

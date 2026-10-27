@@ -6,7 +6,7 @@ import tkinter as tk
 from threading import Thread, Lock, Timer, Event
 from dotenv import load_dotenv
 from core.engine import SpeechEngine
-from core.ai import LocalAIClient, describe_action
+from core.ai import LocalAIClient, describe_action, summarize_results
 from core.journal import setup_journal
 from core.logger import setup_logging
 from core.speech_text import confirmation_question
@@ -199,16 +199,20 @@ class VoiceApp:
         if answer:
             self.update_status("Выполняю...", "green")
             self.engine.speak("Выполняю.")
-            self.report_result(self.ai.execute_actions(actions, phrase=phrase, confirmed=True))
-            self.engine.speak("Готово.")
+            ok, summary = self.report_result(self.ai.run_actions(actions, phrase=phrase, confirmed=True))
+            self.engine.speak(summary if not ok else (summary or "Готово."))
         else:
             self.ai.reject_actions(actions, phrase, "отменено пользователем", confirmed=False)
             self.engine.speak("Отменено.")
         self.set_idle_status()
 
-    def report_result(self, result_log):
-        log.info("Результат действий:\n%s", result_log)
-        self.update_log(result_log)
+    def report_result(self, results):
+        """Пишет результаты в лог и окно. Возвращает (всё ли успешно, что сказать)."""
+        ok, summary = summarize_results(results)
+        details = "\n".join(r["message"] for r in results)
+        log.info("Результат действий:\n%s", details)
+        self.update_log(f"{summary or 'Готово.'}\n{details}" if ok else f"{summary}\n{details}")
+        return ok, summary
 
     def process_command(self, text, source="voice"):
         """Единая точка входа для обработки команд (голос или текст)."""
@@ -240,13 +244,20 @@ class VoiceApp:
             self.set_idle_status()
             return
 
-        if response_text:
-            self.engine.speak(response_text)
-
-        # SAFE — сразу, без подтверждения
+        # SAFE — сначала выполнить, потом сказать правду. Ответ модели («Открываю Telegram») звучит,
+        # только если всё получилось и ничего не ждёт подтверждения: иначе он мог бы быть неправдой
         if immediate:
             self.update_status("Выполняю...", "green")
-            self.report_result(self.ai.execute_actions(immediate, phrase=text))
+            ok, summary = self.report_result(self.ai.run_actions(immediate, phrase=text))
+            if not ok:
+                self.engine.speak(summary)
+            elif to_confirm:
+                if summary:
+                    self.engine.speak(summary)  # результаты find_apps / list_apps
+            else:
+                self.engine.speak(" ".join(p for p in (response_text, summary) if p) or "Готово.")
+        elif response_text and not to_confirm:
+            self.engine.speak(response_text)
 
         # CONFIRM — только после «да»; таймер ожидания стартует после вопроса
         if to_confirm:
