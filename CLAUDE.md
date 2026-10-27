@@ -21,7 +21,8 @@ VoiceApp.process_command            (main.py)
                 (classify + повторная проверка + журнал); ошибка → запись удаляется
               промпт (core/prompts.py: дата/время + характер с именем из памяти + блок памяти ≤600 симв.)
                 + история (6 сообщений, ≤2000 симв.)
-              llm.chat → FallbackClient (core/llm): gemini → groq → local из LLM_PROVIDERS;
+              llm.chat → FallbackClient (core/llm): gemini → groq из LLM_PROVIDERS (local выключен по умолчанию,
+                включается строкой LLM_PROVIDERS=gemini,groq,local в .env; код провайдера сохранён);
               ошибка/429/таймаут (облако 15 с, LOCAL_TIMEOUT 45 с) → следующий, пауза 60 с
                 (3 ответа 429 подряд за 10 мин → пауза LLM_RATE_LIMIT_PAUSE_MIN, 15 мин); ≥90% лимита — пропуск;
                 раз в 10 запросов в лог «запросы сегодня: …»

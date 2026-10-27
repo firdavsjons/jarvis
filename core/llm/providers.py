@@ -15,7 +15,8 @@ REQUEST_TIMEOUT = 15  # секунд на запрос к облачным пр�
 TEMPERATURE = 0.3     # меньше креативности, больше точности
 
 DEFAULTS = {
-    "LLM_PROVIDERS": "gemini,groq,local",
+    # Локальная модель выключена по умолчанию (вернуть в Этапе 14): LLM_PROVIDERS=gemini,groq,local
+    "LLM_PROVIDERS": "gemini,groq",
     "LLM_RATE_LIMIT_PAUSE_MIN": "15",  # пауза после 3 ответов 429 подряд за 10 минут
     "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta/openai/",
     "GEMINI_MODEL": "gemini-2.5-flash",
