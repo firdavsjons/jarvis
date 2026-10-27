@@ -1,0 +1,7 @@
+openai
+python-dotenv
+SpeechRecognition
+pyaudio
+pyttsx3
+pyobjc
+keyboard
