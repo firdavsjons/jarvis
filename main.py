@@ -7,14 +7,17 @@ from threading import Thread, Lock, Timer, Event
 from dotenv import load_dotenv
 from core.engine import SpeechEngine
 from core.ai import LocalAIClient, describe_action
+from core.journal import setup_journal
 from core.logger import setup_logging
+from core.speech_text import confirmation_question
 from modules.mac_control import MacControl
 
 log = logging.getLogger(__name__)
 
 CONFIRM_WORDS = {"да", "подтверждаю", "выполняй"}
 CANCEL_WORDS = {"нет", "отмена"}
-CONFIRM_TIMEOUT = 15  # секунд на подтверждение, потом действия отменяются
+CONFIRM_TIMEOUT = 20  # секунд на подтверждение после вопроса, потом действия отменяются
+BLOCKED_REPLY = "Это слишком опасно, я этого не сделаю."
 UI_POLL_MS = 100  # как часто главный поток забирает обновления окна из очереди
 
 
@@ -77,6 +80,7 @@ class VoiceApp:
         self.stop_event = Event()
         self.listen_thread = None
         self.pending_actions = [] # Действия, ждущие подтверждения
+        self.pending_phrase = ""  # исходная фраза — для журнала
         self.pending_timer = None
         self.pending_lock = Lock()
 
@@ -142,33 +146,43 @@ class VoiceApp:
         with self.pending_lock:
             return bool(self.pending_actions)
 
-    def set_pending(self, actions):
+    def set_pending(self, actions, phrase):
+        """Сохраняет действия до ответа. Таймер — отдельно, после озвучки вопроса."""
         with self.pending_lock:
             if self.pending_timer:
                 self.pending_timer.cancel()
+                self.pending_timer = None
             self.pending_actions = actions
+            self.pending_phrase = phrase
+
+    def start_pending_timer(self, actions):
+        with self.pending_lock:
+            if self.pending_actions is not actions:
+                return # Ответ пришёл, пока звучал вопрос
             self.pending_timer = Timer(CONFIRM_TIMEOUT, self.expire_pending, args=(actions,))
             self.pending_timer.daemon = True
             self.pending_timer.start()
 
     def take_pending(self):
-        """Забирает отложенные действия и останавливает таймер."""
+        """Забирает отложенные действия (и исходную фразу) и останавливает таймер."""
         with self.pending_lock:
-            actions = self.pending_actions
-            self.pending_actions = []
+            actions, phrase = self.pending_actions, self.pending_phrase
+            self.pending_actions, self.pending_phrase = [], ""
             if self.pending_timer:
                 self.pending_timer.cancel()
                 self.pending_timer = None
-            return actions
+            return actions, phrase
 
     def expire_pending(self, actions):
         with self.pending_lock:
             # Действия уже подтверждены, отменены или заменены новыми
             if self.pending_actions is not actions:
                 return
-            self.pending_actions = []
+            phrase = self.pending_phrase
+            self.pending_actions, self.pending_phrase = [], ""
             self.pending_timer = None
         log.info("⌛ Подтверждение не получено за %s с, отменено: %s", CONFIRM_TIMEOUT, actions)
+        self.ai.reject_actions(actions, phrase, f"нет ответа за {CONFIRM_TIMEOUT} с", confirmed=False)
         self.engine.speak("Время вышло, отменено.")
         self.set_idle_status()
 
@@ -178,16 +192,17 @@ class VoiceApp:
             self.engine.speak("Скажите «да» или «нет».")
             return
 
-        actions = self.take_pending()
+        actions, phrase = self.take_pending()
         if not actions:
             return # Таймаут успел сработать раньше
 
         if answer:
             self.update_status("Выполняю...", "green")
             self.engine.speak("Выполняю.")
-            self.report_result(self.ai.execute_actions(actions))
+            self.report_result(self.ai.execute_actions(actions, phrase=phrase, confirmed=True))
             self.engine.speak("Готово.")
         else:
+            self.ai.reject_actions(actions, phrase, "отменено пользователем", confirmed=False)
             self.engine.speak("Отменено.")
         self.set_idle_status()
 
@@ -214,22 +229,32 @@ class VoiceApp:
         # 2. Спрашиваем AI
         self.update_status("Думаю...", "blue")
         response_text, actions = normalize_ai_response(self.ai.ask(text))
-        immediate, to_confirm = self.ai.split_actions(actions)
+        immediate, to_confirm, blocked = self.ai.split_actions(actions)
+
+        # Хоть одно опасное действие — отклоняем весь ответ, включая текст модели
+        if blocked:
+            self.ai.reject_actions(actions, text, "в ответе есть опасное действие")
+            self.update_log("⛔ Отклонено: " + ", ".join(describe_action(a) if isinstance(a, dict) else str(a)
+                                                          for a in blocked))
+            self.engine.speak(BLOCKED_REPLY)
+            self.set_idle_status()
+            return
 
         if response_text:
             self.engine.speak(response_text)
 
-        # Открытие приложений и громкость — сразу, без подтверждения
+        # SAFE — сразу, без подтверждения
         if immediate:
             self.update_status("Выполняю...", "green")
-            self.report_result(self.ai.execute_actions(immediate))
+            self.report_result(self.ai.execute_actions(immediate, phrase=text))
 
-        # Закрытие приложений и ссылки — только после подтверждения
+        # CONFIRM — только после «да»; таймер ожидания стартует после вопроса
         if to_confirm:
-            self.set_pending(to_confirm)
+            self.set_pending(to_confirm, text)
             self.update_status("Подтвердите действия...", "orange")
-            descriptions = ", ".join(describe_action(a) for a in to_confirm)
-            self.engine.speak(f"Нужно подтверждение: {descriptions}. Выполнить?")
+            self.update_log("Подтвердите: " + "; ".join(describe_action(a) for a in to_confirm))
+            self.engine.speak(confirmation_question(to_confirm))
+            self.start_pending_timer(to_confirm)
         else:
             self.set_idle_status()
 
@@ -266,7 +291,8 @@ class VoiceApp:
 
 if __name__ == "__main__":
     log_file = setup_logging()
-    log.info("Jarvis запущен, лог: %s", log_file)
+    journal_file = setup_journal()
+    log.info("Jarvis запущен, лог: %s, журнал действий: %s", log_file, journal_file)
     root = tk.Tk()
     app = VoiceApp(root)
     root.mainloop()

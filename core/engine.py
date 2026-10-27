@@ -5,6 +5,8 @@ import time
 
 import speech_recognition as sr
 
+from core.speech_text import prepare_for_speech
+
 log = logging.getLogger(__name__)
 
 PREFERRED_VOICE = "Milena"
@@ -58,7 +60,9 @@ class SpeechEngine:
         self.speaking = threading.Event()
 
     def speak(self, text):
-        if not text:
+        # В лог — исходный текст, в say — без ссылок, путей, Markdown и эмодзи
+        spoken = prepare_for_speech(text)
+        if not spoken:
             return
         generation = self._stop_generation
         with self._speak_lock:
@@ -68,7 +72,7 @@ class SpeechEngine:
             self.speaking.set()
             try:
                 # Popen, а не run: процесс нужен, чтобы stop_speaking мог его прервать
-                self._proc = subprocess.Popen(say_command(text, self.voice))
+                self._proc = subprocess.Popen(say_command(spoken, self.voice))
                 self._proc.wait()
             except OSError as e:
                 log.error("Ошибка озвучки: %s", e)

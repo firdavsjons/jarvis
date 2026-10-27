@@ -1,0 +1,9 @@
+# Доверенные сайты: открываются без подтверждения (вместе с поддоменами).
+# Один домен на строку, без http:// и www.
+youtube.com
+google.com
+wikipedia.org
+github.com
+yandex.ru
+mail.ru
+apple.com

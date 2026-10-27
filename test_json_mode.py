@@ -110,7 +110,8 @@ class TestLocalAIActions(unittest.TestCase):
         mock_run.assert_not_called()
 
         mock_run.return_value.returncode = 0
-        self.client.execute_actions([{"name": "open_url", "args": {"url": "https://example.com"}}])
+        # example.com не в доверенных — CONFIRM, выполняется только с confirmed=True
+        self.client.execute_actions([{"name": "open_url", "args": {"url": "https://example.com"}}], confirmed=True)
         mock_run.assert_called_once_with(["open", "https://example.com"], capture_output=True, text=True, timeout=10)
         print("✅ open_url: OK")
 
@@ -122,10 +123,11 @@ class TestLocalAIActions(unittest.TestCase):
             {"name": "open_url", "args": {"url": "https://example.com"}},
             {"name": "run_shell", "args": {}},
         ]
-        immediate, to_confirm = self.client.split_actions(actions)
-        self.assertEqual([a["name"] for a in immediate], ["open_app", "set_volume", "run_shell"])
-        self.assertEqual([a["name"] for a in to_confirm], ["quit_app", "open_url"])
-        self.assertEqual(self.client.split_actions("не список"), ([], []))
+        safe, to_confirm, blocked = self.client.split_actions(actions)
+        self.assertEqual([a["name"] for a in safe], ["open_app", "quit_app", "set_volume"])
+        self.assertEqual([a["name"] for a in to_confirm], ["open_url"])
+        self.assertEqual([a["name"] for a in blocked], ["run_shell"])
+        self.assertEqual(self.client.split_actions("не список"), ([], [], []))
         print("✅ split_actions: OK")
 
 

@@ -57,7 +57,7 @@ class TestNormalizeAIResponse(unittest.TestCase):
         with patch('openai.OpenAI'):
             client = LocalAIClient()
         _, actions = normalize_ai_response({"response": "Ок", "actions": "rm -rf ~"})
-        self.assertEqual(client.split_actions(actions), ([], []))
+        self.assertEqual(client.split_actions(actions), ([], [], []))
         print("✅ normalize_ai_response: OK")
 
 
