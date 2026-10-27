@@ -9,11 +9,14 @@ MAX_TOOLS_LINE = 200
 
 FORGET_REPLY = "Хорошо, разговор забыт."
 _FORGET_OBJECTS = {"разговор", "всё", "все", "историю", "контекст", "диалог", "переписку"}
+_NOT_CONVERSATION = {"себе", "мне", "меня", "обо", "память", "кэш", "кеш"}
 
 
 def is_forget_command(text):
     """«забудь разговор», «забудь всё», «очисти историю»."""
     words = set(re.findall(r"\w+", text.lower()))
+    if words & _NOT_CONVERSATION:  # «забудь всё обо мне» — память, «забудь кэш команд» — кэш
+        return False
     return bool({"забудь", "очисти", "сотри"} & words and _FORGET_OBJECTS & words) and len(words) <= 5
 
 

@@ -5,11 +5,18 @@ import time
 
 import speech_recognition as sr
 
+from core.settings import env_float
 from core.speech_text import prepare_for_speech
 
 log = logging.getLogger(__name__)
 
 PREFERRED_VOICE = "Milena"
+DEFAULT_SPEECH_PAUSE = 1.2
+
+
+def speech_pause():
+    """SPEECH_PAUSE из .env (0.5–5 с); non_speaking_duration распознавателя — 0.5 с, меньше нельзя."""
+    return env_float("SPEECH_PAUSE", DEFAULT_SPEECH_PAUSE, 0.5, 5.0)
 
 
 def pick_voice(say_voices_output):
@@ -48,6 +55,8 @@ def _detect_voice():
 class SpeechEngine:
     def __init__(self):
         self.recognizer = sr.Recognizer()
+        # Пауза, после которой фраза считается законченной: 1.2 с, чтобы не обрезать на середине
+        self.recognizer.pause_threshold = speech_pause()
         self.microphone = sr.Microphone()
 
         self.voice = _detect_voice()

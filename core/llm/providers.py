@@ -1,17 +1,16 @@
 """Провайдеры с OpenAI-совместимым API. Настройки — только из файла .env (не из окружения терминала)."""
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import openai
 from dotenv import dotenv_values
 
 from core.llm.base import EmptyResponseError, LLMClient, LLMResponse
 from core.logger import register_secret
+from core.settings import ENV_FILE
 
 log = logging.getLogger(__name__)
 
-ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 REQUEST_TIMEOUT = 15  # секунд на запрос к облачным провайдерам
 TEMPERATURE = 0.3     # меньше креативности, больше точности
 

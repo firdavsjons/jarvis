@@ -180,6 +180,8 @@ def action_for_speech(action):
         return f"открыть сайт {url_for_speech(str(args.get('url', '')))}"
     if name == "quit_app":
         return f"закрыть {args.get('app')}"
+    if name == "clear_memory":
+        return "удалить всё, что я о вас помню"
     return str(name)
 
 

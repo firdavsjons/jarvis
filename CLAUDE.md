@@ -10,13 +10,17 @@
         ▼
 VoiceApp.process_command            (main.py)
         │
-        ├─► «забудь разговор» → история очищена (core/history.py)
+        ├─► правила до модели: «забудь разговор» (история), «забудь кэш команд» (кэш),
+        │     «забудь всё обо мне» → сразу вопрос → clear_memory после «да»
         │
         ├─► MacControl.execute(text)   (modules/mac_control.py)
         │     короткие фразы: громкость, mute, браузер, Spotify, калькулятор; вернул строку → озвучить и выйти
         │
         └─► AIClient.respond(text) → Turn(speech, pending, blocked, results)   (core/ai.py)
-              промпт (core/prompts.py: дата/время + характер Jarvis) + история (6 сообщений, ≤2000 симв.)
+              кэш команд (core/cache.py): точная нормализованная фраза → SAFE-действия без модели
+                (classify + повторная проверка + журнал); ошибка → запись удаляется
+              промпт (core/prompts.py: дата/время + характер с именем из памяти + блок памяти ≤600 симв.)
+                + история (6 сообщений, ≤2000 симв.)
               llm.chat → FallbackClient (core/llm): gemini → groq → local из LLM_PROVIDERS;
               ошибка/429/таймаут (облако 15 с, LOCAL_TIMEOUT 45 с) → следующий, пауза 60 с; ≥90% лимита — пропуск
               │
@@ -26,6 +30,7 @@ VoiceApp.process_command            (main.py)
               │    только SAFE  → выполнить, результат — модели ролью tool (при ошибке — «ответь честно»),
               │                   до 3 кругов, дальше «Не получилось завершить запрос»
               │    финальный текст; если инструмент упал, а текст похож на успех → «Не получилось: …»
+              │    «Открываю…» без единого вызова → один повтор с указанием, потом «Не получилось: …»
               │
               └─ модель без инструментов (LOCAL_TOOLS=false): старый режим JSON {"response", "actions"}
                    (во 2-м круге её пропускаем — ответ строится по результатам действий без модели)
@@ -46,6 +51,9 @@ VoiceApp.process_command            (main.py)
 - `core/tools.py` — схемы инструментов OpenAI (`TOOLS`), разбор вызовов, сообщения `assistant`/`tool`.
 - `core/prompts.py` — характер Jarvis (`tools_prompt` ≤1200 символов, `json_prompt` для моделей без инструментов), `describe_now`.
 - `core/history.py` — `ConversationHistory` (6 сообщений, ≤2000 символов, только память), `is_forget_command`.
+- `core/cache.py` — `CommandCache` (`command_cache.json`: 500 записей LRU, 90 дней с создания), `normalize_phrase`, `cacheable_actions` (только успешные SAFE `open_app`/`quit_app`/`set_volume`/`open_url`, ≤3, без контекстных слов).
+- `core/memory.py` — `UserMemory` (`memory.json`: факты, псевдонимы приложений, имя ассистента), `asked_to_remember`, `contains_secret`, `valid_assistant_name`, `prompt_block`, `is_clear_memory_command`.
+- `core/storage.py` — `DATA_DIR` (`~/Library/Application Support/Jarvis`, папка 700), `atomic_write_json` (файлы 600). `core/settings.py` — чтение `.env` (`ENV_FILE`, `env_value`, `env_float`).
 - `core/safety.py` — уровни риска: `classify(action)`, `classify_path` (только внутри дома, без `~/Library` и скрытых файлов верхнего уровня), `classify_url` (по `trusted_domains.txt`), `CAREFUL_APPS`.
 - `core/journal.py` — журнал действий `actions.jsonl`, `redact()` скрывает пароли и токены. Включается `setup_journal()` только при запуске `main.py`.
 - `core/speech_text.py` — `prepare_for_speech` (вызывается в `speak`: ссылки → «ютуб точка ком», пути → «отчёт точка тэ-экс-тэ, с рабочего стола», без Markdown и эмодзи) и короткие вопросы `confirmation_question`.
@@ -62,6 +70,7 @@ VoiceApp.process_command            (main.py)
 - `fixtures_apps.py` — `patch_installed()`: фиксированный список «установленных» приложений для тестов (не `test*.py`, поэтому не запускается сам).
 - `verify_local_ai.py` — `AIClient.ask` возвращает dict (успех, не-JSON ответ, все провайдеры недоступны, исключение).
 - `test_llm.py` — цепочка провайдеров (429, таймаут, 5xx, 401/404, пустой ответ), пауза 60 с, лимиты, чтение `.env`, ключи не утекают (без сети).
+- `test_cache.py` — кэш команд; `test_memory.py` — память, «запомни», секреты, имена, псевдонимы, очистка, права файла.
 - `test_tools.py` — цикл инструментов на мок-LLM: SAFE → результат модели, ошибка → честный ответ, BLOCKED, CONFIRM до/после «да», 3 круга, история, режим JSON, флаги и таймауты, `get_time`, промпт.
 
 ## Запуск
@@ -93,6 +102,7 @@ python -m unittest verify_local_ai.py # не подходит под шабло�
 - **Уровни риска.** Решает только `core/safety.py`. Удаление — только `trash_file` (Корзина через Finder), никогда `rm`/`os.remove`/`shutil.rmtree`. Пути — через `classify_path` (expanduser + realpath, сравнение без учёта регистра). В тестах `subprocess.run` всегда мок, реальное удаление не запускать.
 - **Приложения.** Имя приложения — только через `installed_apps.resolve_app_name` (и при выполнении, и в `safety.classify`), чтобы уровень и действие относились к одному приложению. Тесты, где есть `open_app` / `quit_app`, используют `fixtures_apps.patch_installed()` и не зависят от того, что установлено на Mac.
 - **Инструменты.** Новое действие = функция в `ACTIONS` + уровень в `safety` + схема в `core/tools.py` (тест сверяет наборы имён) + строка в `prompts.JSON_FORMAT`. Модели возвращать только `ok` и короткий результат/причину, без ключей и путей вне нужного. Промпт `tools_prompt` держать ≤1200 символов (тест), список приложений в промпт не добавлять — для этого `find_apps` / `list_apps`.
+- **Память и кэш.** Запись в память (`remember`, `remember_alias`) — только если «запомни»/«запиши»/«учти» есть в РЕАЛЬНОЙ фразе пользователя (`run_actions(phrase=…)`), никогда по аргументам модели или тексту со страниц. Секреты (пароли, токены, ключи, карты, CVV, паспорт) не запоминать. Имя ассистента попадает в системный промпт — только `valid_assistant_name` (буквы, цифры, пробел, дефис, ≤30). Файлы — только в `DATA_DIR` через `atomic_write_json`, в тестах — `UserMemory()` / `CommandCache()` без пути или временные папки. В кэш — только успешные SAFE-действия из `CACHEABLE_ACTIONS`; смена псевдонимов очищает кэш.
 - **Честный результат.** SAFE: сначала выполнить, потом сказать (ответ модели — только при успехе). CONFIRM: вопрос → «Выполняю» → результат; ответ модели до подтверждения не озвучивать. «Готово» — только если все действия успешны, иначе «Не получилось: <ActionError.short>».
 - **MacControl.** Перехватывает только короткие фразы (глагол + приложение или команда громкости, плюс «пожалуйста», «мне», «а») и только если команда реально выполнилась; иначе `None` — решает нейросеть.
 - **Потоки и Tkinter.** Обработка идёт в фоновых `Thread` и `Timer`. Виджеты не трогать из них напрямую: только `update_status` / `update_log`, которые кладут сообщение в `ui_queue`; виджеты меняет `poll_ui` в главном потоке.

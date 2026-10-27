@@ -1,5 +1,6 @@
 import sys
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -86,6 +87,16 @@ class TestVoice(unittest.TestCase):
 @patch('core.engine._detect_voice', return_value="Milena")
 @patch('core.engine.sr.Microphone')
 class TestSpeechEngine(unittest.TestCase):
+    def test_pause_threshold_from_env(self, *_):
+        self.assertEqual(SpeechEngine().recognizer.pause_threshold, 1.2)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.path.join(tmp, ".env")
+            for raw, expected in [("2", 2.0), ("abc", 1.2), ("0.1", 0.5), ("99", 5.0)]:
+                with open(env, "w", encoding="utf-8") as f:
+                    f.write(f"SPEECH_PAUSE={raw}\n")
+                with patch('core.settings.ENV_FILE', env):
+                    self.assertEqual(SpeechEngine().recognizer.pause_threshold, expected, raw)
+
     @patch('core.engine.subprocess.Popen')
     def test_speak_passes_text_after_double_dash(self, mock_popen, *_):
         engine = SpeechEngine()

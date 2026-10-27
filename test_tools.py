@@ -16,7 +16,8 @@ import openai
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core import prompts, safety
-from core.ai import BLOCKED_REPLY, TOO_MANY_ROUNDS_REPLY, AIClient, get_time
+from core.ai import (BLOCKED_REPLY, PROMISE_FAIL_REPLY, PROMISE_RETRY_NOTE, TOO_MANY_ROUNDS_REPLY, AIClient,
+                     get_time)
 from core.history import FORGET_REPLY, ConversationHistory, is_forget_command
 from core.llm import FallbackClient, LLMClient, LLMResponse
 from core.llm.providers import _tool_call_dict, build_providers, load_config
@@ -173,6 +174,37 @@ class TestToolLoop(RunMock):
         print("✅ Цикл инструментов: OK")
 
 
+class TestPromiseWithoutAction(RunMock):
+    def test_retry_once_then_tool_called(self):
+        llm = ScriptedLLM(final("Открываю Safari."), tools_reply(call("open_app", {"app": "Safari"})),
+                          final("Открыла Safari."))
+        turn = AIClient(llm=llm).respond("открой сафари")
+        self.assertEqual(turn.speech, "Открыла Safari.")
+        self.assertEqual(llm.requests[1]["messages"][-1], {"role": "user", "content": PROMISE_RETRY_NOTE})
+        self.mock_run.assert_called_once()
+
+    def test_still_no_tool_after_retry(self):
+        llm = ScriptedLLM(final("Открываю Safari."), final("Запускаю Safari!"))
+        turn = AIClient(llm=llm).respond("открой сафари")
+        self.assertEqual(turn.speech, PROMISE_FAIL_REPLY)
+        self.assertEqual(len(llm.requests), 2)  # повтор — ровно один
+        self.mock_run.assert_not_called()
+
+    def test_honest_refusal_after_retry_is_spoken(self):
+        llm = ScriptedLLM(final("Перемещаю файл."), final("Не могу: укажите, какой файл."))
+        self.assertEqual(AIClient(llm=llm).respond("убери файл").speech, "Не могу: укажите, какой файл.")
+
+    def test_promise_after_real_tool_call_is_fine(self):
+        llm = ScriptedLLM(tools_reply(call("open_app", {"app": "Safari"})), final("Открываю Safari."))
+        self.assertEqual(AIClient(llm=llm).respond("открой сафари").speech, "Открываю Safari.")
+        self.assertEqual(len(llm.requests), 2)
+
+    def test_json_mode_promise_without_actions(self):
+        llm = ScriptedLLM(LLMResponse(ok=True, mode="json", text='{"response": "Открываю Safari.", "actions": []}'))
+        self.assertEqual(AIClient(llm=llm).respond("открой сафари").speech, PROMISE_FAIL_REPLY)
+        print("✅ Обещание без действия: OK")
+
+
 class TestConfirmFlow(RunMock):
     """main + ai: CONFIRM не выполняется до «да» и выполняется после."""
 
@@ -181,6 +213,7 @@ class TestConfirmFlow(RunMock):
         app.ai = AIClient(llm=llm)
         app.has_pending.return_value = False
         app.report_result = lambda results: main.VoiceApp.report_result(app, results)
+        app.ask_confirmation = lambda pending, phrase: main.VoiceApp.ask_confirmation(app, pending, phrase)
         return app
 
     def spoken(self, app):

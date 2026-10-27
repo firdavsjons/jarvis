@@ -34,6 +34,18 @@ POPULAR_APPS = [
 
 _cache = {"time": None, "apps": None}
 _lock = Lock()
+_user_aliases = {}  # из памяти пользователя (core/memory.py): «как говорю» -> имя приложения
+
+
+def alias_key(spoken):
+    """Ключ псевдонима: слова в нижнем регистре через пробел («Мой  Браузер!» -> «мой браузер»)."""
+    return " ".join(re.findall(r"\w+", str(spoken).lower()))
+
+
+def set_user_aliases(aliases):
+    global _user_aliases
+    with _lock:
+        _user_aliases = {alias_key(k): v for k, v in dict(aliases).items() if alias_key(k)}
 
 
 def _words(text):
@@ -84,14 +96,18 @@ def clear_cache():
         _cache["apps"], _cache["time"] = None, None
 
 
-def resolve_app_name(name):
+def resolve_app_name(name, use_user_aliases=True):
     """Название от пользователя или модели -> имя установленного приложения или None.
 
-    1) словарь APP_ALIASES; 2) точное совпадение без учёта регистра; 3) совпадение по слову
-    («Chrome» -> Google Chrome, если такое одно); 4) нечёткое (difflib, порог FUZZY_CUTOFF).
+    0) псевдонимы пользователя из памяти; 1) словарь APP_ALIASES; 2) точное совпадение без учёта
+    регистра; 3) совпадение по слову («Chrome» -> Google Chrome, если такое одно); 4) нечёткое (difflib).
+    use_user_aliases=False — при запоминании псевдонима (без цепочек псевдоним -> псевдоним).
     """
     if not isinstance(name, str) or not name.strip():
         return None
+    if use_user_aliases:
+        with _lock:
+            name = _user_aliases.get(alias_key(name), name)
     name = resolve_app(name.strip())
     installed = list_installed_apps()
     if not installed:

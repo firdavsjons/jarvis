@@ -7,7 +7,9 @@ from threading import Thread, Lock, Timer, Event
 from dotenv import load_dotenv
 from core.engine import SpeechEngine
 from core.ai import BLOCKED_REPLY, AIClient, describe_action, normalize_ai_response, summarize_results
+from core.cache import CACHE_FILE, CLEARED_REPLY, CommandCache, is_forget_cache_command
 from core.history import FORGET_REPLY, is_forget_command
+from core.memory import MEMORY_FILE, UserMemory, is_clear_memory_command
 from core.journal import setup_journal
 from core.llm import build_default_client
 from core.logger import LOG_DIR, setup_logging
@@ -64,7 +66,8 @@ class VoiceApp:
         self.stop_btn.pack(pady=5)
 
         self.engine = SpeechEngine()
-        self.ai = AIClient(llm=build_default_client(usage_path=LOG_DIR / "llm_usage.json"))
+        self.ai = AIClient(llm=build_default_client(usage_path=LOG_DIR / "llm_usage.json"),
+                           memory=UserMemory(MEMORY_FILE), cache=CommandCache(CACHE_FILE))
         self.mac = MacControl()
         self.is_listening = False
         self.stop_event = Event()
@@ -225,6 +228,20 @@ class VoiceApp:
             self.set_idle_status()
             return
 
+        if is_forget_cache_command(text):
+            if self.ai.cache is not None:
+                self.ai.cache.clear()
+            self.engine.speak(CLEARED_REPLY)
+            self.set_idle_status()
+            return
+
+        # «Забудь всё обо мне» — удаление всей памяти, сразу с вопросом (без модели)
+        if is_clear_memory_command(text):
+            pending = [{"name": "clear_memory", "args": {}}]
+            self.ai.remember(text, confirmation_question(pending))
+            self.ask_confirmation(pending, text)
+            return
+
         # 2. Проверяем жесткие системные команды (громкость и т.д.)
         sys_response = self.mac.execute(text)
         if sys_response:
@@ -251,13 +268,16 @@ class VoiceApp:
 
         # CONFIRM — только после «да»; таймер ожидания стартует после вопроса
         if turn.pending:
-            self.set_pending(turn.pending, text)
-            self.update_status("Подтвердите действия...", "orange")
-            self.update_log("Подтвердите: " + "; ".join(describe_action(a) for a in turn.pending))
-            self.engine.speak(confirmation_question(turn.pending))
-            self.start_pending_timer(turn.pending)
+            self.ask_confirmation(turn.pending, text)
         else:
             self.set_idle_status()
+
+    def ask_confirmation(self, pending, phrase):
+        self.set_pending(pending, phrase)
+        self.update_status("Подтвердите действия...", "orange")
+        self.update_log("Подтвердите: " + "; ".join(describe_action(a) for a in pending))
+        self.engine.speak(confirmation_question(pending))
+        self.start_pending_timer(pending)
 
     def background_loop(self):
         try:

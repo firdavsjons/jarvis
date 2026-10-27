@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from core import installed_apps, journal, prompts, safety
+from core.cache import cacheable_actions
 from core.history import ConversationHistory
+from core.memory import MemoryRefused, UserMemory, asked_to_remember
 from core.llm import build_default_client
 from core.speech_text import confirmation_question
 from core.tools import TOOLS, assistant_message, call_to_action, tool_message
@@ -22,6 +24,13 @@ MAX_TOOL_ROUNDS = 3     # кругов «модель вызвала инстр�
 BLOCKED_REPLY = "Это слишком опасно, я этого не сделаю."
 TOO_MANY_ROUNDS_REPLY = "Не получилось завершить запрос."
 AI_ERROR_REPLY = "Произошла ошибка при обращении к нейросети."
+PROMISE_RETRY_NOTE = "Вызови инструмент или скажи, что не можешь. Не обещай действия без вызова."
+PROMISE_FAIL_REPLY = "Не получилось: действие не было выполнено."
+# Модель обещает действие («Открываю Safari»), но не вызвала ни одного инструмента
+_PROMISE_RE = re.compile(r"(?<!\w)(открываю|закрываю|запускаю|устанавливаю|выполняю|перемещаю)(?!\w)", re.IGNORECASE)
+MEMORY_ACTIONS = {"remember", "remember_alias", "list_memory", "forget_memory", "clear_memory"}
+REMEMBER_ACTIONS = {"remember", "remember_alias"}
+NOT_ASKED_SHORT = "запоминаю только по вашей просьбе со словом «запомни»"
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
@@ -33,9 +42,10 @@ class ActionError(ValueError):
     short — короткая причина по-русски для голоса и окна («файл не найден»).
     """
 
-    def __init__(self, message, short="команда завершилась с ошибкой"):
+    def __init__(self, message, short="команда завершилась с ошибкой", reply=None):
         super().__init__(message)
         self.short = short
+        self.reply = reply  # готовая фраза вместо «Не получилось: …» («Такое я запоминать не буду.»)
 
 
 class Done:
@@ -185,12 +195,18 @@ def describe_action(action):
 
 def summarize_results(results):
     """(всё ли успешно, что сказать). Ошибка -> «Не получилось: …», без «Готово»."""
-    failed = []
+    failed, replies = [], []
     for r in results:
-        if not r["ok"] and r["short"] not in failed:
+        if r["ok"]:
+            continue
+        if r.get("reply"):
+            if r["reply"] not in replies:
+                replies.append(r["reply"])
+        elif r["short"] not in failed:
             failed.append(r["short"])
-    if failed:
-        return False, f"Не получилось: {', '.join(failed)}."
+    if failed or replies:
+        parts = ([f"Не получилось: {', '.join(failed)}."] if failed else []) + replies
+        return False, " ".join(parts)
     return True, " ".join(r["speech"] for r in results if r["speech"])
 
 
@@ -215,16 +231,29 @@ class Turn:
 
 
 class AIClient:
-    def __init__(self, llm=None, tools=TOOLS, allowed_actions=None):
+    def __init__(self, llm=None, tools=TOOLS, allowed_actions=None, memory=None, cache=None):
         # Провайдеры (Gemini → Groq → LM Studio) с запасными вариантами — core/llm, настройки из .env
         self.llm = llm if llm is not None else build_default_client()
         self.tools = tools
         self.allowed_actions = allowed_actions  # None — весь белый список (подмножество — для проверки связи)
         self.history = ConversationHistory()
+        # Память: по умолчанию только в памяти процесса; файл (~/Library/Application Support/Jarvis) — из main
+        self.memory = memory if memory is not None else UserMemory()
+        self.memory.on_change = self._memory_changed
+        installed_apps.set_user_aliases(self.memory.aliases)
+        self.cache = cache  # None — кэш команд выключен (тесты); в приложении — CommandCache с файлом
+
+    def _memory_changed(self, aliases_changed):
+        installed_apps.set_user_aliases(self.memory.aliases)
+        if aliases_changed and self.cache is not None:
+            self.cache.clear()  # «открой браузер» мог закэшироваться со старым псевдонимом
+
+    def _prompt_kwargs(self):
+        return {"memory_block": self.memory.prompt_block(), "assistant_name": self.memory.assistant_name}
 
     @property
     def system_prompt(self):
-        return prompts.tools_prompt()
+        return prompts.tools_prompt(**self._prompt_kwargs())
 
     def forget(self):
         self.history.clear()
@@ -235,19 +264,57 @@ class AIClient:
     # --- Режим инструментов ---
 
     def respond(self, text):
-        """Фраза пользователя -> Turn. Инструменты: SAFE — выполнить и вернуть модели результат (до 3 кругов),
-        CONFIRM — вопрос пользователю, BLOCKED — отклонить весь ответ. Модели без инструментов — режим JSON."""
+        """Фраза пользователя -> Turn. Сначала кэш команд; иначе модель (инструменты или режим JSON)."""
+        turn = self._from_cache(text)
+        if turn is None:
+            turn = self._respond_model(text)
+            self._maybe_cache(text, turn)
+        return turn
+
+    def _from_cache(self, text):
+        """Попадание в кэш: без модели, через обычный путь (classify, повторная проверка, журнал)."""
+        if self.cache is None:
+            return None
+        actions = self.cache.lookup(text)
+        if not actions:
+            return None
+        if any(safety.classify(a)[0] != safety.SAFE for a in actions):
+            self.cache.remove(text)  # уровень изменился (например, сайт убрали из доверенных) — спросим модель
+            return None
+        log.info("Кэш команд: «%s» -> %s", text, actions)
+        results = self.run_actions(actions, phrase=text)
+        ok, summary = summarize_results(results)
+        if ok:
+            self.cache.mark_used(text)
+            speech = ". ".join(r["result"] for r in results if r.get("result")) + "."
+        else:
+            self.cache.remove(text)
+            speech = summary
+        return self._finish(text, Turn(speech, results=results))
+
+    def _maybe_cache(self, text, turn):
+        if self.cache is None or turn.pending or turn.blocked:
+            return
+        actions = cacheable_actions(turn.results)
+        if actions and self.cache.store(text, actions):
+            log.info("Кэш команд: запомнил «%s» -> %s", text, actions)
+
+    def _respond_model(self, text):
+        """Инструменты: SAFE — выполнить и вернуть модели результат (до 3 кругов), CONFIRM — вопрос
+        пользователю, BLOCKED — отклонить весь ответ. Модели без инструментов — режим JSON."""
         history = self.history.messages()
         user = {"role": "user", "content": text}
-        messages = [{"role": "system", "content": prompts.tools_prompt()}, *history, user]
-        json_messages = [{"role": "system", "content": prompts.json_prompt()}, *history, user]
+        messages = [{"role": "system", "content": prompts.tools_prompt(**self._prompt_kwargs())}, *history, user]
+        json_messages = [{"role": "system", "content": prompts.json_prompt(**self._prompt_kwargs())}, *history, user]
         executed = []
+        tool_rounds, requests, retried = 0, 0, False
 
-        for round_no in range(MAX_TOOL_ROUNDS + 1):
+        while True:
             try:
-                # json_messages только в первом круге: без инструментов результаты им не вернуть
+                # json_messages только в первом запросе: без инструментов результаты им не вернуть
                 response = self.llm.chat(messages, tools=self.tools,
-                                         json_messages=json_messages if round_no == 0 else None)
+                                         json_messages=json_messages if requests == 0 else None)
+                requests += 1
             except Exception as e:
                 log.error("❌ Ошибка запроса к AI: %s", type(e).__name__)
                 return self._finish(text, self._results_turn(executed, AI_ERROR_REPLY))
@@ -257,8 +324,17 @@ class AIClient:
             if response.mode == "json":
                 return self._finish(text, self._json_turn(text, response.text))
             if not response.tool_calls:
+                if not executed and _PROMISE_RE.search(response.text or ""):
+                    if not retried:
+                        # Обещание без вызова инструмента — переспросить один раз
+                        log.warning("LLM: обещание без вызова инструмента — повторяю запрос: %s", response.text)
+                        retried = True
+                        messages = messages + [{"role": "assistant", "content": response.text},
+                                               {"role": "user", "content": PROMISE_RETRY_NOTE}]
+                        continue
+                    return self._finish(text, Turn(PROMISE_FAIL_REPLY))
                 return self._finish(text, Turn(self._honest(response.text, executed), results=executed))
-            if round_no == MAX_TOOL_ROUNDS:
+            if tool_rounds == MAX_TOOL_ROUNDS:
                 log.warning("LLM: больше %s кругов с инструментами — прерываю", MAX_TOOL_ROUNDS)
                 return self._finish(text, Turn(TOO_MANY_ROUNDS_REPLY, results=executed))
 
@@ -279,6 +355,7 @@ class AIClient:
                 ok, summary = summarize_results(results)
                 return self._finish(text, Turn(summary, pending=confirm, results=executed))
 
+            tool_rounds += 1
             results = iter(self.run_actions(safe, phrase=text))
             messages = messages + [assistant_message(response)]
             for call, action, error in calls:
@@ -291,8 +368,6 @@ class AIClient:
                 executed.append(result)
                 messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
                                              error=result["short"]))
-
-        return self._finish(text, Turn(TOO_MANY_ROUNDS_REPLY, results=executed))
 
     def _honest(self, final_text, executed):
         """Страховка: инструмент упал, а модель говорит как об успехе — говорим правду сами."""
@@ -323,6 +398,8 @@ class AIClient:
             self.reject_actions(actions, text, "в ответе есть опасное действие")
             return Turn(BLOCKED_REPLY, blocked=blocked)
         if not safe:
+            if not confirm and not actions and _PROMISE_RE.search(response_text):
+                return Turn(PROMISE_FAIL_REPLY)  # «Открываю Safari» без единого действия
             return Turn("" if confirm else response_text, pending=confirm)
 
         results = self.run_actions(safe, phrase=text)
@@ -335,7 +412,7 @@ class AIClient:
     def ask(self, text):
         """Один запрос в режиме JSON: {"response", "actions"}."""
         messages = [
-            {"role": "system", "content": prompts.json_prompt()},
+            {"role": "system", "content": prompts.json_prompt(**self._prompt_kwargs())},
             {"role": "user", "content": text},
         ]
         try:
@@ -367,6 +444,24 @@ class AIClient:
             log.warning("⚠️ Ошибка парсинга JSON: %s", content)
             return {"response": content, "actions": []}
 
+    def _memory_action(self, name, phrase):
+        """Действие памяти. phrase — исходная фраза ПОЛЬЗОВАТЕЛЯ (не аргументы модели): запись в память
+        только если в ней есть «запомни», «запиши» или «учти» — текст со страниц и ответы модели не в счёт."""
+        def run(**args):
+            if name in REMEMBER_ACTIONS and not asked_to_remember(phrase):
+                raise ActionError(f"{name} без просьбы пользователя: {phrase!r}", NOT_ASKED_SHORT)
+            method = {"remember": self.memory.remember, "remember_alias": self.memory.remember_alias,
+                      "list_memory": self.memory.list_memory, "forget_memory": self.memory.forget,
+                      "clear_memory": self.memory.clear}[name]
+            if name == "forget_memory":
+                args = {"query": args.get("query")} if set(args) <= {"query"} else args
+            try:
+                message, speech = method(**args)
+            except MemoryRefused as e:
+                raise ActionError(f"память: {e.short}", e.short, e.reply)
+            return Done(message, speech)
+        return run
+
     def split_actions(self, actions):
         """Делит действия по уровню риска: (SAFE, CONFIRM, BLOCKED)."""
         if not isinstance(actions, list):
@@ -395,7 +490,7 @@ class AIClient:
         for action in actions:
             level, reason = safety.classify(action)
             journal_confirmed = confirmed if level == safety.CONFIRM else None
-            ok, short, speech, result_text = False, None, None, None
+            ok, short, speech, result_text, reply = False, None, None, None, None
 
             if level == safety.BLOCKED:
                 message, short = f"⛔ Заблокировано: {action} — {reason}", "это запрещено"
@@ -404,7 +499,8 @@ class AIClient:
             elif level == safety.CONFIRM and not confirmed:
                 message, short = f"⛔ Нужно подтверждение: {action} — {reason}", "нужно подтверждение"
             else:
-                func = ACTIONS[action["name"]]
+                func = self._memory_action(action["name"], phrase) if action["name"] in MEMORY_ACTIONS \
+                    else ACTIONS[action["name"]]
                 args = action.get("args") or {}
                 log.info("▶ Действие: %s %s", action["name"], args)
                 try:
@@ -416,10 +512,10 @@ class AIClient:
                 except TypeError as e:
                     message, short = f"⛔ Отклонено (неверные аргументы): {action} — {e}", "неверные параметры"
                 except ActionError as e:
-                    message, short = f"⛔ Отклонено: {action} — {e}", e.short
+                    message, short, reply = f"⛔ Отклонено: {action} — {e}", e.short, e.reply
 
             results.append({"action": action, "level": level, "ok": ok, "message": message,
-                            "short": short, "speech": speech, "result": result_text})
+                            "short": short, "speech": speech, "result": result_text, "reply": reply})
             journal.record(phrase, action, level, journal_confirmed, ok, message)
 
         return results

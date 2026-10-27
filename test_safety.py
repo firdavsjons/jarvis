@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core import journal, safety
-from core.ai import ACTIONS, AIClient
+from core.ai import ACTIONS, MEMORY_ACTIONS, AIClient
 from core.safety import BLOCKED, CONFIRM, SAFE, classify, classify_path, classify_url
 from core.llm import LLMResponse
 from fixtures_apps import patch_installed
@@ -101,7 +101,7 @@ class TestPathLevels(FakeHomeMixin, unittest.TestCase):
 
 class TestActionLevels(FakeHomeMixin, unittest.TestCase):
     def test_whitelist_matches_ai_actions(self):
-        self.assertEqual(set(ACTIONS), safety.ACTION_NAMES)
+        self.assertEqual(set(ACTIONS) | MEMORY_ACTIONS, safety.ACTION_NAMES)
 
     def test_unknown_actions_blocked(self):
         for action in [
@@ -277,6 +277,7 @@ class TestBlockedReply(unittest.TestCase):
         app.has_pending.return_value = False
         app.mac.execute.return_value = None
         app.report_result = lambda results: main.VoiceApp.report_result(app, results)
+        app.ask_confirmation = lambda pending, phrase: main.VoiceApp.ask_confirmation(app, pending, phrase)
         return app
 
     def spoken(self, app):
