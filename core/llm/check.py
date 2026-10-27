@@ -68,13 +68,38 @@ def check_tools(provider, out=sys.stdout):
     return called
 
 
+def check_web(out=sys.stdout):
+    """По одному разу: погода, курс USD→TJS, поиск. Выводит ok/ошибку, время и первые 80 символов."""
+    from core.ai import ActionError, get_exchange_rate, get_weather, web_search
+
+    checks = [("get_weather", lambda: get_weather()),
+              ("get_exchange_rate", lambda: get_exchange_rate("USD", "TJS")),
+              ("web_search", lambda: web_search("погода Душанбе"))]
+    results = []
+    for name, run in checks:
+        started = time.monotonic()
+        try:
+            done = run()
+            status, text = "OK", " ".join((done.for_model or done.message).split())
+        except ActionError as e:
+            status, text = f"ошибка: {e.short}", ""
+        elapsed = time.monotonic() - started
+        _print(f"{name:<18} {status:<32} {elapsed:4.1f} с   {text[:80]}", out)
+        results.append(status == "OK")
+    return results
+
+
 def main(argv=None, config=None, out=sys.stdout):
     parser = argparse.ArgumentParser(description="Проверка связи с LLM-провайдерами")
     parser.add_argument("--models", action="store_true", help="показать доступные модели")
     parser.add_argument("--provider", help="проверить только этого провайдера (gemini, groq, local)")
     parser.add_argument("--tools", action="store_true",
                         help="живая проверка tool calling: «Который час?» с get_time (2 запроса на провайдера)")
+    parser.add_argument("--web", action="store_true",
+                        help="проверка погоды, курса USD→TJS и поиска (бесплатные сервисы, без ключей)")
     args = parser.parse_args(argv)
+    if args.web:
+        return 0 if any(check_web(out)) else 1
 
     config = load_config() if config is None else config
     if args.provider:

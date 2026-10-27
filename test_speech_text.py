@@ -82,6 +82,32 @@ class TestPrepareForSpeech(unittest.TestCase):
         self.assertEqual(prepare_for_speech("🚀✅"), "")
 
 
+class TestUnits(unittest.TestCase):
+    def test_weather_line(self):
+        self.assertEqual(
+            prepare_for_speech("Душанбе: сейчас +18°C, ощущается как +16°C, ветер 3 м/с. Сегодня от -2°C до +21°C."),
+            "Душанбе: сейчас плюс 18 градусов Цельсия, ощущается как плюс 16 градусов Цельсия, ветер 3 метра в секунду. "
+            "Сегодня от минус 2 градусов Цельсия до плюс 21 градуса Цельсия.")
+
+    def test_agreement(self):
+        cases = [("1°C", "1 градус Цельсия"), ("2°C", "2 градуса Цельсия"), ("11°C", "11 градусов Цельсия"),
+                 ("21°C", "21 градус Цельсия"), ("2,5°C", "2,5 градуса Цельсия"), ("41%", "41 процент"),
+                 ("12%", "12 процентов"), ("1 м/с", "1 метр в секунду"), ("5 м/с", "5 метров в секунду"),
+                 ("0,5 мм", "0,5 миллиметра")]
+        for text, expected in cases:
+            self.assertEqual(prepare_for_speech(text), expected, text)
+
+    def test_currencies(self):
+        self.assertEqual(prepare_for_speech("1 USD = 10,93 TJS"), "1 доллар равно 10,93 сомони")
+        self.assertEqual(prepare_for_speech("$5 и 100 ₽, 3 EUR, 2 CNY, 7 сомони"),
+                         "5 долларов и 100 рублей, 3 евро, 2 юаня, 7 сомони")
+
+    def test_plain_degrees_and_numbers_unchanged(self):
+        for text in ["Сейчас 25° тепла.", "Версия 3.5", "Время 12:30"]:
+            self.assertEqual(prepare_for_speech(text), text)
+        print("✅ Числа и единицы: OK")
+
+
 class TestConfirmationQuestion(unittest.TestCase):
     def test_short_questions(self):
         self.assertEqual(confirmation_question([{"name": "open_url", "args": {"url": "https://www.youtube.com/watch?v=1"}}]),

@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from core import installed_apps, journal, prompts, safety
+from core import installed_apps, journal, prompts, safety, web
 from core.cache import cacheable_actions
 from core.history import ConversationHistory
 from core.memory import SECRET_REFUSAL, MemoryRefused, UserMemory, asked_to_remember, contains_secret
@@ -35,6 +35,11 @@ NOT_FOUND_SHORT = "не нашёл"
 # Простые действия: при успехе модели результат не возвращаем — фраза по шаблону, на 1 запрос меньше
 TEMPLATE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url"}
 MAX_TEMPLATE_PARTS = 3
+# Данные из интернета: после них в этой фразе нельзя менять память, открывать ссылки, удалять и закрывать
+WEB_ACTIONS = {"web_search", "get_weather", "get_exchange_rate"}
+RESTRICTED_AFTER_WEB = {"remember", "remember_alias", "forget_memory", "clear_memory", "open_url", "trash_file",
+                        "quit_app"}
+WEB_RESTRICTED_SHORT = "в ответе были данные из интернета"
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
@@ -53,11 +58,14 @@ class ActionError(ValueError):
 
 
 class Done:
-    """Результат действия: message — в лог и окно, speech — сказать пользователю (для действий-чтений)."""
+    """Результат действия: message — в лог и окно, speech — сказать пользователю (для действий-чтений),
+    for_model — что вернуть модели (если короче окна), web — данные из интернета (не инструкции)."""
 
-    def __init__(self, message, speech=None):
+    def __init__(self, message, speech=None, for_model=None, web=False):
         self.message = message
         self.speech = speech
+        self.for_model = for_model
+        self.web = web
 
 
 def _run(args):
@@ -164,6 +172,32 @@ def list_apps():
     return Done(f"Установлены: {', '.join(apps)}", f"Установлены: {_spoken_list(apps)}.")
 
 
+def _web(call, *args):
+    try:
+        return call(*args)
+    except web.WebError as e:
+        raise ActionError(str(e), e.short)
+
+
+def web_search(query):
+    """Только чтение: поиск в интернете (ddgs). Модели — сжато, в окно — со ссылками."""
+    for_model, window = _web(web.search, query)
+    first = for_model.split("\n", 1)[0].split(". ", 1)[-1]
+    return Done(f"Поиск «{query}»:\n{window}", f"Нашёл: {first}", for_model=for_model, web=True)
+
+
+def get_weather(city=None):
+    """Только чтение: погода Open-Meteo, город по умолчанию — DEFAULT_CITY из .env."""
+    text = _web(web.weather, city)
+    return Done(text, text, for_model=text, web=True)
+
+
+def get_exchange_rate(base, target):
+    """Только чтение: курс валют (open.er-api.com, запасной — currency-api)."""
+    text = _web(web.exchange_rate, base, target)
+    return Done(text, text, for_model=text, web=True)
+
+
 def get_time():
     """Только чтение: текущие дата, время и день недели (системный часовой пояс)."""
     now = prompts.describe_now()
@@ -180,6 +214,9 @@ ACTIONS = {
     "find_apps": find_apps,
     "list_apps": list_apps,
     "get_time": get_time,
+    "web_search": web_search,
+    "get_weather": get_weather,
+    "get_exchange_rate": get_exchange_rate,
 }
 
 
@@ -330,7 +367,7 @@ class AIClient:
         messages = [{"role": "system", "content": prompts.tools_prompt(**self._prompt_kwargs())}, *history, user]
         json_messages = [{"role": "system", "content": prompts.json_prompt(**self._prompt_kwargs())}, *history, user]
         executed = []
-        tool_rounds, requests, retried = 0, 0, False
+        tool_rounds, requests, retried, web_seen = 0, 0, False, False
 
         while True:
             try:
@@ -371,6 +408,17 @@ class AIClient:
             if blocked:
                 self.reject_actions(actions, text, "в ответе есть опасное действие")
                 return self._finish(text, Turn(BLOCKED_REPLY, blocked=blocked, results=executed))
+
+            # Веб-данные в этой фразе (уже получены или запрошены в этом же круге) — запрет на память,
+            # ссылки, удаление и закрытие: текст из интернета мог подсказать модели такие вызовы
+            web_seen = web_seen or any(a and a.get("name") in WEB_ACTIONS for _, a, _ in calls)
+            if web_seen and any(a and a.get("name") in RESTRICTED_AFTER_WEB for _, a, _ in calls):
+                self.reject_actions([a for _, a, _ in calls if a and a.get("name") in RESTRICTED_AFTER_WEB],
+                                    text, WEB_RESTRICTED_SHORT)
+                calls = [(c, None, WEB_RESTRICTED_SHORT) if a and a.get("name") in RESTRICTED_AFTER_WEB else (c, a, e)
+                         for c, a, e in calls]
+                actions = [a for _, a, _ in calls if a is not None]
+                safe, confirm, _ = self.split_actions(actions, phrase=text)
             if confirm:
                 # SAFE — сейчас, CONFIRM — после «да»; модели ничего не возвращаем, пока пользователь не ответит
                 results = self.run_actions(safe, phrase=text)
@@ -395,7 +443,7 @@ class AIClient:
                 result = next(results)
                 executed.append(result)
                 messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
-                                             error=result["short"]))
+                                             error=result["short"], web=result.get("web", False)))
 
     @staticmethod
     def _template_ok(calls, results):
@@ -430,6 +478,12 @@ class AIClient:
         if blocked:
             self.reject_actions(actions, text, "в ответе есть опасное действие")
             return Turn(BLOCKED_REPLY, blocked=blocked)
+        if isinstance(actions, list) and any(isinstance(a, dict) and a.get("name") in WEB_ACTIONS for a in actions):
+            restricted = [a for a in actions if isinstance(a, dict) and a.get("name") in RESTRICTED_AFTER_WEB]
+            if restricted:
+                self.reject_actions(restricted, text, WEB_RESTRICTED_SHORT)
+                safe = [a for a in safe if a not in restricted]
+                confirm = [a for a in confirm if a not in restricted]
         if not safe:
             if not confirm and not actions and _PROMISE_RE.search(response_text):
                 return Turn(PROMISE_FAIL_REPLY)  # «Открываю Safari» без единого действия
@@ -541,7 +595,7 @@ class AIClient:
             level, reason = safety.classify(action)
             remember_confirmed = isinstance(action, dict) and action.get("name") in REMEMBER_ACTIONS and confirmed
             journal_confirmed = confirmed if level == safety.CONFIRM or remember_confirmed else None
-            ok, short, speech, result_text, reply = False, None, None, None, None
+            ok, short, speech, result_text, reply, web_data = False, None, None, None, None, False
 
             if level == safety.BLOCKED:
                 message, short = f"⛔ Заблокировано: {action} — {reason}", "это запрещено"
@@ -559,14 +613,16 @@ class AIClient:
                         raise ActionError(f"args должен быть объектом: {args!r}", "неверные параметры")
                     out = func(**args)
                     done = out if isinstance(out, Done) else Done(out)
-                    ok, message, speech, result_text = True, f"✅ {done.message}", done.speech, done.message
+                    ok, message, speech = True, f"✅ {done.message}", done.speech
+                    result_text, web_data = done.for_model or done.message, done.web
                 except TypeError as e:
                     message, short = f"⛔ Отклонено (неверные аргументы): {action} — {e}", "неверные параметры"
                 except ActionError as e:
                     message, short, reply = f"⛔ Отклонено: {action} — {e}", e.short, e.reply
 
             results.append({"action": action, "level": level, "ok": ok, "message": message,
-                            "short": short, "speech": speech, "result": result_text, "reply": reply})
+                            "short": short, "speech": speech, "result": result_text, "reply": reply,
+                            "web": web_data})
             journal.record(phrase, action, level, journal_confirmed, ok, message)
 
         return results

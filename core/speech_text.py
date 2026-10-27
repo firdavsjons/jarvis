@@ -81,6 +81,58 @@ _LONG_TOKEN_RE = re.compile(r"\b(?=\w*\d)(?=\w*[^\W\d])\w{16,}\b")  # хеши, 
 _TRAILING_PUNCT = ".,;:!?"
 
 
+# --- Числа и единицы для голоса ---
+
+_NUM = r"(\d+(?:[.,]\d+)?)"
+
+
+def plural(number, forms):
+    """forms = («градус», «градуса», «градусов»); дробное число — родительный падеж единственного («2,5 градуса»)."""
+    if "," in number or "." in number:
+        return forms[1]
+    n = int(number)
+    if 11 <= n % 100 <= 14:
+        return forms[2]
+    return forms[0] if n % 10 == 1 else forms[1] if 2 <= n % 10 <= 4 else forms[2]
+
+
+def _unit(forms, suffix=""):
+    def replace(match):
+        number = match.group("n")
+        return f"{number} {plural(number, forms)}{suffix}"
+    return replace
+
+
+def _temperature(match):
+    sign = {"+": "плюс ", "-": "минус ", "−": "минус "}.get(match.group("sign") or "", "")
+    number = match.group("n")
+    # «от/до +21°C» — родительный падеж: «до плюс 21 градуса», «от минус 5 градусов»
+    after_preposition = re.search(r"(?<!\w)(от|до)\s$", match.string[:match.start()])
+    forms = ("градуса", "градусов", "градусов") if after_preposition else ("градус", "градуса", "градусов")
+    return f"{sign}{number} {plural(number, forms)} Цельсия"
+
+
+_UNIT_RULES = [
+    (re.compile(r"(?<![\w.,])(?P<sign>[+\-−])?(?P<n>\d+(?:[.,]\d+)?)\s?°\s?[CС](?!\w)"), _temperature),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?%"), _unit(("процент", "процента", "процентов"))),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?м/с(?!\w)"), _unit(("метр", "метра", "метров"), " в секунду")),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?мм(?!\w)"), _unit(("миллиметр", "миллиметра", "миллиметров"))),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?(?:TJS|сомони)(?!\w)"), _unit(("сомони", "сомони", "сомони"))),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?(?:USD|\$)(?!\w)"), _unit(("доллар", "доллара", "долларов"))),
+    (re.compile(rf"\$\s?(?P<n>{_NUM[1:-1]})"), _unit(("доллар", "доллара", "долларов"))),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?(?:RUB|₽)(?!\w)"), _unit(("рубль", "рубля", "рублей"))),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?(?:EUR|€)(?!\w)"), _unit(("евро", "евро", "евро"))),
+    (re.compile(rf"(?P<n>{_NUM[1:-1]})\s?(?:CNY|¥)(?!\w)"), _unit(("юань", "юаня", "юаней"))),
+]
+
+
+def units_for_speech(text):
+    """«+18°C» -> «плюс 18 градусов Цельсия», «3 м/с» -> «3 метра в секунду», «10,93 TJS» -> «10,93 сомони»."""
+    for pattern, replace in _UNIT_RULES:
+        text = pattern.sub(replace, text)
+    return re.sub(r"\s=\s", " равно ", text)
+
+
 def domain_for_speech(host):
     """www.youtube.com -> «ютуб точка ком»."""
     host = host.lower().rstrip(".")
@@ -154,6 +206,7 @@ def prepare_for_speech(text):
     s = _PAREN_URL_RE.sub("", s)
     s = _URL_RE.sub(_replace_keeping_tail(url_for_speech), s)
     s = _PATH_RE.sub(_replace_keeping_tail(path_for_speech), s)
+    s = units_for_speech(s)
     s = _FILE_NAME_RE.sub(lambda m: f"{m.group(1)} точка {extension_for_speech(m.group(2))}", s)
     s = _strip_emoji(s)
     s = _MD_CHARS_RE.sub(" ", s)
