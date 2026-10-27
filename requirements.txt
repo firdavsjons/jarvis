@@ -2,7 +2,5 @@ openai
 python-dotenv
 SpeechRecognition
 pyaudio
-pyobjc
-keyboard
 httpx==0.28.1
 ddgs==9.16.1

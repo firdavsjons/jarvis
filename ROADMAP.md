@@ -188,6 +188,7 @@
 - [ ] Автозапуск при входе (launchd)
 - [ ] README: установка, права macOS (Микрофон, Accessibility, Automation, Input Monitoring), настройка `.env`
 - [ ] Версии зависимостей закреплены
+- [x] Убрать pyobjc и keyboard (не импортируются нигде в коде; озвучка — say)
 
 ## Этап 14. Позже (версия 2)
 - [ ] Офлайн-режим на Qwen 7B / Gemma 4B (LM Studio или MLX) — код провайдера `local` уже есть, включить: `LLM_PROVIDERS=gemini,groq,local`

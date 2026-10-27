@@ -88,12 +88,13 @@ VoiceApp.process_command            (main.py)
 
 ```bash
 brew install portaudio          # нужен для pyaudio
-pip install -r requirements.txt
+pip install -r requirements.txt  # openai, python-dotenv, SpeechRecognition, pyaudio, httpx, ddgs;
+                                 #   pyobjc и keyboard не нужны: озвучка — системный say, клавиатура не используется
 cp .env.example .env            # вписать GEMINI_API_KEY и GROQ_API_KEY
 python -m core.llm.check        # связь с провайдерами (--models — список моделей, --provider groq — один,
                                 #   --tools — «Который час?» с get_time, 2 запроса на провайдера,
                                 #   --web — погода, курс USD→TJS, поиск: бесплатные сервисы без ключей)
-# LM Studio (запасной вариант): загрузить модель → Developer → Start Server (порт 1234)
+# LM Studio (выключен по умолчанию; LLM_PROVIDERS=gemini,groq,local): модель → Developer → Start Server (1234)
 python main.py
 ```
 
