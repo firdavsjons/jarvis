@@ -41,8 +41,12 @@ TOOLS = [
     _tool("clear_memory", "Удалить всю память о пользователе (спросит подтверждение)."),
     _tool("web_search", "Поиск в интернете: свежие факты, новости. Возвращает заголовки, фрагменты и источники.",
           {"query": {"type": "string", "description": "Поисковый запрос по-русски"}}, ["query"]),
+    # Все параметры обязательны: Groq проверяет вызов по схеме, и необязательный "city": null у get_weather
+    # давал 400 tool_use_failed («expected string, but got null»). Нет города — пустая строка.
     _tool("get_weather", "Погода сейчас и прогноз на сегодня и завтра (Open-Meteo).",
-          {"city": {"type": "string", "description": "Город; не указывай — будет город пользователя по умолчанию"}}),
+          {"city": {"type": "string",
+                    "description": "Город, например Душанбе. Если пользователь город не назвал — пустая строка"}},
+          ["city"]),
     _tool("get_exchange_rate", "Курс валют.",
           {"base": {"type": "string", "description": "Из какой валюты: USD, EUR, RUB, CNY, TJS"},
            "target": {"type": "string", "description": "В какую валюту: TJS, USD…"}}, ["base", "target"]),
