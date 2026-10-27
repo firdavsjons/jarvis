@@ -9,7 +9,7 @@ from core.engine import SpeechEngine
 from core.ai import BLOCKED_REPLY, AIClient, describe_action, normalize_ai_response, summarize_results
 from core.cache import CACHE_FILE, CLEARED_REPLY, CommandCache, is_forget_cache_command
 from core.history import FORGET_REPLY, is_forget_command
-from core.links import parse_link_command
+from core.links import parse_link_command, parse_read_command
 from core.memory import MEMORY_FILE, UserMemory, is_clear_memory_command
 from core.journal import setup_journal
 from core.llm import build_default_client
@@ -243,6 +243,15 @@ class VoiceApp:
             pending = [{"name": "clear_memory", "args": {}}]
             self.ai.remember(text, confirmation_question(pending))
             self.ask_confirmation(pending, text)
+            return
+
+        # «Прочитай первую ссылку» / «прочитай сайт example.com» — адрес из сохранённых ссылок или из фразы
+        read = parse_read_command(text)
+        if read is not None:
+            kind, value = read
+            self.update_status("Читаю страницу...", "blue")
+            self.deliver(self.ai.read_page_turn(text, number=value if kind == "number" else None,
+                                                url=value if kind == "url" else None), text)
             return
 
         # «Открой первую ссылку» — адрес из сохранённого результата поиска, не от модели

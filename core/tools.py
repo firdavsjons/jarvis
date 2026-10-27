@@ -13,6 +13,10 @@ def _tool(name, description, properties=None, required=()):
     }
 
 
+# Форма ответа по данным из интернета — в описаниях веб-инструментов, а не в системном промпте (лимит 1200)
+WEB_ANSWER_RULE = ("Ответ: 1–3 короткие фразы, источник назови словами (например «по данным Open-Meteo», «по данным "
+                   "РИА Новости»), числа и единицы — словами; чего нет в результатах — не придумывай, не нашёл — так и скажи.")
+
 _APP = {"app": {"type": "string", "description": "Название приложения как в macOS, по-английски: Safari, Telegram"}}
 
 TOOLS = [
@@ -39,17 +43,20 @@ TOOLS = [
     _tool("forget_memory", "Забыть из памяти всё, что содержит запрос.",
           {"query": {"type": "string", "description": "Что забыть: «кофе»"}}, ["query"]),
     _tool("clear_memory", "Удалить всю память о пользователе (спросит подтверждение)."),
-    _tool("web_search", "Поиск в интернете: свежие факты, новости. Возвращает заголовки, фрагменты и источники.",
-          {"query": {"type": "string", "description": "Поисковый запрос по-русски"}}, ["query"]),
+    _tool("web_search", "Поиск в интернете: свежие факты, новости. Возвращает заголовки, фрагменты и источники. "
+          + WEB_ANSWER_RULE, {"query": {"type": "string", "description": "Поисковый запрос по-русски"}}, ["query"]),
     # Все параметры обязательны: Groq проверяет вызов по схеме, и необязательный "city": null у get_weather
     # давал 400 tool_use_failed («expected string, but got null»). Нет города — пустая строка.
-    _tool("get_weather", "Погода сейчас и прогноз на сегодня и завтра (Open-Meteo).",
+    _tool("get_weather", "Погода сейчас и прогноз на сегодня и завтра (Open-Meteo). " + WEB_ANSWER_RULE,
           {"city": {"type": "string",
                     "description": "Город, например Душанбе. Если пользователь город не назвал — пустая строка"}},
           ["city"]),
-    _tool("get_exchange_rate", "Курс валют.",
+    _tool("get_exchange_rate", "Курс валют. " + WEB_ANSWER_RULE,
           {"base": {"type": "string", "description": "Из какой валюты: USD, EUR, RUB, CNY, TJS"},
            "target": {"type": "string", "description": "В какую валюту: TJS, USD…"}}, ["base", "target"]),
+    _tool("read_page", "Прочитать страницу из последнего поиска по её номеру (1–5) и пересказать. " + WEB_ANSWER_RULE,
+          {"link_number": {"type": "integer", "minimum": 1, "maximum": 5,
+                           "description": "Номер ссылки из последнего результата web_search"}}, ["link_number"]),
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}

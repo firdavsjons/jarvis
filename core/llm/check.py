@@ -68,6 +68,20 @@ def check_tools(provider, out=sys.stdout):
     return called
 
 
+PAGE_CHECK_URL = "https://en.wikipedia.org/wiki/Dushanbe"
+
+
+def _read_page_check(url):
+    """Только загрузка и извлечение текста, без модели. Результат — число символов."""
+    from core import web
+    from core.ai import ActionError, Done
+    try:
+        title, domain, text, _ = web.read_page(url)
+    except web.WebError as e:
+        raise ActionError(str(e), e.short)
+    return Done(f"{len(text)} символов ({domain})")
+
+
 def check_web(out=sys.stdout):
     """По одному разу: погода, курс USD→TJS, поиск. Выводит ok/ошибку, время и первые 80 символов."""
     from core.ai import ActionError, get_exchange_rate, get_weather, web_search
@@ -75,7 +89,8 @@ def check_web(out=sys.stdout):
     checks = [("get_weather", lambda: get_weather()),
               ("get_exchange_rate", lambda: get_exchange_rate("USD", "TJS")),
               ("web_search", lambda: web_search("погода Душанбе")),
-              ("web_search (новости)", lambda: web_search("новости Душанбе"))]
+              ("web_search (новости)", lambda: web_search("новости Душанбе")),
+              ("read_page", lambda: _read_page_check(PAGE_CHECK_URL))]
     results = []
     for name, run in checks:
         started = time.monotonic()

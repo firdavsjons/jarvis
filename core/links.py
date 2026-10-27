@@ -15,11 +15,16 @@ _NOUN_RE = re.compile(r"^(ссылк|сайт|результат)")
 _ORDINALS = [("перв", 1), ("втор", 2), ("трет", 3), ("четв", 4), ("пят", 5)]
 
 
-def parse_link_command(text):
-    """«открой первую ссылку», «открой 2-ю ссылку», «открой ссылку номер 3», «зайди на первую» -> номер или None."""
-    words = re.findall(r"\w+", str(text).lower().replace("ё", "е"))
-    if not words or not _VERBS & set(words) or len(words) > 8:
-        return None
+_READ_VERBS = {"прочитай", "прочти", "прочитайте", "перескажи", "перескажите", "расскажи", "расскажите", "озвучь"}
+_SPOKEN_TLDS = {"ком": "com", "ру": "ru", "орг": "org", "нет": "net", "ио": "io", "тж": "tj"}
+_FILE_EXTENSIONS = {"txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "py", "js", "json", "csv", "md",
+                    "jpg", "jpeg", "png", "gif", "mp3", "mp4", "mov", "zip", "dmg", "app", "rtf", "heic"}
+_URL_RE = re.compile(r"https?://[^\s<>\"«»()]+", re.IGNORECASE)
+_DOMAIN_RE = re.compile(r"(?<![\w@.\-/])((?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,24}(?:/[^\s<>\"«»(),;!?]*)?)",
+                        re.IGNORECASE)
+
+
+def _number(words):
     number = None
     for i, word in enumerate(words):
         if word.isdigit() and 0 < int(word) < 100:
@@ -28,6 +33,47 @@ def parse_link_command(text):
             number = int(words[i + 1])
         else:
             number = next((n for stem, n in _ORDINALS if word.startswith(stem)), number)
+    return number
+
+
+def urls_in_phrase(text):
+    """Адреса, которые пользователь сам сказал: ссылки и латинские домены, голосом — «wikipedia точка org»,
+    «example точка ком». Только из этого текста — никогда из ответа модели."""
+    spoken = re.sub(r"\s+точка\s+", ".", str(text), flags=re.IGNORECASE)
+    spoken = re.sub(r"\.(" + "|".join(_SPOKEN_TLDS) + r")(?![\w])",
+                    lambda m: "." + _SPOKEN_TLDS[m.group(1).lower()], spoken, flags=re.IGNORECASE)
+    found = [u.rstrip(".,;:!?") for u in _URL_RE.findall(spoken)]
+    without_urls = _URL_RE.sub(" ", spoken)
+    for domain in _DOMAIN_RE.findall(without_urls):
+        domain = domain.rstrip(".,;:!?")
+        if domain.split("/")[0].rsplit(".", 1)[-1].lower() not in _FILE_EXTENSIONS:  # report.txt — файл, не сайт
+            found.append("https://" + domain)
+    return list(dict.fromkeys(found))
+
+
+def parse_read_command(text):
+    """«прочитай/перескажи первую ссылку», «что там на третьей ссылке», «прочитай сайт example.com»
+    -> ("number", N) | ("url", адрес из фразы) | None."""
+    low = str(text).lower().replace("ё", "е")
+    words = re.findall(r"\w+", low)
+    asks = bool(_READ_VERBS & set(words)) or (("что" in words) and bool({"на", "там"} & set(words)))
+    if not words or not asks or len(words) > 12:
+        return None
+    urls = urls_in_phrase(text)
+    if urls:
+        return ("url", urls[0])
+    number = _number(words)
+    if number is not None and any(_NOUN_RE.match(w) or w.startswith("страниц") for w in words):
+        return ("number", number)
+    return None
+
+
+def parse_link_command(text):
+    """«открой первую ссылку», «открой 2-ю ссылку», «открой ссылку номер 3», «зайди на первую» -> номер или None."""
+    words = re.findall(r"\w+", str(text).lower().replace("ё", "е"))
+    if not words or not _VERBS & set(words) or len(words) > 8:
+        return None
+    number = _number(words)
     if number is None:
         return None
     has_noun = any(_NOUN_RE.match(w) for w in words)

@@ -3,17 +3,21 @@
 Адреса — только из констант этого модуля. Текст модели (город, валюта, запрос) попадает в запрос
 лишь как экранированный параметр или проверенный трёхбуквенный код валюты.
 """
+import ipaddress
 import logging
 import re
+import socket
 import time
 import unicodedata
+import zlib
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from threading import Lock
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 
 from core.settings import env_value
@@ -358,3 +362,245 @@ def search(query, news=False):
                                in enumerate(items, 1)]) or _clip(items[0][1], MAX_SEARCH_CHARS)
     window = "\n".join(f"{i}. {title}\n   {url}" for i, (title, _, _, url) in enumerate(items, 1))
     return for_model, window, [url for *_, url in items if url]
+
+
+# --- Чтение страницы (read_page) ---
+
+PAGE_TIMEOUT = 8               # общий дедлайн на весь fetch_page: перенаправления, соединения, тело
+MAX_PAGE_BYTES = 1024 * 1024   # читаем не больше 1 МБ распакованных байт, остальное обрезаем (и «бомба» сжатия)
+MAX_REDIRECTS = 3
+READ_STEP_TIMEOUT = 1.5        # одно чтение из сокета ждёт не дольше (и не дольше остатка дедлайна)
+MAX_PAGE_TEXT = 2500           # модели: на бесплатном тарифе Groq мало токенов в минуту
+WINDOW_PAGE_TEXT = 1000
+ALLOWED_PORTS = {"http": 80, "https": 443}
+TEXT_TYPES = ("text/html", "text/plain")
+PAGE_FAILED = "страница недоступна"
+PAGE_NOT_TEXT = "не текст"
+_BLOCK_TAGS = ["p", "div", "br", "li", "ul", "ol", "tr", "td", "th", "table", "section", "h1", "h2", "h3", "h4",
+               "h5", "h6", "blockquote", "dd", "dt", "pre", "figcaption"]
+_REMOVED_TAGS = ["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "noscript",
+                 "template", "svg"]
+
+
+class BlockedAddress(httpcore.ConnectError):
+    """Адрес во внутренней сети или служебный — соединение запрещено."""
+
+
+def ip_allowed(ip):
+    """Только публичные адреса: не loopback, не частные, не link-local, не служебные."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if address.version == 6 and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return not (address.is_private or address.is_loopback or address.is_link_local or address.is_multicast
+                or address.is_reserved or address.is_unspecified or not address.is_global)
+
+
+def check_page_url(url):
+    """Схема http/https, порт 80/443, без user:pass@, не localhost, IP-адрес в ссылке — только публичный."""
+    try:
+        parsed = urlparse(str(url).strip())
+        port = parsed.port
+    except ValueError:
+        raise WebError(PAGE_FAILED, "неверный адрес")
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if parsed.scheme not in ALLOWED_PORTS or not host:
+        raise WebError(PAGE_FAILED, f"схема {parsed.scheme!r} запрещена")
+    if parsed.username is not None or parsed.password is not None:
+        raise WebError(PAGE_FAILED, "логин и пароль в адресе")
+    if port is not None and port != ALLOWED_PORTS[parsed.scheme]:
+        raise WebError(PAGE_FAILED, f"нестандартный порт {port}")
+    if host == "localhost" or host.endswith(".localhost"):
+        raise WebError(PAGE_FAILED, "localhost")
+    try:
+        ipaddress.ip_address(host)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if is_ip and not ip_allowed(host):
+        raise WebError(PAGE_FAILED, "внутренний адрес")
+    return parsed
+
+
+class SafeBackend(httpcore.SyncBackend):
+    """Соединение только с проверенным публичным IP: адрес резолвится здесь, проверяется каждый вариант,
+    и TCP открывается именно на проверенный IP (подмена DNS между проверкой и соединением не пройдёт).
+    TLS httpcore проверяет по исходному домену (SNI и сертификат), а не по IP."""
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise httpcore.ConnectTimeout("общий дедлайн")
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as e:
+            raise httpcore.ConnectError(f"DNS: {e}")
+        ips = [info[4][0] for info in infos]
+        if not ips or not all(ip_allowed(ip) for ip in ips):
+            raise BlockedAddress("адрес во внутренней сети")
+        timeout = remaining if timeout is None else min(timeout, remaining)
+        return super().connect_tcp(ips[0], port, timeout=timeout, local_address=local_address,
+                                   socket_options=socket_options)
+
+
+def _safe_transport(deadline):
+    transport = httpx.HTTPTransport(retries=0)
+    default_pool = transport._pool
+    transport._pool = httpcore.ConnectionPool(ssl_context=default_pool._ssl_context, max_connections=1,
+                                              http1=True, http2=False, network_backend=SafeBackend(deadline))
+    default_pool.close()
+    return transport
+
+
+def _remaining(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise WebError(PAGE_FAILED, f"больше {PAGE_TIMEOUT} с")
+    return left
+
+
+def _read_limited(response, deadline):
+    """Тело ≤1 МБ ПОСЛЕ распаковки. Сырые байты распаковываем сами с max_length: сжатый кусок в несколько КБ
+    не развернётся в памяти в гигабайты (iter_bytes распаковал бы его целиком до проверки)."""
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding in ("", "identity"):
+        decompressor = None
+    elif encoding in ("gzip", "x-gzip", "deflate"):
+        decompressor = zlib.decompressobj(wbits=47 if encoding != "deflate" else 15)  # 47: gzip или zlib
+    else:
+        raise WebError(PAGE_FAILED, f"сжатие {encoding}")  # мы просили identity; br/zstd не распаковываем
+    body = bytearray()
+    try:
+        for raw in response.iter_raw():
+            if time.monotonic() >= deadline:
+                break  # кусок пришёл после дедлайна — не берём
+            pending = raw
+            while pending and len(body) < MAX_PAGE_BYTES:
+                if decompressor is None:
+                    body += pending[:MAX_PAGE_BYTES - len(body)]
+                    break
+                try:
+                    body += decompressor.decompress(pending, MAX_PAGE_BYTES - len(body))
+                except zlib.error:
+                    raise WebError(PAGE_FAILED, "битое сжатие")
+                pending = decompressor.unconsumed_tail
+            if len(body) >= MAX_PAGE_BYTES:
+                break  # дальше не читаем: начала страницы хватает
+    except httpx.TimeoutException:
+        if not body:
+            raise
+    if time.monotonic() >= deadline:
+        if not body:
+            raise WebError(PAGE_FAILED, f"больше {PAGE_TIMEOUT} с")
+        log.info("Страница: дедлайн %s с, взято начало — %d байт", PAGE_TIMEOUT, len(body))
+    return bytes(body)
+
+
+def fetch_page(url, transport_factory=_safe_transport):
+    """-> (итоговый адрес, content-type, тело ≤1 МБ, кодировка из заголовка). Общий дедлайн 8 с, ≤3 перенаправлений,
+    тело читается не дальше 1 МБ распакованных байт (длинная страница обрезается), только text/html и text/plain,
+    без cookies, авторизации и прокси из окружения."""
+    deadline = time.monotonic() + PAGE_TIMEOUT
+    current = str(url).strip()
+    headers = {"User-Agent": page_user_agent(), "Accept": "text/html, text/plain;q=0.9",
+               "Accept-Encoding": "identity"}
+    for hop in range(MAX_REDIRECTS + 1):
+        check_page_url(current)
+        try:
+            left = _remaining(deadline)
+            # Таймаут чтения задаётся на весь запрос; короткий — чтобы одно зависшее чтение не съедало дедлайн
+            timeout = httpx.Timeout(left, read=min(READ_STEP_TIMEOUT, left))
+            with httpx.Client(transport=transport_factory(deadline), follow_redirects=False, trust_env=False,
+                              timeout=timeout) as client:
+                with client.stream("GET", current, headers=headers) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise WebError(PAGE_FAILED, "перенаправление без адреса")
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code != 200:
+                        raise WebError(PAGE_FAILED, f"HTTP {response.status_code}")
+                    content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+                    if content_type not in TEXT_TYPES:
+                        raise WebError(PAGE_NOT_TEXT, content_type or "без типа")
+                    body = _read_limited(response, deadline)
+                    if len(body) >= MAX_PAGE_BYTES:
+                        log.info("Страница %s обрезана до %d байт", _domain(current), MAX_PAGE_BYTES)
+                    return current, content_type, body, response.charset_encoding  # None — нет в заголовке
+        except WebError:
+            raise
+        except (httpx.HTTPError, httpcore.ConnectError, OSError) as e:
+            raise WebError(PAGE_FAILED, type(e).__name__)
+    raise WebError(PAGE_FAILED, f"больше {MAX_REDIRECTS} перенаправлений")
+
+
+def page_user_agent():
+    """Сайты вроде Wikipedia требуют контакт в User-Agent (robot policy). PAGE_CONTACT — из .env пользователя."""
+    contact = env_value("PAGE_CONTACT")
+    details = "personal macOS voice assistant, reads single pages on user request"
+    if contact and all(c.isprintable() and c not in "()\r\n" for c in contact) and len(contact) <= 100:
+        details += f"; {contact}"
+    return f"JarvisMac/1.0 ({details}) python-httpx/{httpx.__version__}"
+
+
+def _hidden(element):
+    style = (element.get("style") or "").replace(" ", "").lower()
+    return (element.get("hidden") is not None or (element.get("aria-hidden") or "").lower() == "true"
+            or "display:none" in style or "visibility:hidden" in style)
+
+
+_META_CHARSET_RE = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?([A-Za-z0-9_\-]+)""", re.IGNORECASE)
+
+
+def _page_encoding(body, header_encoding):
+    """Кодировка: из заголовка HTTP, иначе из <meta charset>, иначе UTF-8 (lxml сам по умолчанию берёт latin-1)."""
+    for candidate in (header_encoding, *(m.decode("ascii") for m in _META_CHARSET_RE.findall(body[:4096]))):
+        if candidate:
+            try:
+                "".encode(candidate)
+                return candidate
+            except LookupError:
+                continue
+    return "utf-8"
+
+
+def extract_text(body, content_type, encoding=None):
+    """-> (заголовок, текст ≤2500): без script/style/nav/header/footer/aside/form/iframe/noscript, комментариев
+    и скрытого текста; article, иначе main, иначе body."""
+    encoding = _page_encoding(body, encoding)
+    if content_type == "text/plain":
+        return "", _clip(body.decode(encoding, errors="replace"), MAX_PAGE_TEXT)
+    from lxml import etree, html
+    try:
+        doc = html.document_fromstring(body, parser=html.HTMLParser(encoding=encoding))
+    except (etree.ParserError, ValueError):
+        return "", ""
+    title = _clip(doc.findtext(".//title") or "", 150)
+    for comment in doc.xpath("//comment()"):
+        comment.getparent().remove(comment)
+    for element in doc.xpath("//" + " | //".join(_REMOVED_TAGS)):
+        element.drop_tree()
+    for element in [e for e in doc.iter() if isinstance(e.tag, str) and _hidden(e)]:
+        if element.getparent() is not None:
+            element.drop_tree()
+    root = next(iter(doc.xpath("//article") or doc.xpath("//main") or doc.xpath("//body")), doc)
+    for element in root.iter(*_BLOCK_TAGS):  # иначе «<h1>Душанбе</h1><p>Столица» склеится в «ДушанбеСтолица»
+        element.tail = " " + (element.tail or "")
+    return title, _clip(root.text_content(), MAX_PAGE_TEXT)
+
+
+def read_page(url, transport_factory=_safe_transport):
+    """-> (заголовок, домен, текст ≤2500 для модели, окно: заголовок, домен и ~1000 символов)."""
+    final_url, content_type, body, encoding = fetch_page(url, transport_factory)
+    title, text = extract_text(body, content_type, encoding)
+    if not text:
+        raise WebError(PAGE_NOT_TEXT, "пустая страница")
+    domain = _domain(final_url)
+    window = f"{title or domain} — {domain}\n{text[:WINDOW_PAGE_TEXT]}"
+    return title or domain, domain, text, window
