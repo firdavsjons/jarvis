@@ -37,6 +37,13 @@ class FakeMac:
     def __init__(self, clipboard_info=TEXT_INFO, clipboard="старый буфер", front=CLIENT, window="ok",
                  fail_on=None):
         self.events, self.pasteboard, self.lenient = [], clipboard, False
+        # диагностика (core.telegram_check)
+        self.layout = 'KeyboardLayout Name = "ABC";'
+        self.geometry = "100 50 1200 800"
+        self.menu_bar = "Apple, Telegram, Файл, Правка, Вид"
+        self.menu_items = "Отменить, missing value, Вставить, Вставить и согласовать стиль"
+        self.clip_as_ok = True
+        self.pbpaste_mangle = False
         self.clipboard_info, self.front, self.window, self.fail_on = clipboard_info, front, window, fail_on or {}
 
     def names(self):
@@ -50,15 +57,36 @@ class FakeMac:
         if cmd == "open":
             self.events.append(("open", args[-1]))
             return self.reply("open")
+        if cmd == "defaults":
+            self.events.append(("layout",))
+            return self.reply("layout", self.layout)
         if cmd == "pbpaste":
             self.events.append(("pbpaste",))
-            return self.reply("pbpaste", self.pasteboard)
+            return self.reply("pbpaste", "???" if self.pbpaste_mangle else self.pasteboard)
         if cmd == "pbcopy":
             self.events.append(("pbcopy", kwargs.get("input")))
             self.pasteboard = kwargs.get("input")
             return self.reply("pbcopy")
         script = " ".join(a for a in args if a != "-e")
-        for marker, name, out in (("count of windows of (first process", "probe_access", "1"),
+        if "set the clipboard to (item 1 of argv)" in script:      # AppleScript: положить в буфер и сравнить
+            text = args[-1]
+            self.events.append(("clip_as", text))
+            if "clip_as" in self.fail_on:
+                return completed("", 1, self.fail_on["clip_as"])
+            self.pasteboard = text if self.clip_as_ok else "???"
+            return completed(f"{'true' if self.clip_as_ok else 'false'}|{len(text) if self.clip_as_ok else 3}")
+        if "click at {" in script:
+            self.events.append(("click", args[-2], args[-1]))
+            return self.reply("click")
+        if "click menu item" in script:
+            self.events.append(("menu_click", args[-2], args[-1]))
+            return self.reply("menu_click")
+        for marker, name, out in (("name of every menu bar item", "menu_bar", self.menu_bar),
+                                  ("name of every menu item", "menu_items", self.menu_items),
+                                  ("position of w", "geometry", self.geometry),
+                                  ('keystroke " "', "space", ""), ("key code 51", "delete", ""),
+                                  ("key code 9 using command down", "paste_keycode", ""),
+                                  ("count of windows of (first process", "probe_access", "1"),
                                   ("clipboard info", "clipboard_info", self.clipboard_info),
                                   ("first process whose frontmost", "front", self.front),
                                   ("repeat tenths times", "wait", self.window),
