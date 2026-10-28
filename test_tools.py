@@ -202,6 +202,55 @@ class TestPromiseWithoutAction(RunMock):
         self.assertEqual(AIClient(llm=llm).respond("который час").speech, "Выполняю: сейчас вечер.")
         self.assertEqual(len(llm.requests), 2)
 
+    def test_false_success_without_call_is_caught(self):
+        # Команда в фразе + «Светлая тема включена» без единого вызова = ложный успех
+        llm = ScriptedLLM(final("Светлая тема включена."), final("Готово, тема включена."))
+        turn = AIClient(llm=llm).respond("включи светлую тему")
+        self.assertEqual(turn.speech, PROMISE_FAIL_REPLY)
+        self.assertEqual(len(llm.requests), 2)   # повтор ровно один
+        self.assertEqual(llm.requests[1]["messages"][-1], {"role": "user", "content": PROMISE_RETRY_NOTE})
+        self.assertIn("Не сообщай о результате без вызова", PROMISE_RETRY_NOTE)
+
+    def test_false_success_retry_with_tool_call(self):
+        llm = ScriptedLLM(final("Тема выключена."), tools_reply(call("display", {"action": "dark_mode_off", "value": ""})))
+        with patch("core.mac_actions.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = ""
+            turn = AIClient(llm=llm).respond("выключи тёмную тему")
+        self.assertEqual(turn.speech, "Тёмная тема выключена.")
+
+    def test_each_success_word_is_caught(self):
+        for answer in ["Тема включена", "Звук выключена", "Включил", "Выключил.", "Safari открыт", "Файл закрыт",
+                       "Скриншот сохранён", "Сохранил в документы", "Установлен", "Сделано", "Готово.",
+                       "Выполнено", "Перемещён в Корзину", "Отправлено"]:
+            with self.subTest(answer=answer):
+                llm = ScriptedLLM(final(answer))
+                turn = AIClient(llm=llm).respond("сделай что-нибудь с этим файлом")
+                self.assertEqual(turn.speech, PROMISE_FAIL_REPLY)
+
+    def test_ordinary_answers_not_touched(self):
+        cases = [("до скольки открыт музей", "Музей открыт до 18:00."),
+                 ("кто ты", "Я Jarvis, голосовой помощник."),
+                 ("работает ли магазин", "Магазин сейчас закрыт."),
+                 ("открой сафари", "Safari не открыт: приложение не найдено."),      # «не открыт» — честный отказ
+                 ("какой статус", "Статус: готово.")]    # «готово» без команды в фразе
+        for phrase, answer in cases:
+            with self.subTest(phrase=phrase):
+                llm = ScriptedLLM(final(answer))
+                self.assertEqual(AIClient(llm=llm).respond(phrase).speech, answer)
+                self.assertEqual(len(llm.requests), 1)
+
+    def test_success_claim_after_real_call_not_touched(self):
+        llm = ScriptedLLM(tools_reply(call("get_time")), final("Всё сделано: сейчас вечер."))
+        self.assertEqual(AIClient(llm=llm).respond("сделай запрос времени").speech, "Всё сделано: сейчас вечер.")
+        self.assertEqual(len(llm.requests), 2)
+
+    def test_json_mode_false_success(self):
+        llm = ScriptedLLM(LLMResponse(ok=True, mode="json", text='{"response": "Светлая тема включена.", "actions": []}'))
+        self.assertEqual(AIClient(llm=llm).respond("включи светлую тему").speech, PROMISE_FAIL_REPLY)
+        llm = ScriptedLLM(LLMResponse(ok=True, mode="json", text='{"response": "Музей открыт до 18:00.", "actions": []}'))
+        self.assertEqual(AIClient(llm=llm).respond("до скольки открыт музей").speech, "Музей открыт до 18:00.")
+
     def test_json_mode_promise_without_actions(self):
         llm = ScriptedLLM(LLMResponse(ok=True, mode="json", text='{"response": "Открываю Safari.", "actions": []}'))
         self.assertEqual(AIClient(llm=llm).respond("открой сафари").speech, PROMISE_FAIL_REPLY)

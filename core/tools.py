@@ -67,7 +67,8 @@ TOOLS = [
           {"what": {"type": "string", "enum": list(SYSTEM_INFO_VALUES), "description": "Что узнать"}}, ["what"]),
     _tool("display", "Экран: яркость, тёмная тема, блокировка, выключить экран, скриншот.",
           {"action": {"type": "string", "enum": list(DISPLAY_VALUES), "description": "Действие"},
-           "value": {"type": "string", "description": "Яркость 0–100 для brightness_set, иначе пустая строка"}},
+           "value": {"type": "string", "description": "brightness_set: 0–100; screenshot: desktop, documents или "
+                                                      "downloads, если назвал папку; иначе пустая строка"}},
           ["action", "value"]),
     _tool("media", "Музыка в Music или Spotify: пуск, пауза, треки, что играет, громкость плеера.",
           {"action": {"type": "string", "enum": list(MEDIA_VALUES), "description": "Действие"},

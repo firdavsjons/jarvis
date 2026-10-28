@@ -260,29 +260,116 @@ class TestDisplay(MacActionsCase):
             display("brightness_up", "")
         self.assertEqual(ctx.exception.short, "регулировка яркости недоступна")
 
+    def shoot(self, home, value, *, now=(2026, 10, 28, 9, 5, 7)):
+        """Скриншот в замоканном screencapture: создаёт файл по пути из аргументов."""
+        def fake(args, **kwargs):
+            Path(args[-1]).write_bytes(b"png")
+            return completed()
+        with patch("core.mac_actions.subprocess.run", side_effect=fake) as run, \
+                patch("core.mac_actions.datetime") as dt:
+            dt.now.return_value = __import__("datetime").datetime(*now)
+            return mac_actions._screenshot(value, home), run
+
+    def make_home(self, tmp):
+        for name in ("Desktop", "Documents", "Downloads", "Pictures"):
+            (Path(tmp) / name).mkdir()
+        return Path(tmp)
+
     def test_screenshot_name_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
-            desktop = Path(tmp)
+            home = self.make_home(tmp)
+            first, run = self.shoot(home, "")
+            second, _ = self.shoot(home, "")
+            self.assertEqual(first.speech, "Скриншот сохранён на рабочем столе.")
+            names = sorted(p.name for p in (home / "Desktop").iterdir())
+            self.assertEqual(names, ["Снимок экрана 2026-10-28 09.05.07 (2).png", "Снимок экрана 2026-10-28 09.05.07.png"])
+            self.assertEqual(run.call_args.args[0][:2], ["screencapture", "-x"])
+            self.assertIn("Снимок экрана", second.message)
+
+    def test_screenshot_folders(self):
+        expected = {"": ("Desktop", "на рабочем столе"), "desktop": ("Desktop", "на рабочем столе"),
+                    "documents": ("Documents", "в документах"), "downloads": ("Downloads", "в загрузках"),
+                    " Documents ": ("Documents", "в документах")}
+        for value, (folder, where) in expected.items():
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                home = self.make_home(tmp)
+                done, run = self.shoot(home, value)
+                self.assertEqual(done.speech, f"Скриншот сохранён {where}.")
+                saved = Path(run.call_args.args[0][-1])
+                self.assertEqual(saved.parent, home / folder)
+                self.assertIn(str(home / folder), done.message)   # в окне и журнале — полный путь
+
+    def test_screenshot_other_folders_refused(self):
+        hint = "Могу сохранить на рабочий стол, в документы или в загрузки"
+        for value in ("pictures", "~/Pictures", "/tmp", "../etc", "documents/..", "Library", None, 5):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                home = self.make_home(tmp)
+                mock = self.run_with("")
+                with self.assertRaises(ActionError) as ctx:
+                    mac_actions._screenshot(value, home)
+                self.assertEqual(ctx.exception.short, hint)
+                self.assertEqual(ctx.exception.reply, hint + ".")
+                mock.assert_not_called()
+
+    def test_screenshot_through_display_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self.make_home(tmp)
 
             def fake(args, **kwargs):
                 Path(args[-1]).write_bytes(b"png")
                 return completed()
-            with patch("core.mac_actions.subprocess.run", side_effect=fake) as run:
-                with patch("core.mac_actions.datetime") as dt:
-                    dt.now.return_value = __import__("datetime").datetime(2026, 10, 28, 9, 5, 7)
-                    first = mac_actions._screenshot("", desktop)
-                    second = mac_actions._screenshot("", desktop)
-            self.assertEqual(first.speech, "Скриншот сохранён на рабочем столе.")
-            names = sorted(p.name for p in desktop.iterdir())
-            self.assertEqual(names, ["Снимок экрана 2026-10-28 09.05.07 (2).png", "Снимок экрана 2026-10-28 09.05.07.png"])
-            self.assertEqual(run.call_args.args[0][:2], ["screencapture", "-x"])
-            self.assertIn("Снимок экрана", second.message)
+            with patch("core.mac_actions.subprocess.run", side_effect=fake), \
+                    patch("core.mac_actions.Path.home", return_value=home):
+                self.assertEqual(display("screenshot", "downloads").speech, "Скриншот сохранён в загрузках.")
+                self.assertEqual(len(list((home / "Downloads").iterdir())), 1)
+
+    def test_screenshot_retries_once_after_display_error(self):
+        err = completed("", 1, "screencapture: could not create image from display 0x1")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self.make_home(tmp)
+            calls = []
+
+            def fake(args, **kwargs):
+                calls.append(args)
+                if len(calls) == 1:
+                    return err
+                Path(args[-1]).write_bytes(b"png")
+                return completed()
+            with patch("core.mac_actions.subprocess.run", side_effect=fake), \
+                    patch("core.mac_actions.time.sleep") as sleep:
+                done = mac_actions._screenshot("", home)
+            self.assertEqual(len(calls), 2)
+            sleep.assert_called_once_with(1.0)
+            self.assertEqual(done.speech, "Скриншот сохранён на рабочем столе.")
+
+    def test_screenshot_permission_after_second_failure(self):
+        err = completed("", 1, "screencapture: could not create image from display 0x1")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self.make_home(tmp)
+            mock = self.run_with(err)
+            with patch("core.mac_actions.time.sleep") as sleep, self.assertRaises(ActionError) as ctx:
+                mac_actions._screenshot("", home)
+            self.assertEqual(mock.call_count, 2)    # ровно один повтор
+            sleep.assert_called_once_with(1.0)
+            self.assertEqual(str(ctx.exception), "Нужно разрешение: Системные настройки → Конфиденциальность и "
+                                                 "безопасность → Запись экрана для приложения, из которого запущен Jarvis.")
+            self.assertIn("Запись экрана", ctx.exception.reply)
+            self.assertNotIn("→", ctx.exception.reply)
+
+    def test_screenshot_other_errors_not_retried(self):
+        mock = self.run_with(completed("", 1, "что-то другое"))
+        with tempfile.TemporaryDirectory() as tmp, patch("core.mac_actions.time.sleep") as sleep, \
+                self.assertRaises(ActionError) as ctx:
+            mac_actions._screenshot("", self.make_home(tmp))
+        self.assertEqual(mock.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(str(ctx.exception), "что-то другое")
 
     def test_screenshot_without_file_is_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.run_with("")
             with self.assertRaises(ActionError) as ctx:
-                mac_actions._screenshot("", Path(tmp))
+                mac_actions._screenshot("", self.make_home(tmp))
             self.assertIn("Запись экрана", ctx.exception.short)
 
     def test_unknown_action(self):

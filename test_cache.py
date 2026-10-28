@@ -132,8 +132,8 @@ class TestCacheable(unittest.TestCase):
         return {"action": {"name": name, "args": args or {}}, "ok": True}
 
     def test_only_successful_safe_whitelist(self):
-        self.assertEqual(cacheable_actions([self.ok("open_app", {"app": "Telegram"})]), OPEN_TELEGRAM)
-        self.assertIsNotNone(cacheable_actions([self.ok("open_url", {"url": "https://youtube.com"})]))
+        self.assertEqual(cacheable_actions([self.ok("open_app", {"app": "Telegram"})], "открой telegram"), OPEN_TELEGRAM)
+        self.assertIsNotNone(cacheable_actions([self.ok("open_url", {"url": "https://youtube.com"})], "открой youtube"))
         not_cacheable = [
             [self.ok("get_time")],
             [self.ok("trash_file", {"path": "~/Desktop/a.txt"})],
@@ -147,8 +147,69 @@ class TestCacheable(unittest.TestCase):
             [],
         ]
         for results in not_cacheable:
-            self.assertIsNone(cacheable_actions(results), results)
+            self.assertIsNone(cacheable_actions(results, "открой telegram и safari"), results)
         print("✅ Что кэшируется: OK")
+
+    def test_app_must_be_named_in_phrase(self):
+        """Модель выбрала приложение, которого во фразе нет («главный экран» -> Preview) — не кэшируем."""
+        preview = [self.ok("open_app", {"app": "Notes"})]
+        self.assertIsNone(cacheable_actions(preview, "главный экран"))
+        self.assertIsNone(cacheable_actions(preview, "открой главный экран"))
+        self.assertIsNone(cacheable_actions([self.ok("quit_app", {"app": "Safari"})], "закрой всё лишнее"))
+        # Название, русское название (с падежом), слово из названия, фраза с «пожалуйста»
+        named = [("Telegram", "Открой Telegram"), ("Telegram", "открой телеграм"), ("Calculator", "запусти калькулятор"),
+                 ("Calculator", "закрой калькулятора"), ("Google Chrome", "открой chrome"),
+                 ("Google Chrome", "открой google chrome"), ("Google Chrome", "открой хром"),
+                 ("Safari", "открой, пожалуйста, safari!"), ("Safari", "сафари")]
+        for app, phrase in named:
+            with self.subTest(app=app, phrase=phrase):
+                self.assertIsNotNone(cacheable_actions([self.ok("open_app", {"app": app})], phrase))
+
+    def test_ambiguous_app_word_not_enough(self):
+        # «code» есть и в Visual Studio Code, и у других — одного слова мало; «microsoft» — Word и Excel
+        self.assertIsNone(cacheable_actions([self.ok("open_app", {"app": "Microsoft Word"})], "открой microsoft"))
+        self.assertIsNotNone(cacheable_actions([self.ok("open_app", {"app": "Microsoft Word"})], "открой word"))
+
+    def test_user_alias_in_phrase(self):
+        installed_apps.set_user_aliases({"мой браузер": "Google Chrome"})
+        self.addCleanup(installed_apps.set_user_aliases, {})
+        results = [self.ok("open_app", {"app": "Google Chrome"})]
+        self.assertIsNotNone(cacheable_actions(results, "открой мой браузер"))
+        self.assertIsNone(cacheable_actions(results, "открой интернет"))
+
+    def test_several_apps_each_must_be_named(self):
+        results = [self.ok("open_app", {"app": "Safari"}), self.ok("open_app", {"app": "Telegram"})]
+        self.assertIsNotNone(cacheable_actions(results, "открой сафари и телеграм"))
+        self.assertIsNone(cacheable_actions(results, "открой сафари и главный экран"))
+
+    def test_volume_template(self):
+        vol = [self.ok("set_volume", {"level": 50})]
+        for phrase in ["громкость 50", "поставь громкость на 50", "сделай звук на 50 процентов",
+                       "поставь, пожалуйста, громкость 50"]:
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(cacheable_actions(vol, phrase))
+        for phrase in ["сделай поприятнее", "громкость 60", "громкость 50 и открой safari", "включи музыку",
+                       "громкость на половину"]:
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(cacheable_actions(vol, phrase))
+        # громкость вместе с другим действием — без шаблона на всю фразу не кэшируем
+        both = [self.ok("open_app", {"app": "Safari"}), self.ok("set_volume", {"level": 50})]
+        self.assertIsNone(cacheable_actions(both, "открой safari и громкость 50"))
+
+    def test_url_template(self):
+        yt = [self.ok("open_url", {"url": "https://www.youtube.com/watch?v=x"})]
+        for phrase in ["открой youtube", "открой ютуб", "зайди на youtube.com", "перейди на сайт youtube"]:
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(cacheable_actions(yt, phrase))
+        for phrase in ["покажи что-нибудь весёлое", "открой музыку", "найди котиков на youtube"]:
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(cacheable_actions(yt, phrase))
+
+    def test_other_tools_never_cached(self):
+        for result in [self.ok("display", {"action": "dark_mode_on", "value": ""}),
+                       self.ok("media", {"action": "pause", "app": "Music"}),
+                       self.ok("system_info", {"what": "battery"})]:
+            self.assertIsNone(cacheable_actions([result], "включи тёмную тему"))
 
 
 @patch('core.ai.subprocess.run')
@@ -183,6 +244,20 @@ class TestCacheInAIClient(unittest.TestCase):
         client, _ = self.client(tools_reply(call("get_time")), final("Сейчас вечер."))
         client.respond("который час")
         self.assertEqual(len(client.cache), 0)
+
+    def test_wrong_app_choice_not_stored(self, mock_run):
+        mock_run.return_value.returncode = 0
+        client, llm = self.client(tools_reply(call("open_app", {"app": "Notes"})))
+        self.assertEqual(client.respond("главный экран").speech, "Открыто приложение Notes.")
+        self.assertEqual(len(client.cache), 0)
+        client.respond("главный экран")
+        self.assertEqual(llm.requests, 2)   # во второй раз снова спрашиваем модель, а не повторяем ошибку
+
+    def test_existing_cache_is_not_touched(self, mock_run):
+        client, _ = self.client(final("Привет."))
+        client.cache.store("главный экран", [{"name": "open_app", "args": {"app": "Preview"}}])
+        client.respond("как дела у тебя")
+        self.assertEqual(len(client.cache), 1)   # старые записи сам не чищу: только «забудь кэш команд»
 
     def test_failed_hit_removes_entry(self, mock_run):
         client, llm = self.client()

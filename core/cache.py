@@ -8,7 +8,10 @@ import re
 import time
 from threading import Lock
 
-from core import safety
+from urllib.parse import urlparse
+
+from core import installed_apps, safety
+from core.apps import ALIAS_PREFIX_MIN, APP_ALIASES
 from core.storage import DATA_DIR, atomic_write_json, read_json
 
 CACHE_FILE = DATA_DIR / "command_cache.json"
@@ -34,8 +37,75 @@ def is_forget_cache_command(text):
     return bool({"забудь", "очисти", "сотри"} & words and {"кэш", "кеш"} & words)
 
 
-def cacheable_actions(results):
-    """Действия из результатов, если их можно кэшировать; иначе None."""
+# Шаблоны фраз. Кэш повторяет действие по фразе без модели, поэтому действие обязано следовать из самой фразы:
+# модель могла ошибиться («главный экран» -> Preview), и ошибка закрепилась бы навсегда.
+OPEN_WORDS = {"открой", "открыть", "запусти", "запустить", "включи", "зайди", "перейди", "на", "в", "сайт",
+              "страницу", "страница"}
+VOLUME_WORDS = {"поставь", "установи", "сделай", "выставь", "громкость", "звук", "на", "до", "в", "процент",
+                "процента", "процентов"}
+TLD_WORDS = {"com", "ru", "org", "net", "tj", "io", "точка", "ком", "ру", "орг"}
+SITE_NAMES = {"ютуб": "youtube", "гугл": "google", "яндекс": "yandex", "википедия": "wikipedia", "гитхаб": "github",
+              "вк": "vk"}
+
+
+def app_in_phrase(app, phrase_words, normalized):
+    """Приложение действительно названо во фразе: его слово (если оно однозначное), русское название
+    из словаря (с падежом), псевдоним пользователя. Нечёткого сравнения нет."""
+    resolved = installed_apps.resolve_app_name(app)
+    if not resolved:
+        return False
+    installed = installed_apps.list_installed_apps()
+    for word in installed_apps.words_of(resolved):
+        # «chrome» в «Google Chrome» годится, «code» (Visual Studio Code и Claude Code) — нет
+        if len(word) >= 3 and word in phrase_words \
+                and sum(1 for a in installed if word in installed_apps.words_of(a)) == 1:
+            return True
+    for key, value in APP_ALIASES.items():
+        if value.casefold() == resolved.casefold() and any(
+                w == key or (len(key) >= ALIAS_PREFIX_MIN and w.startswith(key)) for w in phrase_words):
+            return True
+    padded = f" {normalized} "
+    return any(f" {k} " in padded and (installed_apps.resolve_app_name(v, use_user_aliases=False) or "").casefold()
+               == resolved.casefold() for k, v in installed_apps.user_aliases().items())
+
+
+def volume_template(level, phrase_words):
+    """«громкость 50», «поставь громкость на 50 процентов»: ровно одно число, равное уровню."""
+    numbers = [w for w in phrase_words if w.isdigit()]
+    rest = [w for w in phrase_words if not w.isdigit()]
+    return (numbers == [str(level)] and {"громкость", "звук"} & set(rest) and set(rest) <= VOLUME_WORDS)
+
+
+def url_template(url, phrase_words):
+    """«открой youtube», «открой ютуб»: после слов открытия остаётся одно название сайта из самой ссылки."""
+    host = (urlparse(url).hostname or "").lower()
+    labels = [p for p in host.split(".") if p and p != "www"]
+    if len(labels) < 2:
+        return False
+    label = labels[-2]
+    rest = [w for w in phrase_words if w not in OPEN_WORDS and w not in TLD_WORDS]
+    return len(rest) == 1 and (rest[0] == label or SITE_NAMES.get(rest[0]) == label)
+
+
+def action_follows_phrase(action, phrase, single):
+    """Следует ли действие из фразы. Нет известного шаблона — не кэшируем."""
+    words = re.findall(r"\w+", normalize_phrase(phrase))
+    normalized = " ".join(words)
+    args = action.get("args") or {}
+    name = action.get("name")
+    if name in ("open_app", "quit_app"):
+        return isinstance(args.get("app"), str) and app_in_phrase(args["app"], set(words), normalized)
+    if not single:
+        return False  # громкость и ссылки — только когда вся фраза про них одних
+    if name == "set_volume":
+        return bool(volume_template(args.get("level"), words))
+    if name == "open_url":
+        return isinstance(args.get("url"), str) and url_template(args["url"], words)
+    return False
+
+
+def cacheable_actions(results, phrase):
+    """Действия из результатов, если их можно кэшировать для этой фразы; иначе None."""
     if not results or len(results) > MAX_ACTIONS:
         return None
     actions = []
@@ -44,6 +114,8 @@ def cacheable_actions(results):
         if not r.get("ok") or not isinstance(action, dict) or action.get("name") not in CACHEABLE_ACTIONS:
             return None
         if safety.classify(action)[0] != safety.SAFE:  # open_url — только доверенные сайты
+            return None
+        if not action_follows_phrase(action, phrase, single=len(results) == 1):
             return None
         actions.append({"name": action["name"], "args": dict(action.get("args") or {})})
     return actions

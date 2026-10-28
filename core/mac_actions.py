@@ -377,23 +377,54 @@ def _sleep_display(value):
     return _done("Экран выключен")
 
 
-def screenshot_path(desktop, now=None):
-    """~/Desktop/Снимок экрана ГГГГ-ММ-ДД ЧЧ.ММ.СС.png; существующий файл не перезаписывается (суффикс 2, 3…)."""
+# Куда можно сохранять скриншот: значение value -> (папка в домашней, как сказать вслух). Путь только из этой таблицы
+SCREENSHOT_FOLDERS = {
+    "": ("Desktop", "на рабочем столе"), "desktop": ("Desktop", "на рабочем столе"),
+    "documents": ("Documents", "в документах"), "downloads": ("Downloads", "в загрузках"),
+}
+SCREENSHOT_FOLDER_HINT = "Могу сохранить на рабочий стол, в документы или в загрузки"
+SCREEN_RECORDING = "Запись экрана"
+SCREENSHOT_RETRY_DELAY = 1.0   # screencapture сразу после разблокировки иногда отвечает «could not create image»
+_NO_IMAGE = "could not create image from display"
+
+
+def screenshot_path(folder, now=None):
+    """<папка>/Снимок экрана ГГГГ-ММ-ДД ЧЧ.ММ.СС.png; существующий файл не перезаписывается (суффикс 2, 3…)."""
     now = now or datetime.now()
     base = f"Снимок экрана {now:%Y-%m-%d %H.%M.%S}"
-    path, n = Path(desktop) / f"{base}.png", 1
+    path, n = Path(folder) / f"{base}.png", 1
     while path.exists():
         n += 1
-        path = Path(desktop) / f"{base} ({n}).png"
+        path = Path(folder) / f"{base} ({n}).png"
     return path
 
 
-def _screenshot(value, desktop=None):
-    path = screenshot_path(desktop or Path.home() / "Desktop")
-    run_capture(["screencapture", "-x", str(path)])
+def _capture(path):
+    """screencapture; «could not create image from display» — повтор через секунду, потом причина про права."""
+    for attempt in (1, 2):
+        try:
+            run_capture(["screencapture", "-x", str(path)])
+            return
+        except ActionError as e:
+            if _NO_IMAGE not in str(e).lower():
+                raise
+            if attempt == 1:
+                time.sleep(SCREENSHOT_RETRY_DELAY)
+    voice = PERMISSION_VOICE.format(name=SCREEN_RECORDING)
+    raise ActionError(PERMISSION_WINDOW.format(name=SCREEN_RECORDING), voice, voice)
+
+
+def _screenshot(value, home=None):
+    key = value.strip().casefold() if isinstance(value, str) else None
+    if key not in SCREENSHOT_FOLDERS:
+        raise ActionError(f"screenshot: папка {value!r} не поддерживается", SCREENSHOT_FOLDER_HINT,
+                          SCREENSHOT_FOLDER_HINT + ".")
+    folder, where = SCREENSHOT_FOLDERS[key]
+    path = screenshot_path(Path(home or Path.home()) / folder)
+    _capture(path)
     if not path.exists() or path.stat().st_size == 0:
         raise ActionError(f"screencapture не создал {path}", "снимок не получился, проверьте разрешение «Запись экрана»")
-    return _done("Скриншот сохранён на рабочем столе", f"Скриншот сохранён: {path}")
+    return _done(f"Скриншот сохранён {where}", f"Скриншот сохранён: {path}")
 
 
 DISPLAY = {

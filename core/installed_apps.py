@@ -5,7 +5,7 @@ import re
 import time
 from threading import Lock
 
-from core.apps import resolve_app
+from core.apps import APP_ALIASES, resolve_app
 
 APP_DIRS = [
     "/Applications",
@@ -47,6 +47,27 @@ def set_user_aliases(aliases):
     global _user_aliases
     with _lock:
         _user_aliases = {alias_key(k): v for k, v in dict(aliases).items() if alias_key(k)}
+
+
+def words_of(name):
+    """Слова названия в нижнем регистре: «Google Chrome» -> {google, chrome}."""
+    return _words(name)
+
+
+def user_aliases():
+    """Копия псевдонимов пользователя: «мой браузер» -> имя приложения."""
+    with _lock:
+        return dict(_user_aliases)
+
+
+def known_app_words():
+    """Слова, которыми можно назвать приложение: установленные, их слова, русские названия, псевдонимы."""
+    with _lock:
+        aliases = list(_user_aliases)
+    words = set()
+    for name in [*list_installed_apps(), *APP_ALIASES, *aliases]:
+        words |= _words(name)
+    return words
 
 
 def _words(text):

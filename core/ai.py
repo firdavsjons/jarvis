@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from core import installed_apps, journal, prompts, safety, web
 from core.cache import cacheable_actions
 from core.errors import ActionError, Done
+from core.fragments import FRAGMENT_REPLY, is_fragment
 from core.history import ConversationHistory
 from core.links import NO_LINK_REPLY, SearchLinks, urls_in_phrase
 from core.mac_actions import TOOL_FUNCS
@@ -29,10 +30,20 @@ MAX_TOOL_ROUNDS = 3     # кругов «модель вызвала инстр�
 BLOCKED_REPLY = "Это слишком опасно, я этого не сделаю."
 TOO_MANY_ROUNDS_REPLY = "Не получилось завершить запрос."
 AI_ERROR_REPLY = "Произошла ошибка при обращении к нейросети."
-PROMISE_RETRY_NOTE = "Вызови инструмент или скажи, что не можешь. Не обещай действия без вызова."
+PROMISE_RETRY_NOTE = "Вызови инструмент или скажи, что не можешь. Не сообщай о результате без вызова."
 PROMISE_FAIL_REPLY = "Не получилось: действие не было выполнено."
 # Модель обещает действие («Открываю Safari»), но не вызвала ни одного инструмента
 _PROMISE_RE = re.compile(r"(?<!\w)(открываю|закрываю|запускаю|устанавливаю|выполняю|перемещаю)(?!\w)", re.IGNORECASE)
+# Ложный успех: «Светлая тема включена» без единого вызова. Считается только если пользователь дал команду
+# (_COMMAND_RE): на вопрос «до скольки открыт музей» «Музей открыт до 18:00» — обычный ответ. «не открыт» — честный отказ.
+_CLAIM_RE = re.compile(
+    r"(?<!не )(?<!\w)(включ[её]н[аоы]?|выключ[её]н[аоы]?|включил[аио]?|выключил[аио]?|открыт[аоы]?|закрыт[аоы]?|"
+    r"сохран[её]н[аоы]?|сохранил[аио]?|установлен[аоы]?|установил[аио]?|сделан[аоы]|сделал[аио]?|готово|"
+    r"выполнен[аоы]?|перемещ[её]н[аоы]?|переместил[аио]?|отправлен[аоы]?|отправил[аио]?)(?!\w)", re.IGNORECASE)
+_COMMAND_RE = re.compile(
+    r"(?<!\w)(откр(ой|ыть)|закр(ой|ыть)|включи|включить|выключи|выключить|сохрани|сохранить|установи|установить|"
+    r"поставь|поставить|сделай|сделать|перемести|переместить|отправь|отправить|запусти|запустить|найди|найти|"
+    r"убери|убрать|удали|удалить)(те)?(?!\w)", re.IGNORECASE)
 MEMORY_ACTIONS = {"remember", "remember_alias", "list_memory", "forget_memory", "clear_memory"}
 REMEMBER_ACTIONS = {"remember", "remember_alias"}
 NOT_ASKED_SHORT = "запоминаю только по вашей просьбе со словом «запомни»"
@@ -60,6 +71,12 @@ SLOW_TOOL_AFTER = 2.0  # веб-инструмент дольше — «Секу
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
+
+
+def claims_unperformed_action(phrase, answer):
+    """Ответ без вызова инструмента обещает действие («Открываю…») или заявляет результат («Тема включена»)."""
+    answer = answer or ""
+    return bool(_PROMISE_RE.search(answer) or (_COMMAND_RE.search(phrase or "") and _CLAIM_RE.search(answer)))
 
 
 def _run(args):
@@ -327,6 +344,10 @@ class AIClient:
         """Фраза пользователя -> Turn. Сначала кэш команд; иначе модель (инструменты или режим JSON)."""
         self._slow_said.clear()  # «Секунду, ищу.» — не больше одного раза за фразу
         turn = self._from_cache(text)
+        if turn is None and is_fragment(text):
+            # Обрывок речи: запрос к модели не тратим; в историю не пишем
+            log.info("Обрывок речи, модель не спрашиваем: %r", text)
+            return Turn(FRAGMENT_REPLY)
         if turn is None:
             turn = self._respond_model(text)
             self._maybe_cache(text, turn)
@@ -356,7 +377,7 @@ class AIClient:
     def _maybe_cache(self, text, turn):
         if self.cache is None or turn.pending or turn.blocked:
             return
-        actions = cacheable_actions(turn.results)
+        actions = cacheable_actions(turn.results, text)
         if actions and self.cache.store(text, actions):
             log.info("Кэш команд: запомнил «%s» -> %s", text, actions)
 
@@ -385,7 +406,7 @@ class AIClient:
             if response.mode == "json":
                 return self._finish(text, self._json_turn(text, response.text))
             if not response.tool_calls:
-                if not executed and _PROMISE_RE.search(response.text or ""):
+                if not executed and claims_unperformed_action(text, response.text):
                     if not retried:
                         # Обещание без вызова инструмента — переспросить один раз
                         log.warning("LLM: обещание без вызова инструмента — повторяю запрос: %s", response.text)
@@ -489,8 +510,8 @@ class AIClient:
                 self.reject_actions(restricted, text, WEB_RESTRICTED_SHORT)
                 return self._web_refusal_turn(self.run_actions([a for a in safe if a not in restricted], phrase=text))
         if not safe:
-            if not confirm and not actions and _PROMISE_RE.search(response_text):
-                return Turn(PROMISE_FAIL_REPLY)  # «Открываю Safari» без единого действия
+            if not confirm and not actions and claims_unperformed_action(text, response_text):
+                return Turn(PROMISE_FAIL_REPLY)  # «Открываю Safari» / «Тема включена» без единого действия
             return Turn("" if confirm else response_text, pending=confirm)
 
         results = self.run_actions(safe, phrase=text)
