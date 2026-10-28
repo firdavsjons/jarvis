@@ -27,6 +27,7 @@ TOPICS = {
     "files": "файлы и Корзина",
     "memory": "память ассистента о пользователе",
     "apps": "приложения и Быстрые команды",
+    "messaging": "сообщения: Telegram",
 }
 
 _SKIP_MODULES = {"common", "registry"}
@@ -49,6 +50,10 @@ class AppTool:
     creates: frozenset = frozenset()       # действия, создающие запись с этим текстом (таймер, напоминание, заметка)
     preview: Optional[Callable] = None     # preview(**args) -> «удалить событие …»: читающий поиск цели до вопроса
     quick: Optional[Callable] = None       # quick(phrase) -> {"args": {...}} | None — быстрое правило без модели
+    prepare: Optional[Callable] = None     # prepare(phrase=..., **args) -> (для голоса, полностью) | строка: подготовка ДО
+    #   вопроса (проверки, черновик в приложении); видимое действие здесь допустимо, но отправлять нельзя
+    discard: Optional[Callable] = None     # discard(**args) -> str | None: «нет» или таймаут; фраза для пользователя
+    private: tuple = ()                    # параметры с личным текстом: в журнал и лог — только длина, фраза скрыта
     level_fn: Optional[Callable] = None    # level_fn(args) -> (уровень, причина) | None: уровень зависит от аргументов
     cache_check: Optional[Callable] = None  # cache_check(args, phrase) -> bool: можно ли кэшировать для этой фразы
 

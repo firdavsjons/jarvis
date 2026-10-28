@@ -87,13 +87,14 @@ def _redirect_app_paths():
     """Файлы приложения — во временную папку: код, пишущий «по умолчанию», не доберётся до папки пользователя."""
     data = TEMP_ROOT / "Application Support" / "Jarvis"
     logs = TEMP_ROOT / "Logs" / "Jarvis"
-    from core import cache, logger, memory, scheduler, storage
+    from core import cache, contacts, logger, memory, scheduler, storage
     from core.apps import shortcuts
     storage.DATA_DIR = data
     cache.CACHE_FILE = data / "command_cache.json"
     memory.MEMORY_FILE = data / "memory.json"
     scheduler.TIMERS_FILE = data / "timers.json"
     shortcuts.SHORTCUTS_FILE = data / "shortcuts_allowed.json"
+    contacts.CONTACTS_FILE = data / "contacts.json"
     logger.LOG_DIR = logs
     logger.LOG_FILE = logs / "jarvis.log"
 

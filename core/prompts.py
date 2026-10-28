@@ -73,6 +73,7 @@ JSON_FORMAT = (
     '- notes {"action": "create|append|list_titles|read_last", "title": "", "text": ""}\n'
     '- shortcuts {"action": "list|run", "name": "", "input": ""}; settings {"pane": "wifi|bluetooth|sound|display|battery|'
     'notifications|focus|keyboard|privacy|accessibility|storage|general|network"}\n'
+    '- telegram {"action": "open_chat|send", "to": "имя из фразы", "text": "слово в слово или пусто"} — send всегда спросит\n'
     '- system_info {"what": "battery|storage|memory|cpu|uptime|wifi|ip|macos|running_apps|frontmost_app"}\n'
     '- display {"action": "brightness_up|brightness_down|brightness_set|dark_mode_on|dark_mode_off|'
     'dark_mode_toggle|lock_screen|sleep_display|screenshot", "value": "яркость 0-100 или пусто"}\n'

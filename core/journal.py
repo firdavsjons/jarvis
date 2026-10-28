@@ -52,10 +52,52 @@ def redact(value):
     return value
 
 
+# Слова фразы, по которым она считается личным сообщением: в лог и журнал — только длина
+_MESSAGE_STEMS = ("телеграм", "telegram", "сообщен", "напиш", "отправ")
+
+
+def loggable_phrase(phrase):
+    """Фраза для лога: про сообщение — «(сообщение, N символов)», остальные как есть."""
+    text = str(phrase or "")
+    words = re.findall(r"\w+", text.lower())
+    if any(w.startswith(_MESSAGE_STEMS) for w in words):
+        return f"(сообщение, {len(text)} символов)"
+    return text
+
+
+def scrub(phrase, action):
+    """(фраза, действие) без личного текста: у инструментов с private-параметрами (текст сообщения) вместо
+    значения остаётся длина, а фраза, содержащая этот текст, скрывается."""
+    if not isinstance(action, dict):
+        return phrase, action
+    from core.apps import registry   # позже импорта: журнал нужен планировщику, реестру — планировщик
+    tool = registry.get(action.get("name"))
+    if tool is None or not tool.private or not isinstance(action.get("args"), dict):
+        return phrase, action
+    args = dict(action["args"])
+    hidden = 0
+    for name in tool.private:
+        value = args.pop(name, None)
+        if isinstance(value, str) and value:
+            args[f"{name}_length"] = len(value)
+            hidden = len(value)
+    if hidden:
+        phrase = f"(сообщение, {hidden} символов)"
+    # вопрос подтверждения («отправить … сообщение: «текст»») тоже содержит текст
+    cleaned = {k: v for k, v in action.items() if k not in ("preview", "preview_full")}
+    return phrase, {**cleaned, "args": args}
+
+
+def loggable_action(action):
+    return scrub("", action)[1]
+
+
 def record(phrase, action, level, confirmed, ok, result):
-    """confirmed: True/False — ответ пользователя, None — подтверждение не требовалось."""
+    """confirmed: True/False — ответ пользователя, None — подтверждение не требовалось.
+    Текст сообщений в журнал не попадает (scrub): время, получатель, длина, подтверждено ли."""
     if JOURNAL_FILE is None:
         return
+    phrase, action = scrub(phrase, action)
     entry = {
         "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "phrase": redact(phrase or ""),

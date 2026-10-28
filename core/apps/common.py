@@ -80,6 +80,19 @@ def osascript(app, lines, *argv, timeout=TIMEOUT):
     return (result.stdout or "").strip()
 
 
+def run_cmd(args, timeout=TIMEOUT, stdin=None, env=None):
+    """Обычная команда списком аргументов (open, pbcopy, pbpaste): stdout или ActionError. Текст — через stdin."""
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=stdin, env=env)
+    except subprocess.TimeoutExpired:
+        raise ActionError(f"{args[0]}: таймаут {timeout} с", "команда не ответила вовремя")
+    except OSError as e:
+        raise ActionError(str(e), "команда не запустилась")
+    if result.returncode != 0:
+        raise ActionError(f"{args[0]}: {(result.stderr or '').strip() or result.returncode}")
+    return result.stdout or ""
+
+
 # --- Проверка строк ---
 
 def clean_text(value, field, limit=MAX_TITLE, required=True, multiline=False):

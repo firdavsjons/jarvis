@@ -12,7 +12,7 @@ from core.history import FORGET_REPLY, is_forget_command
 from core.links import parse_link_command, parse_read_command
 from core.memory import MEMORY_FILE, UserMemory, is_clear_memory_command
 from core import scheduler as timers
-from core.journal import setup_journal
+from core.journal import loggable_action, loggable_phrase, setup_journal
 from core.llm import build_default_client
 from core.logger import LOG_DIR, setup_logging
 from core.speech_text import confirmation_question
@@ -183,10 +183,12 @@ class VoiceApp:
             phrase = self.pending_phrase
             self.pending_actions, self.pending_phrase = [], ""
             self.pending_timer = None
-        log.info("⌛ Подтверждение не получено за %s с, отменено: %s", CONFIRM_TIMEOUT, actions)
-        self.ai.reject_actions(actions, phrase, f"нет ответа за {CONFIRM_TIMEOUT} с", confirmed=False)
-        self.ai.remember("(нет ответа)", "Время вышло, отменено.")
-        self.engine.speak("Время вышло, отменено.")
+        log.info("⌛ Подтверждение не получено за %s с, отменено: %s", CONFIRM_TIMEOUT,
+                 [loggable_action(a) for a in actions])
+        notes = self.ai.reject_actions(actions, phrase, f"нет ответа за {CONFIRM_TIMEOUT} с", confirmed=False)
+        reply = " ".join(notes) if isinstance(notes, list) and notes else "Время вышло, отменено."
+        self.ai.remember("(нет ответа)", reply)
+        self.engine.speak(reply)
         self.set_idle_status()
 
     def handle_confirmation(self, text):
@@ -208,9 +210,10 @@ class VoiceApp:
             self.ai.remember(text, reply, results)
             self.engine.speak(reply)
         else:
-            self.ai.reject_actions(actions, phrase, "отменено пользователем", confirmed=False)
-            self.ai.remember(text, "Отменено.")
-            self.engine.speak("Отменено.")
+            notes = self.ai.reject_actions(actions, phrase, "отменено пользователем", confirmed=False)
+            reply = " ".join(notes) if isinstance(notes, list) and notes else "Отменено."   # «черновик остался в чате…»
+            self.ai.remember(text, reply)
+            self.engine.speak(reply)
         self.set_idle_status()
 
     def report_result(self, results):
@@ -223,7 +226,7 @@ class VoiceApp:
 
     def process_command(self, text, source="voice"):
         """Единая точка входа для обработки команд (голос или текст)."""
-        log.info("Обработка (%s): %s", source, text)
+        log.info("Обработка (%s): %s", source, loggable_phrase(text))
 
         # 0. Если ждём подтверждения — это ответ на вопрос
         if self.has_pending():
@@ -264,6 +267,14 @@ class VoiceApp:
         link_number = parse_link_command(text)
         if link_number is not None:
             self.deliver(self.ai.open_search_link(link_number, text), text)
+            return
+
+        # Быстрое правило с обязательным вопросом («напиши маме в телеграм …»): разбор кодом, дальше проверки, черновик
+        # и вопрос подтверждения — как у ответа модели
+        quick_turn = self.ai.quick_confirm(text)
+        if quick_turn is not None:
+            self.update_status("Готовлю сообщение...", "blue")
+            self.deliver(quick_turn, text)
             return
 
         # 2. Проверяем жесткие системные команды (громкость и т.д.)

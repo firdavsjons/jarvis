@@ -293,8 +293,8 @@ def describe_action(action):
         return f"запомнить: {args.get('text')}"
     if name == "remember_alias":
         return f"запомнить: {args.get('spoken')} — это {args.get('app')}"
-    if action.get("preview"):
-        return str(action["preview"])
+    if action.get("preview_full") or action.get("preview"):
+        return str(action.get("preview_full") or action["preview"])   # в окне — текст полностью, голосом — начало
     return str(name)
 
 
@@ -411,7 +411,7 @@ class AIClient:
         if any(safety.classify(a)[0] != safety.SAFE for a in actions):
             self.cache.remove(text)  # уровень изменился (например, сайт убрали из доверенных) — спросим модель
             return None
-        log.info("Кэш команд: «%s» -> %s", text, actions)
+        log.info("Кэш команд: «%s» -> %s", journal.loggable_phrase(text), actions)
         results = self.run_actions(actions, phrase=text)
         ok, summary = summarize_results(results)
         if ok:
@@ -427,7 +427,7 @@ class AIClient:
             return
         actions = cacheable_actions(turn.results, text)
         if actions and self.cache.store(text, actions):
-            log.info("Кэш команд: запомнил «%s» -> %s", text, actions)
+            log.info("Кэш команд: запомнил «%s» -> %s", journal.loggable_phrase(text), actions)
 
     def _respond_model(self, text):
         """Инструменты: SAFE — выполнить и вернуть модели результат (до 3 кругов), CONFIRM — вопрос
@@ -571,29 +571,53 @@ class AIClient:
         return " ".join(([template_speech(done)] if done else []) + replies)
 
     def _preview_confirmations(self, confirm, phrase):
-        """Перед вопросом «Удалить …?» читающий поиск цели (preview): в вопросе называется найденное; не найдено
-        или несколько — вопроса нет, честный отказ."""
-        kept, failed = [], []
+        """Перед вопросом «Удалить …?» / «Отправить …?» подготовка (prepare: проверки и, например, черновик
+        сообщения на экране) или читающий поиск цели (preview): в вопросе называется найденное; не найдено,
+        запрещено или несколько — вопроса нет, честный отказ. Возвращает (действия с вопросом, неудачи)."""
+        kept, failed, prepared = [], [], set()
         for action in confirm:
             tool = registry.get(action.get("name"))
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            if tool is None or tool.preview is None:
+            hook = None if tool is None else (tool.prepare or tool.preview)
+            if hook is None:
                 kept.append(action)
                 continue
             try:
-                kept.append({**action, "preview": tool.preview(**args)})
+                if tool.prepare is not None and tool.name in prepared:
+                    raise ActionError("второе такое действие в одном ответе", "за раз можно только одно такое действие")
+                question = hook(phrase=phrase, **args)
+                if tool.prepare is not None:
+                    prepared.add(tool.name)
+                voice, full = question if isinstance(question, tuple) else (question, question)
+                kept.append({**action, "preview": voice, "preview_full": full})
             except TypeError:
                 short, reply = "неверные параметры", None
             except ActionError as e:
                 short, reply = e.short, e.reply
             else:
                 continue
-            log.info("⛔ Не выполнено: %s — %s", action, short)
+            log.info("⛔ Не выполнено: %s — %s", journal.loggable_action(action), short)
             journal.record(phrase, action, safety.CONFIRM, None, False, short)
             failed.append({"action": action, "level": safety.CONFIRM, "ok": False, "message": f"⛔ {short}",
                            "short": short, "speech": None, "result": None, "reply": reply, "web": False,
                            "page": None})
         return kept, failed
+
+    def quick_confirm(self, phrase):
+        """Быстрое правило, которому нужен вопрос подтверждения («напиши маме в телеграм привет»): разбор кодом,
+        без модели, но через тот же путь с проверками, черновиком и вопросом. None — это не такое правило."""
+        found = registry.quick_actions(phrase)
+        if found is None:
+            return None
+        action = {"name": found[0], "args": found[1]}
+        if safety.classify(action)[0] != safety.CONFIRM:
+            return None
+        safe, confirm, blocked = self.split_actions([action], phrase=phrase)
+        if not confirm:
+            return None
+        confirm, failed = self._preview_confirmations(confirm, phrase)
+        _, summary = summarize_results(failed)
+        return self._finish(phrase, Turn(summary, pending=confirm, results=failed))
 
     @staticmethod
     def _template_ok(calls, results):
@@ -808,12 +832,25 @@ class AIClient:
         return not any(contains_secret(v) for v in args.values() if isinstance(v, str))
 
     def reject_actions(self, actions, phrase, reason, confirmed=None):
-        """Записывает в журнал действия, которые не будут выполнены (опасный ответ, «нет», таймаут)."""
+        """Записывает в журнал действия, которые не будут выполнены (опасный ответ, «нет», таймаут).
+        Возвращает фразы хуков discard (например, «черновик остался в чате») — их озвучивает вызывающий."""
+        notes = []
         for action in actions:
             level, level_reason = safety.classify(action)
             result = f"{reason}: {level_reason}" if level == safety.BLOCKED else reason
-            log.info("⛔ Не выполнено: %s — %s", action, result)
+            tool = registry.get(action.get("name")) if isinstance(action, dict) else None
+            if confirmed is False and tool is not None and tool.discard is not None:
+                args = action.get("args") if isinstance(action.get("args"), dict) else {}
+                try:
+                    note = tool.discard(phrase=phrase, **args)
+                except (TypeError, ActionError):
+                    note = None
+                if note:
+                    notes.append(note)
+                    result = f"{result}; {note.rstrip('.')}"
+            log.info("⛔ Не выполнено: %s — %s", journal.loggable_action(action), result)
             journal.record(phrase, action, level, confirmed, False, result)
+        return notes
 
     def run_actions(self, actions, phrase="", confirmed=False):
         """Выполняет действия из белого списка. Уровень проверяется заново прямо перед запуском:
@@ -850,7 +887,7 @@ class AIClient:
                     # Новостной запрос узнаём и по РЕАЛЬНОЙ фразе пользователя: модель могла переформулировать
                     func = partial(func, news_hint=web.is_news_request(phrase))
                 args = action.get("args") or {}
-                log.info("▶ Действие: %s %s", action["name"], args)
+                log.info("▶ Действие: %s %s", action["name"], journal.loggable_action(action).get("args", args))
                 slow = threading.Timer(SLOW_TOOL_AFTER, self._say_slow) if action["name"] in WEB_ACTIONS else None
                 try:
                     if not isinstance(args, dict):

@@ -133,6 +133,8 @@ class MacControl:
                 args["app"] = app
             action = {"name": name, "args": args}
             level, reason = safety.classify(action)
+            if level == safety.CONFIRM:
+                return None   # правило с обязательным вопросом ведёт AIClient.quick_confirm (main.py), не мы
             if level != safety.SAFE:
                 _journal(command, action, False, f"не выполнено: {reason}", level=level)
                 return None

@@ -93,6 +93,7 @@ class TestRespond(unittest.TestCase):
         app = MagicMock()
         app.has_pending.return_value = False
         app.mac.execute.return_value = "Пауза."
+        app.ai.quick_confirm.return_value = None
         main.VoiceApp.process_command(app, "пауза")
         app.engine.speak.assert_called_once_with("Пауза.")
         app.ai.respond.assert_not_called()

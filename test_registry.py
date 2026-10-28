@@ -25,7 +25,7 @@ from fixtures_run import completed, isolated_apps, scripted_run
 from test_tool_schemas import schema_problems
 from test_tools import ScriptedLLM, final
 
-EXPECTED = {"timer", "alarm", "reminders", "calendar", "notes", "shortcuts", "settings"}
+EXPECTED = {"timer", "alarm", "reminders", "calendar", "notes", "shortcuts", "settings", "telegram"}
 
 NEW_APP = textwrap.dedent('''
     from core.apps import common
@@ -196,7 +196,7 @@ class WriteGuard:
 SAMPLE_ARGS = {
     "action": None, "what": "battery", "pane": "wifi",
     "name": "Jarvis Alarm", "input": "07:30", "seconds": 60, "label": "x", "when": "", "title": "x", "text": "x",
-    "list_name": "", "start": "", "minutes": 30, "value": "", "app": "Music", "area": "web",
+    "list_name": "", "start": "", "minutes": 30, "value": "", "app": "Music", "area": "web", "to": "мама",
 }
 ATTACK_STRINGS = ["shortcuts_allowed.json", "../shortcuts_allowed.json", "trusted_domains.txt",
                   "~/Library/Application Support/Jarvis/shortcuts_allowed.json", "/etc/passwd", "x; rm -rf ~"]
@@ -212,9 +212,10 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
         installed.start()
         self.addCleanup(installed.stop)
         self.trusted = Path(safety.TRUSTED_DOMAINS_FILE)
-        self.before = {p: p.read_bytes() for p in (self.allowed, self.trusted)}
-        mtimes = {p: p.stat().st_mtime_ns for p in (self.allowed, self.trusted)}
-        self.mtimes = mtimes
+        self.contacts = self.contacts_file     # исходные контакты теста (isolated_apps)
+        protected = (self.allowed, self.trusted, self.contacts)
+        self.before = {p: p.read_bytes() for p in protected}
+        self.mtimes = {p: p.stat().st_mtime_ns for p in protected}
 
     def run_everything(self, guard):
         for patcher in guard.patches():
@@ -242,14 +243,17 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
                     args[param] = action
                     if attack:
                         args.update({"name": attack, "input": attack, "title": attack, "text": attack,
-                                     "label": attack, "list_name": attack, "value": attack})
-                    func = tool.run if tool else ACTIONS[name]
-                    kwargs = {k: v for k, v in args.items() if k in self._params(func)}
-                    try:
-                        func(**kwargs)
-                    except (ActionError, TypeError, ValueError, OSError):
-                        pass
-                    calls += 1
+                                     "label": attack, "list_name": attack, "value": attack, "to": attack})
+                    funcs = [tool.run if tool else ACTIONS[name]]
+                    if tool is not None:      # хуки подготовки черновика и отмены тоже не должны ничего писать
+                        funcs += [h for h in (tool.prepare, tool.preview, tool.discard) if h is not None]
+                    for func in funcs:
+                        kwargs = {k: v for k, v in args.items() if k in self._params(func)}
+                        try:
+                            func(**kwargs)
+                        except (ActionError, TypeError, ValueError, OSError):
+                            pass
+                        calls += 1
         return calls
 
     @staticmethod
@@ -258,7 +262,7 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
         return set(inspect.signature(func).parameters)
 
     def test_no_tool_or_action_writes_to_permission_files(self):
-        guard = WriteGuard(self.allowed, self.trusted)
+        guard = WriteGuard(self.allowed, self.trusted, self.contacts)
         calls = self.run_everything(guard)
         self.assertGreater(calls, 150)       # перебор действительно прошёл по всем инструментам и действиям
         self.assertEqual(guard.hits, [])
@@ -268,17 +272,21 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
 
     def test_model_flow_cannot_write_either(self):
         """Через AIClient: ответ модели с вызовом shortcuts / любым действием не пишет в эти файлы."""
-        guard = WriteGuard(self.allowed, self.trusted)
+        guard = WriteGuard(self.allowed, self.trusted, self.contacts)
         for patcher in guard.patches():
             patcher.start()
             self.addCleanup(patcher.stop)
         patch("core.apps.shortcuts.subprocess.run", scripted_run(completed("Jarvis Alarm\n"))).start()
+        patch("core.apps.common.subprocess.run", scripted_run(completed(""))).start()
         self.addCleanup(patch.stopall)
         from test_tools import call, tools_reply
         for payload in ATTACK_STRINGS:
             client = AIClient(llm=ScriptedLLM(tools_reply(call("shortcuts", {"action": "run", "name": payload,
                                                                              "input": payload})), final("ок")))
             client.respond("запусти команду")
+            client = AIClient(llm=ScriptedLLM(tools_reply(call("telegram", {"action": "send", "to": payload,
+                                                                            "text": payload})), final("ок")))
+            client.respond(f"напиши {payload} в телеграм {payload}")
         self.assertEqual(guard.hits, [])
 
     def test_guard_itself_detects_writes(self):
@@ -293,6 +301,16 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
         os.close(os.open(self.allowed, os.O_WRONLY))
         self.assertGreaterEqual(len(guard.hits), 3)
 
+    def test_guard_detects_contacts_writes_too(self):
+        guard = WriteGuard(self.contacts)
+        for patcher in guard.patches():
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with open(self.contacts, "a", encoding="utf-8"):
+            pass
+        self.contacts.write_text(self.contacts.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertGreaterEqual(len(guard.hits), 2)
+
     def test_source_references_to_the_files(self):
         """Статически: имя файла разрешений встречается только там, где его читают (и создают по умолчанию)."""
         root = Path(__file__).parent
@@ -303,6 +321,17 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
                 if token in text:
                     writers.setdefault(token, set()).add(str(py.relative_to(root)))
         self.assertEqual(writers["shortcuts_allowed"], {"core/apps/shortcuts.py"})
+        # contacts.json: создаётся (пример) и читается только в core/contacts.py; остальные файлы лишь называют его
+        # в тексте подсказки и никуда не пишут
+        contacts_text = (root / "core/contacts.py").read_text(encoding="utf-8")
+        self.assertEqual(contacts_text.count("atomic_write_json("), 1)
+        for py in list(root.glob("core/**/*.py")) + list(root.glob("modules/*.py")) + [root / "main.py"]:
+            if py.name == "contacts.py":
+                continue
+            text = py.read_text(encoding="utf-8")
+            if "contacts.json" in text:
+                for forbidden in ("write_text", "write_bytes", "atomic_write", "os.replace"):
+                    self.assertNotIn(forbidden, text, py.name)
         self.assertEqual(writers["trusted_domains"], {"core/safety.py"})
         # В core/safety.py файл доверенных сайтов только читается
         safety_text = (root / "core/safety.py").read_text(encoding="utf-8")
