@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import mac_actions, prompts, safety
 from core.ai import ACTIONS, AIClient
 from core.errors import ActionError

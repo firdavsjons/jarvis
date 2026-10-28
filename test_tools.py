@@ -15,6 +15,7 @@ import openai
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import prompts, safety
 from core.ai import (BLOCKED_REPLY, PROMISE_FAIL_REPLY, PROMISE_RETRY_NOTE, TOO_MANY_ROUNDS_REPLY, AIClient,
                      get_time)

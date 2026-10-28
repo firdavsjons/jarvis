@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import installed_apps
 from core.ai import AIClient
 from core.safety import SAFE, classify

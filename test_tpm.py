@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core.llm import FallbackClient, LLMClient, LLMResponse
 from core.llm.providers import DEFAULTS, build_providers, load_config
 from core.llm.router import TPM_REPLY, TPM_WAIT

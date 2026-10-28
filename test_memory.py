@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import installed_apps, safety
 from core.ai import NOT_ASKED_SHORT, AIClient, summarize_results
 from core.history import is_forget_command

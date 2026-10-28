@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import journal, scheduler
 from core.ai import AIClient
 from core.cache import CommandCache, cacheable_actions

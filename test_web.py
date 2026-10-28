@@ -13,6 +13,7 @@ import httpx
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import installed_apps, prompts, safety, web
 from core.ai import (WEB_REFUSAL_REPLY, WEB_RESTRICTED_SHORT, ActionError, AIClient, get_exchange_rate, get_weather,
                      web_search)

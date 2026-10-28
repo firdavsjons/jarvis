@@ -12,6 +12,7 @@ import openai
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core.llm import NO_CONNECTION_REPLY, RATE_LIMIT_REPLY, FallbackClient, LLMClient, LLMResponse
 from core.llm.base import server_message
 from core.llm.router import BAD_REQUEST_PAUSE, COOLDOWN_SECONDS

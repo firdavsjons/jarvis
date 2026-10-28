@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core.ai import AIClient
 from core.engine import SpeechEngine, pick_voice, say_command
 from main import normalize_ai_response, parse_confirmation

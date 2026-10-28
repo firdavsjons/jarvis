@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import journal, scheduler
 from core.errors import ActionError
 from core.scheduler import MAX_ACTIVE, Scheduler, fire_text, make_fire_handler, make_missed_handler, missed_phrase

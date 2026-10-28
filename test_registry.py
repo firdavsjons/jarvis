@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core import safety
 from core.ai import ACTIONS, AIClient
 from core.apps import registry, shortcuts
