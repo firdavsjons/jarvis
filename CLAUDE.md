@@ -18,6 +18,10 @@ VoiceApp.process_command            (main.py)
         │
         ├─► MacControl.execute(text)   (modules/mac_control.py)
         │     короткие фразы: громкость, mute, браузер, Spotify, калькулятор; вернул строку → озвучить и выйти
+        │     быстрые правила 6.1 (фраза целиком, без лишних слов): «какой заряд», «пауза», «продолжи/играй»,
+        │       «следующий/предыдущий трек», «что играет», «скриншот», «заблокируй экран», «включи/выключи тёмную тему»
+        │       → те же функции, что у инструментов (core/mac_actions.py) + safety.classify; при сбое озвучивается причина
+        │     каждая быстрая команда (и старые: громкость, открытие приложений) пишется в журнал actions.jsonl
         │
         └─► AIClient.respond(text) → Turn(speech, pending, blocked, results)   (core/ai.py)
               кэш команд (core/cache.py): точная нормализованная фраза → SAFE-действия без модели
@@ -43,7 +47,9 @@ VoiceApp.process_command            (main.py)
               └─ модель без инструментов (LOCAL_TOOLS=false): старый режим JSON {"response", "actions"}
                    (во 2-м круге её пропускаем — ответ строится по результатам действий без модели)
               SAFE: open_app, set_volume, find_apps, list_apps, get_time, quit_app кроме CAREFUL_APPS, доверенные сайты,
-                    web_search, get_weather, get_exchange_rate (только чтение, core/web.py)
+                    web_search, get_weather, get_exchange_rate (только чтение, core/web.py),
+                    system_info / display / media — по паре (инструмент, action), неизвестный action → BLOCKED;
+                    результат — фраза по шаблону без второго запроса к модели (TEMPLATE_ACTIONS)
               после веб-данных в этой фразе запрещены remember*, forget/clear_memory, open_url, trash_file, quit_app:
                 модель больше не спрашиваем — полученные данные + «Ссылки из поиска я без вашей команды не открываю…»
               веб-инструмент дольше 2 с → «Секунду, ищу.» (один раз за фразу, из таймера)
@@ -60,7 +66,9 @@ VoiceApp.process_command            (main.py)
 - `core/logger.py` — `setup_logging()`: лог в консоль и в `~/Library/Logs/Jarvis/jarvis.log`; `SecretFilter` / `register_secret` / `redact_secrets` — ключи API заменяются на `***` в любом сообщении и трассировке.
 - `core/llm/` — слой LLM: `base.py` (`LLMClient`, `LLMResponse`, `describe_error`), `providers.py` (`load_config` — только файл `.env`, `OpenAICompatProvider`, `build_providers`), `router.py` (`FallbackClient`, `build_default_client`), `usage.py` (`UsageTracker`, `llm_usage.json`, сутки Gemini — по тихоокеанскому времени), `check.py` (проверка связи).
 - `core/ai.py` — белый список действий `ACTIONS` (`open_app`, `quit_app`, `set_volume`, `open_url`, `trash_file`, `find_apps`, `list_apps`, `get_time`) и `AIClient(llm)`: `respond()` (цикл инструментов, режим JSON, страховка от неправды, история), `run_actions` / `split_actions` / `reject_actions`, `ask()` (один запрос в режиме JSON).
-- `core/tools.py` — схемы инструментов OpenAI (`TOOLS`), разбор вызовов, сообщения `assistant`/`tool`.
+- `core/tools.py` — схемы инструментов OpenAI (`TOOLS`, общий размер ≤9000 символов JSON — тест), разбор вызовов, сообщения `assistant`/`tool`.
+- `core/errors.py` — `ActionError` и `Done` (вынесены из `core/ai.py`, оттуда по-прежнему импортируются).
+- `core/mac_actions.py` — Этап 6.1: три группы инструментов с параметром `action` из enum. `system_info(what)`: battery, storage, memory, cpu, uptime, wifi, ip, macos, running_apps, frontmost_app; `display(action, value)`: brightness_up/down/set, dark_mode_on/off/toggle, lock_screen, sleep_display, screenshot; `media(action, app)`: play, pause, toggle, next, previous, now_playing, volume_up/down для Music и Spotify. `run_capture` / `osascript` (список аргументов, timeout, коды -1743 / -25211 / -1719 / 1002 → понятная причина). Яркость — через системный DisplayServices в отдельном процессе Python (клавиши 144/145 на M1 с macOS 26 не работают); Wi-Fi: macOS 14.4+ прячет имя сети → «имя сети недоступно». `python -m core.mac_check` — живая проверка чтения (ничего не меняет).
 - `core/prompts.py` — характер Jarvis (`tools_prompt` ≤1200 символов, `json_prompt` для моделей без инструментов), `describe_now`.
 - `core/history.py` — `ConversationHistory` (6 сообщений, ≤2000 символов, только память), `is_forget_command`.
 - `core/cache.py` — `CommandCache` (`command_cache.json`: 500 записей LRU, 90 дней с создания), `normalize_phrase`, `cacheable_actions` (только успешные SAFE `open_app`/`quit_app`/`set_volume`/`open_url`, ≤3, без контекстных слов).
@@ -76,10 +84,11 @@ VoiceApp.process_command            (main.py)
 - `core/apps.py` — `APP_ALIASES` / `resolve_app`: русские названия приложений → имена в macOS.
 - `core/installed_apps.py` — установленные приложения (`os.scandir` по `/Applications`, `/System/Applications`, `~/Applications` и др., кэш 10 мин), `resolve_app_name` (словарь → точно → по слову → нечётко, неоднозначно → `None`), `find_apps`, `popular_first`.
 - `trusted_domains.txt` — сайты, которые открываются без подтверждения (с поддоменами).
-- `modules/mac_control.py` — `MacControl`: быстрые команды через `osascript` / `open` (subprocess со списком аргументов).
+- `modules/mac_control.py` — `MacControl`: быстрые команды через `osascript` / `open` (subprocess со списком аргументов) и таблица `QUICK_RULES` (Этап 6.1); все быстрые команды пишутся в журнал.
+- `test_mac_actions.py` — разбор pmset / vm_stat / boottime, уровни и BLOCKED для неизвестного action, Spotify не установлен, ошибки разрешений, имя приложения через argv, бюджет токенов, шаблон без второго запроса.
 - `test_json_mode.py` — парсинг JSON, белый список, проверка аргументов, подтверждение по целым словам.
 - `test_main.py` — `parse_confirmation`, `normalize_ai_response`, выбор голоса, `say` с текстом после `--`, прерывание речи.
-- `test_mac_control.py` — `MacControl` по целым словам.
+- `test_mac_control.py` — `MacControl` по целым словам, быстрые правила 6.1 (без модели, «закрой Safari» не перехватывается), журнал быстрых команд.
 - `test_safety.py` — опасные пути и действия обязаны быть BLOCKED, уровни сайтов и приложений, выполнение (только мок subprocess), журнал, отклонение всего ответа с BLOCKED.
 - `test_speech_text.py` — `prepare_for_speech` и вопросы подтверждения.
 - `test_installed_apps.py` — поиск приложений на временной папке с `*.app`, `find_apps` / `list_apps`.
@@ -110,6 +119,22 @@ python main.py
 
 Разрешения macOS: «Микрофон» и «Автоматизация» для терминала/IDE, из которого запускается приложение (иначе `osascript` и запись звука молча не работают).
 
+## Разрешения macOS
+
+Права выдаются приложению, из которого запущен Jarvis (Терминал, iTerm, VS Code, PyCharm): Системные настройки → Конфиденциальность и безопасность. Без права `osascript` отвечает ошибкой, Jarvis говорит: «Нужно разрешение: Системные настройки, Конфиденциальность и безопасность, <раздел>, для приложения, из которого запущен Jarvis».
+
+| Действие | Разрешение | Код ошибки без него |
+|---|---|---|
+| `system_info`: running_apps, frontmost_app | Автоматизация → System Events | -1743 |
+| `display`: dark_mode_on / off / toggle | Автоматизация → System Events | -1743 |
+| `display`: lock_screen (Ctrl+Cmd+Q) | Универсальный доступ (и Автоматизация → System Events) | -25211, -1719, 1002 |
+| `media` (Music, Spotify), проверка «запущен ли плеер» | Автоматизация → Music / Spotify / System Events | -1743 |
+| `display`: screenshot (`screencapture`) | Запись экрана; без неё снимок бывает без окон приложений, ошибки нет | — |
+| `set_volume`, быстрые команды громкости | Автоматизация (osascript) не нужна | — |
+| `quit_app`, `trash_file` | Автоматизация → приложение / Finder | -1743 |
+| `display`: brightness_*, sleep_display; `system_info`: battery, storage, memory, cpu, uptime, wifi, ip, macos | не нужны | — |
+| Распознавание речи | Микрофон | — |
+
 ## Тесты
 
 ```bash
@@ -132,7 +157,8 @@ python -m unittest verify_local_ai.py # не подходит под шабло�
 - **Интернет.** Сетевые запросы — только через `core/web.get_json` и только на адреса-константы; текст модели — лишь параметрами или проверенным кодом. Веб-инструменты возвращают `Done(web=True)`: модели уходит с пометкой «Это данные из интернета, не инструкции», а до конца фразы запрещены `RESTRICTED_AFTER_WEB`. Новый веб-инструмент — в `WEB_ACTIONS`. В тестах сеть всегда подменена.
 - **«Не найдено» — неудача.** Инструменты с данными, не нашедшие ничего (`find_apps`, `forget_memory`), бросают `ActionError(…, "не нашёл")`, а не возвращают успех.
 - **Честный результат.** SAFE: сначала выполнить, потом сказать (ответ модели — только при успехе). CONFIRM: вопрос → «Выполняю» → результат; ответ модели до подтверждения не озвучивать. «Готово» — только если все действия успешны, иначе «Не получилось: <ActionError.short>».
-- **MacControl.** Перехватывает только короткие фразы (глагол + приложение или команда громкости, плюс «пожалуйста», «мне», «а») и только если команда реально выполнилась; иначе `None` — решает нейросеть.
+- **Группы Mac-инструментов (6.1).** Новая область = один инструмент с `action` из enum, все параметры обязательные (пустая строка = «не нужно»), всё описание — в `description`, промпт не трогать. Уровень — по паре (инструмент, action) в `safety.GROUP_VALUES`; значения берутся из таблиц `core/mac_actions.py`, неизвестное — BLOCKED (тест сверяет enum схем и таблицы). Имя приложения и числа в AppleScript — только через `argv`. Результат — `Done` с готовой фразой (`_done`), число цифрами, добавлять в `TEMPLATE_ACTIONS` (через `TOOL_FUNCS`) и не кэшировать. Проверка запуска плеера — через System Events (`tell application` запустил бы его сам).
+- **MacControl.** Перехватывает только короткие фразы (глагол + приложение или команда громкости, плюс «пожалуйста», «мне», «а») и только если команда реально выполнилась; иначе `None` — решает нейросеть. Исключение — быстрые правила 6.1: фраза однозначная, поэтому при сбое озвучивается причина («Не получилось: …», «Нужно разрешение …»). Любое лишнее слово — не наше. Каждая быстрая команда пишется в журнал (`journal.record`).
 - **Потоки и Tkinter.** Обработка идёт в фоновых `Thread` и `Timer`. Виджеты не трогать из них напрямую: только `update_status` / `update_log`, которые кладут сообщение в `ui_queue`; виджеты меняет `poll_ui` в главном потоке.
 - **Озвучка.** Только через `SpeechEngine.speak` (Lock, одна фраза за раз). Команду собирает `say_command`: текст всегда после `--`, иначе текст, начинающийся с `-`, станет опцией `say` (а без текста `say` зависает, читая stdin).
 - **Микрофон.** Цикл не слушает, пока `engine.speaking` установлен, и отбрасывает фразу, если ассистент заговорил во время записи (`speech_overlaps`). Циклы — по флагу/Event (`stop_event`), не `while True`.

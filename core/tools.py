@@ -1,6 +1,8 @@
 """Действия белого списка как function-tools в формате OpenAI и разбор вызовов модели."""
 import json
 
+from core.mac_actions import DISPLAY_VALUES, MEDIA_APPS, MEDIA_VALUES, SYSTEM_INFO_VALUES
+
 
 def _tool(name, description, properties=None, required=()):
     return {
@@ -58,6 +60,19 @@ TOOLS = [
     _tool("read_page", "Прочитать страницу из последнего поиска по её номеру (1–5) и пересказать. " + WEB_ANSWER_RULE,
           {"link_number": {"type": "integer", "minimum": 1, "maximum": 5,
                            "description": "Номер ссылки из последнего результата web_search"}}, ["link_number"]),
+    # Группы по областям: один инструмент с enum вместо десятков схем (лимит токенов Groq). Все параметры
+    # обязательны; «не нужно» — пустая строка. Описания короткие: бюджет схем проверяет test_mac_actions.py
+    _tool("system_info", "Сведения о Mac: заряд, диск, память, процессор, время работы, Wi-Fi, IP, версия macOS, "
+          "открытые приложения, активное приложение.",
+          {"what": {"type": "string", "enum": list(SYSTEM_INFO_VALUES), "description": "Что узнать"}}, ["what"]),
+    _tool("display", "Экран: яркость, тёмная тема, блокировка, выключить экран, скриншот.",
+          {"action": {"type": "string", "enum": list(DISPLAY_VALUES), "description": "Действие"},
+           "value": {"type": "string", "description": "Яркость 0–100 для brightness_set, иначе пустая строка"}},
+          ["action", "value"]),
+    _tool("media", "Музыка в Music или Spotify: пуск, пауза, треки, что играет, громкость плеера.",
+          {"action": {"type": "string", "enum": list(MEDIA_VALUES), "description": "Действие"},
+           "app": {"type": "string", "enum": list(MEDIA_APPS), "description": "Music, если пользователь не назвал"}},
+          ["action", "app"]),
 ]
 
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}

@@ -64,6 +64,10 @@ JSON_FORMAT = (
     '- list_memory {}; forget_memory {"query": "кофе"}; clear_memory {}\n'
     '- web_search {"query": "..."}; get_weather {"city": "Душанбе"}; get_exchange_rate {"base": "USD", "target": "TJS"}\n'
     '- read_page {"link_number": 1} — страница из последнего поиска\n'
+    '- system_info {"what": "battery|storage|memory|cpu|uptime|wifi|ip|macos|running_apps|frontmost_app"}\n'
+    '- display {"action": "brightness_up|brightness_down|brightness_set|dark_mode_on|dark_mode_off|'
+    'dark_mode_toggle|lock_screen|sleep_display|screenshot", "value": "яркость 0-100 или пусто"}\n'
+    '- media {"action": "play|pause|toggle|next|previous|now_playing|volume_up|volume_down", "app": "Music|Spotify"}\n'
     "По данным из интернета: 1–3 фразы, источник словами, числа — цифрами, не придумывай.\n"
     "Названия приложений — по-английски, как в macOS. Нельзя выполнить — actions пустой, объясни в response.\n"
     'Пример: {"response": "Открываю Safari.", "actions": [{"name": "open_app", "args": {"app": "Safari"}}]}\n'

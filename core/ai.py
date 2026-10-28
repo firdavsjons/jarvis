@@ -11,8 +11,10 @@ from urllib.parse import urlparse
 
 from core import installed_apps, journal, prompts, safety, web
 from core.cache import cacheable_actions
+from core.errors import ActionError, Done
 from core.history import ConversationHistory
 from core.links import NO_LINK_REPLY, SearchLinks, urls_in_phrase
+from core.mac_actions import TOOL_FUNCS
 from core.memory import SECRET_REFUSAL, MemoryRefused, UserMemory, asked_to_remember, contains_secret
 from core.llm import build_default_client
 from core.speech_text import confirmation_question, url_for_speech
@@ -36,7 +38,7 @@ REMEMBER_ACTIONS = {"remember", "remember_alias"}
 NOT_ASKED_SHORT = "запоминаю только по вашей просьбе со словом «запомни»"
 NOT_FOUND_SHORT = "не нашёл"
 # Простые действия: при успехе модели результат не возвращаем — фраза по шаблону, на 1 запрос меньше
-TEMPLATE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url"}
+TEMPLATE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url", *TOOL_FUNCS}
 MAX_TEMPLATE_PARTS = 3
 # Данные из интернета: после них в этой фразе нельзя менять память, открывать ссылки, удалять и закрывать
 WEB_ACTIONS = {"web_search", "get_weather", "get_exchange_rate", "read_page"}
@@ -58,31 +60,6 @@ SLOW_TOOL_AFTER = 2.0  # веб-инструмент дольше — «Секу
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
-
-
-class ActionError(ValueError):
-    """Действие отклонено: неверные аргументы или ошибка выполнения.
-
-    short — короткая причина по-русски для голоса и окна («файл не найден»).
-    """
-
-    def __init__(self, message, short="команда завершилась с ошибкой", reply=None):
-        super().__init__(message)
-        self.short = short
-        self.reply = reply  # готовая фраза вместо «Не получилось: …» («Такое я запоминать не буду.»)
-
-
-class Done:
-    """Результат действия: message — в лог и окно, speech — сказать пользователю (для действий-чтений),
-    for_model — что вернуть модели (если короче окна), web — данные из интернета (не инструкции)."""
-
-    def __init__(self, message, speech=None, for_model=None, web=False, links=(), page=None):
-        self.message = message
-        self.speech = speech
-        self.for_model = for_model
-        self.web = web
-        self.links = list(links)  # ссылки результата поиска — для «открой первую ссылку»
-        self.page = page          # read_page: {"title", "domain"}
 
 
 def _run(args):
@@ -236,6 +213,7 @@ ACTIONS = {
     "web_search": web_search,
     "get_weather": get_weather,
     "get_exchange_rate": get_exchange_rate,
+    **TOOL_FUNCS,  # system_info, display, media (core/mac_actions.py)
 }
 
 

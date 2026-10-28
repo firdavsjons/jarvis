@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from core.apps import resolve_app
 from core.installed_apps import resolve_app_name
+from core.mac_actions import DISPLAY_VALUES, MEDIA_APPS, MEDIA_VALUES, SYSTEM_INFO_VALUES
 
 log = logging.getLogger(__name__)
 
@@ -18,7 +19,12 @@ BLOCKED = "BLOCKED"
 # Белый список: всё остальное (sudo, shell, rm, форматирование, настройки безопасности...) — BLOCKED
 ACTION_NAMES = {"open_app", "quit_app", "set_volume", "open_url", "trash_file", "find_apps", "list_apps",
                 "get_time", "remember", "remember_alias", "list_memory", "forget_memory", "clear_memory",
-                "web_search", "get_weather", "get_exchange_rate", "read_page"}
+                "web_search", "get_weather", "get_exchange_rate", "read_page", "system_info", "display", "media"}
+
+# Группы Mac-инструментов: уровень определяет пара (инструмент, значение параметра). Все значения SAFE
+# (чтение или обратимое безобидное изменение); неизвестное значение — BLOCKED
+GROUP_PARAMS = {"system_info": "what", "display": "action", "media": "action"}
+GROUP_VALUES = {"system_info": set(SYSTEM_INFO_VALUES), "display": set(DISPLAY_VALUES), "media": set(MEDIA_VALUES)}
 
 # Закрыть можно сразу (macOS сама спросит про несохранённое), кроме этих приложений
 CAREFUL_APPS = {"Terminal", "iTerm", "iTerm2", "Visual Studio Code", "Code", "Xcode", "PyCharm",
@@ -122,6 +128,13 @@ def classify(action, trusted=None, home=None):
 
     if name in ("open_app", "set_volume"):
         return SAFE, "безопасное действие"
+    if name in GROUP_VALUES:
+        value = args.get(GROUP_PARAMS[name])
+        if not isinstance(value, str) or value not in GROUP_VALUES[name]:
+            return BLOCKED, f"неизвестное значение {GROUP_PARAMS[name]} у {name}"
+        if name == "media" and args.get("app") not in MEDIA_APPS:
+            return BLOCKED, "media работает только с Music и Spotify"
+        return SAFE, "чтение или безобидное изменение"
     if name in ("find_apps", "list_apps", "get_time"):
         return SAFE, "только чтение"
     if name in ("web_search", "get_weather", "get_exchange_rate", "read_page"):
