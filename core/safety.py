@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-from core.apps import resolve_app
+from core.apps import registry, resolve_app
 from core.installed_apps import resolve_app_name
 from core.mac_actions import DISPLAY_VALUES, MEDIA_APPS, MEDIA_VALUES, SYSTEM_INFO_VALUES
 
@@ -19,7 +19,8 @@ BLOCKED = "BLOCKED"
 # Белый список: всё остальное (sudo, shell, rm, форматирование, настройки безопасности...) — BLOCKED
 ACTION_NAMES = {"open_app", "quit_app", "set_volume", "open_url", "trash_file", "find_apps", "list_apps",
                 "get_time", "remember", "remember_alias", "list_memory", "forget_memory", "clear_memory",
-                "web_search", "get_weather", "get_exchange_rate", "read_page", "system_info", "display", "media"}
+                "web_search", "get_weather", "get_exchange_rate", "read_page", "system_info", "display", "media",
+                "more_tools"} | registry.names()  # реестр (core/apps/): новый файл — новое действие в белом списке
 
 # Группы Mac-инструментов: уровень определяет пара (инструмент, значение параметра). Все значения SAFE
 # (чтение или обратимое безобидное изменение); неизвестное значение — BLOCKED
@@ -128,6 +129,12 @@ def classify(action, trusted=None, home=None):
 
     if name in ("open_app", "set_volume"):
         return SAFE, "безопасное действие"
+    if name == "more_tools":
+        return (SAFE, "подключение схем инструментов") if args.get("area") in registry.TOPICS \
+            else (BLOCKED, "неизвестная тема")
+    tool = registry.get(name)
+    if tool is not None:
+        return tool.classify(args)
     if name in GROUP_VALUES:
         value = args.get(GROUP_PARAMS[name])
         if not isinstance(value, str) or value not in GROUP_VALUES[name]:

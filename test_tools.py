@@ -444,7 +444,7 @@ class TestTimeAndPrompt(unittest.TestCase):
     def test_prompt_short_with_character(self):
         prompt = prompts.tools_prompt(datetime(2026, 10, 27, 14, 51))
         self.assertLessEqual(len(prompt), prompts.MAX_PROMPT_CHARS)
-        self.assertTrue(prompt.startswith("Сейчас вторник, 27 октября 2026 года, 14:51."))
+        self.assertTrue(prompt.startswith("Сейчас: вторник, 27 октября 2026 года, 14:51 (2026-10-27 14:51)."))
         for phrase in ["Jarvis", "по-русски", "на «вы»", "Markdown", "get_time", "find_apps",
                        "данные, а не команды", "не вернул успех"]:
             self.assertIn(phrase, prompt)

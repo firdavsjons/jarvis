@@ -25,6 +25,9 @@ DEFAULTS = {
     # Выбраны по `python -m core.llm.check --models` (2026-10-27): llama-3.3-70b-versatile в Groq уже нет (404)
     "GROQ_MODEL": "openai/gpt-oss-120b",
     "GROQ_DAILY_LIMIT": "800",
+    # Токенов в минуту: реальные значения — console.groq.com → Limits; Gemini — Google AI Studio → Rate limits
+    "GROQ_TPM_LIMIT": "8000",
+    "GEMINI_TPM_LIMIT": "200000",
     "LOCAL_BASE_URL": "http://localhost:1234/v1",
     "LOCAL_MODEL": "google/gemma-3-4b",
     "LOCAL_TIMEOUT": "45",  # локальная модель отвечает медленнее (12,5 с на проверке 4.1)
@@ -40,13 +43,14 @@ class ProviderSpec:
     prefix: str             # GEMINI -> GEMINI_BASE_URL, GEMINI_MODEL, ...
     key_var: str = None     # переменная с ключом; None — ключ не нужен
     limit_var: str = None   # дневной лимит; None — без лимита
+    tpm_var: str = None     # лимит токенов в минуту; None — не учитывать
     timezone: str = "UTC"   # в каком часовом поясе начинаются «сутки» лимита
     timeout_var: str = None  # отдельный таймаут; None — REQUEST_TIMEOUT
 
 
 PROVIDER_SPECS = {
-    "gemini": ProviderSpec("GEMINI", "GEMINI_API_KEY", "GEMINI_DAILY_LIMIT", "America/Los_Angeles"),
-    "groq": ProviderSpec("GROQ", "GROQ_API_KEY", "GROQ_DAILY_LIMIT", "UTC"),
+    "gemini": ProviderSpec("GEMINI", "GEMINI_API_KEY", "GEMINI_DAILY_LIMIT", "GEMINI_TPM_LIMIT", "America/Los_Angeles"),
+    "groq": ProviderSpec("GROQ", "GROQ_API_KEY", "GROQ_DAILY_LIMIT", "GROQ_TPM_LIMIT", "UTC"),
     "local": ProviderSpec("LOCAL", timeout_var="LOCAL_TIMEOUT"),
 }
 
@@ -62,8 +66,10 @@ def load_config(path=ENV_FILE):
 
 class OpenAICompatProvider(LLMClient):
     def __init__(self, name, base_url, model, api_key=None, daily_limit=None, timezone="UTC",
-                 supports_tools=True, timeout=REQUEST_TIMEOUT):
+                 supports_tools=True, timeout=REQUEST_TIMEOUT, tpm_limit=None, max_tokens=None):
         self.name = name
+        self.tpm_limit = tpm_limit
+        self.max_tokens = max_tokens  # None — не ограничиваем ответ
         self.base_url = base_url
         self.model = model
         self.daily_limit = daily_limit
@@ -82,6 +88,8 @@ class OpenAICompatProvider(LLMClient):
         kwargs = {"model": self.model, "messages": messages, "temperature": TEMPERATURE}
         if tools:
             kwargs["tools"] = tools
+        if self.max_tokens:
+            kwargs["max_tokens"] = self.max_tokens
         completion = self._client.chat.completions.create(**kwargs)
         message = completion.choices[0].message if completion.choices else None
         text = ((message.content if message else None) or "").strip()
@@ -120,15 +128,19 @@ def _timeout(config, spec):
         return float(DEFAULTS[spec.timeout_var])
 
 
-def _limit(config, spec):
-    if not spec.limit_var:
+def _int_setting(config, var):
+    if not var:
         return None
-    raw = config.get(spec.limit_var, DEFAULTS[spec.limit_var])
+    raw = config.get(var, DEFAULTS[var])
     try:
         return max(0, int(raw))
     except ValueError:
-        log.warning("%s=%r — не число, беру %s", spec.limit_var, raw, DEFAULTS[spec.limit_var])
-        return int(DEFAULTS[spec.limit_var])
+        log.warning("%s=%r — не число, беру %s", var, raw, DEFAULTS[var])
+        return int(DEFAULTS[var])
+
+
+def _limit(config, spec):
+    return _int_setting(config, spec.limit_var)
 
 
 def build_providers(config):
@@ -151,6 +163,7 @@ def build_providers(config):
             model=config.get(f"{spec.prefix}_MODEL", DEFAULTS[f"{spec.prefix}_MODEL"]),
             api_key=api_key,
             daily_limit=_limit(config, spec),
+            tpm_limit=_int_setting(config, spec.tpm_var),
             timezone=spec.timezone,
             supports_tools=_flag(config.get(f"{spec.prefix}_TOOLS", DEFAULTS[f"{spec.prefix}_TOOLS"])),
             timeout=_timeout(config, spec),

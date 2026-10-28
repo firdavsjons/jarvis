@@ -235,6 +235,8 @@ def action_for_speech(action):
     """Короткое описание действия для вопроса: без полных путей и ссылок."""
     args = action.get("args") or {}
     name = action.get("name")
+    if action.get("preview"):   # реестр приложений: цель названа читающим поиском («удалить событие «Планёрка» …»)
+        return str(action["preview"])
     if name == "trash_file":
         path = str(args.get("path", ""))
         kind = "папку" if os.path.isdir(os.path.expanduser(path)) else "файл"

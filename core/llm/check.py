@@ -48,6 +48,36 @@ def check_provider(provider, show_models=False, out=sys.stdout):
 
 
 TOOLS_PROMPT = "Который час?"
+# Типичные запросы по одной теме: их размер схем должен укладываться в 3500 символов
+BUDGET_PHRASES = ["поставь таймер на 5 минут", "что у меня сегодня", "открой настройки Wi-Fi", "какая погода"]
+
+
+def request_estimate(phrase):
+    """(символы схем, оценка токенов всего запроса: системный промпт + фраза + схемы, / 3,5) без обращения к сети."""
+    from core import prompts, topics
+    from core.tools import TOOLS
+    tools, _ = topics.select(phrase, TOOLS)
+    chars = topics.size(tools) + len(prompts.tools_prompt()) + len(phrase)
+    return topics.size(tools), topics.estimate_tokens(chars), [t["function"]["name"] for t in tools]
+
+
+def check_budget(config, out=sys.stdout):
+    """Оценка токенов запросов без сети: четыре типичные фразы, полный набор и доля лимита токенов в минуту."""
+    from core import topics
+    from core.tools import TOOLS
+    limits = {"groq": int(config.get("GROQ_TPM_LIMIT", 8000)), "gemini": int(config.get("GEMINI_TPM_LIMIT", 200000))}
+    _print(f"{'запрос':<28} {'схемы':>6} {'токенов':>8}   доля минутного лимита Groq", out)
+    ok = True
+    for phrase in BUDGET_PHRASES:
+        chars, tokens, names = request_estimate(phrase)
+        ok = ok and chars <= topics.TYPICAL_REQUEST_CHARS
+        _print(f"{phrase:<28} {chars:>6} {tokens:>8}   {tokens / limits['groq']:.0%}  ({', '.join(names[5:])})", out)
+    all_chars = topics.size(TOOLS)
+    _print(f"{'все схемы вместе':<28} {all_chars:>6} {topics.estimate_tokens(all_chars):>8}   "
+           f"(в запрос целиком не уходят)", out)
+    _print(f"типичный запрос ≤ {topics.TYPICAL_REQUEST_CHARS} символов схем: {'да' if ok else 'НЕТ'}; "
+           f"лимиты токенов в минуту: Groq {limits['groq']}, Gemini {limits['gemini']}", out)
+    return ok
 
 
 def check_tools(provider, out=sys.stdout):
@@ -65,6 +95,8 @@ def check_tools(provider, out=sys.stdout):
     called = any(isinstance(r.get("action"), dict) and r["action"].get("name") == "get_time" and r.get("ok")
                  for r in turn.results)
     _print(f"{provider.name:<7} get_time: {'да' if called else 'нет':<4} {elapsed:5.1f} с   «{turn.speech}»", out)
+    chars, tokens, _ = request_estimate(TOOLS_PROMPT)
+    _print(f"        оценка запроса с набором по теме: схемы {chars} символов, ≈{tokens} токенов", out)
     return called
 
 
@@ -113,7 +145,11 @@ def main(argv=None, config=None, out=sys.stdout):
                         help="живая проверка tool calling: «Который час?» с get_time (2 запроса на провайдера)")
     parser.add_argument("--web", action="store_true",
                         help="проверка погоды, курса USD→TJS и поиска (бесплатные сервисы, без ключей)")
+    parser.add_argument("--budget", action="store_true",
+                        help="оценка токенов запросов (символы / 3,5) для четырёх типичных фраз, без сети")
     args = parser.parse_args(argv)
+    if args.budget:
+        return 0 if check_budget(load_config() if config is None else config, out) else 1
     if args.web:
         return 0 if any(check_web(out)) else 1
 

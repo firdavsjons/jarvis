@@ -11,6 +11,7 @@ from threading import Lock
 from urllib.parse import urlparse
 
 from core import installed_apps, safety
+from core.apps import registry
 from core.apps import ALIAS_PREFIX_MIN, APP_ALIASES
 from core.storage import DATA_DIR, atomic_write_json, read_json
 
@@ -23,7 +24,9 @@ FILLER_WORDS = {"пожалуйста", "мне", "а", "ну", "давай"}
 # Фразы, смысл которых зависит от разговора: «открой его», «запусти снова» — не кэшируем
 CONTEXT_WORDS = {"его", "её", "ее", "это", "этот", "эту", "эти", "то", "тот", "ту", "их", "там", "тут",
                  "снова", "ещё", "еще", "опять"}
-CACHEABLE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url"}
+# Инструменты времени и личных данных (таймеры, будильники, напоминания, календарь, заметки, Быстрые команды) не кэшируются:
+# результат зависит от момента. Исключение — панели настроек по шаблону фразы («открой настройки звука»)
+CACHEABLE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url", "settings"}
 CLEARED_REPLY = "Кэш команд очищен."
 
 
@@ -96,7 +99,10 @@ def action_follows_phrase(action, phrase, single):
     if name in ("open_app", "quit_app"):
         return isinstance(args.get("app"), str) and app_in_phrase(args["app"], set(words), normalized)
     if not single:
-        return False  # громкость и ссылки — только когда вся фраза про них одних
+        return False  # громкость, ссылки и панели — только когда вся фраза про них одних
+    tool = registry.get(name)
+    if tool is not None:
+        return bool(tool.cache_check and tool.cache_check(args, phrase))
     if name == "set_volume":
         return bool(volume_template(args.get("level"), words))
     if name == "open_url":

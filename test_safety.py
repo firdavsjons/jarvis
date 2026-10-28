@@ -10,7 +10,8 @@ from unittest.mock import MagicMock, patch
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from core import journal, safety
-from core.ai import ACTIONS, MEMORY_ACTIONS, PAGE_ACTIONS, AIClient
+from core.apps import registry
+from core.ai import ACTIONS, MEMORY_ACTIONS, MORE_ACTIONS, PAGE_ACTIONS, AIClient
 from core.safety import BLOCKED, CONFIRM, SAFE, classify, classify_path, classify_url
 from core.llm import LLMResponse
 from fixtures_apps import patch_installed
@@ -101,7 +102,7 @@ class TestPathLevels(FakeHomeMixin, unittest.TestCase):
 
 class TestActionLevels(FakeHomeMixin, unittest.TestCase):
     def test_whitelist_matches_ai_actions(self):
-        self.assertEqual(set(ACTIONS) | MEMORY_ACTIONS | PAGE_ACTIONS, safety.ACTION_NAMES)
+        self.assertEqual(set(ACTIONS) | MEMORY_ACTIONS | PAGE_ACTIONS | MORE_ACTIONS | registry.names(), safety.ACTION_NAMES)
 
     def test_unknown_actions_blocked(self):
         for action in [

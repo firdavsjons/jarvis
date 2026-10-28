@@ -3,6 +3,7 @@ import re
 import subprocess
 
 from core import journal, mac_actions, safety
+from core.apps import registry
 from core.errors import ActionError
 
 log = logging.getLogger(__name__)
@@ -116,9 +117,10 @@ class MacControl:
         return None
 
     def _quick(self, command):
-        """Новые быстрые правила (система, экран, музыка). Фраза однозначная, поэтому при сбое озвучиваем
-        причину (нет разрешения, не запущено), а не отдаём фразу модели: она бы упёрлась в то же самое."""
-        rule = QUICK_PHRASES.get(_normalize(command))
+        """Быстрые правила (система, экран, музыка — таблица QUICK_RULES; время, календарь, настройки — файлы реестра
+        core/apps/). Фраза однозначная, поэтому при сбое озвучиваем причину (нет разрешения, не запущено), а не
+        отдаём фразу модели: она бы упёрлась в то же самое."""
+        rule = QUICK_PHRASES.get(_normalize(command)) or registry.quick_actions(command)
         if rule is None:
             return None
         name, args = rule
@@ -134,8 +136,9 @@ class MacControl:
             if level != safety.SAFE:
                 _journal(command, action, False, f"не выполнено: {reason}", level=level)
                 return None
+            tool = registry.get(name)
             try:
-                done = mac_actions.TOOL_FUNCS[name](**args)
+                done = tool.run(phrase=command, **args) if tool else mac_actions.TOOL_FUNCS[name](**args)
             except ActionError as e:
                 _journal(command, action, False, f"⛔ Отклонено: {e}", level=level)
                 return e.reply or f"Не получилось: {e.short}."

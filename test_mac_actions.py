@@ -21,7 +21,7 @@ from core.tools import TOOLS
 from fixtures_apps import FAKE_INSTALLED, patch_installed
 from test_tools import ScriptedLLM, call, final, tools_reply
 
-TOKEN_BUDGET_CHARS = 9000
+TOTAL_SCHEMAS_CHARS = 14000   # все схемы вместе (Этап 6.2); запрос по теме — отдельные лимиты в test_topics.py
 
 PMSET_DISCHARGING = ("Now drawing from 'Battery Power'\n"
                      " -InternalBattery-0 (id=24838243)\t62%; discharging; 3:05 remaining present: true\n")
@@ -514,7 +514,7 @@ class TestSafetyLevels(unittest.TestCase):
 class TestTokenBudget(unittest.TestCase):
     def test_tool_schemas_fit_budget(self):
         size = len(json.dumps(TOOLS, ensure_ascii=False))
-        self.assertLessEqual(size, TOKEN_BUDGET_CHARS, f"схемы инструментов {size} символов, бюджет {TOKEN_BUDGET_CHARS}")
+        self.assertLessEqual(size, TOTAL_SCHEMAS_CHARS, f"схемы {size} символов, бюджет {TOTAL_SCHEMAS_CHARS}")
 
     def test_prompt_unchanged_limit(self):
         self.assertLessEqual(len(prompts.tools_prompt()), prompts.MAX_PROMPT_CHARS)
@@ -540,13 +540,22 @@ class TestModelFlow(MacActionsCase):
         self.assertEqual(turn.speech, "Заряд 100 процентов, заряжен, свободно 120 гигабайт из 500.")
 
     def test_error_goes_back_to_model(self):
-        self.run_with(completed("", 1, "Not authorized (-1743)"))
+        self.run_with(completed("", 1, "что-то непонятное"))
         llm = ScriptedLLM(tools_reply(call("system_info", {"what": "frontmost_app"})),
-                          final("Нужно разрешение на Автоматизацию."))
+                          final("Не получилось узнать активное приложение."))
         turn = AIClient(llm=llm).respond("какое приложение активно")
         self.assertEqual(len(llm.requests), 2)
-        self.assertIn("Автоматизация", json.loads(llm.requests[1]["messages"][-1]["content"])["error"])
-        self.assertIn("разрешение", turn.speech)
+        self.assertEqual(json.loads(llm.requests[1]["messages"][-1]["content"])["error"], "команда завершилась с ошибкой")
+        self.assertIn("Не получилось", turn.speech)
+
+    def test_permission_error_spoken_without_second_request(self):
+        """Отказ с готовой фразой («Нужно разрешение…») озвучивается сразу: модели нечего добавить."""
+        self.run_with(completed("", 1, "Not authorized to send Apple events to System Events. (-1743)"))
+        llm = ScriptedLLM(tools_reply(call("system_info", {"what": "frontmost_app"})))
+        turn = AIClient(llm=llm).respond("какое приложение активно")
+        self.assertEqual(len(llm.requests), 1)
+        self.assertIn("Автоматизация", turn.speech)
+        self.assertIn("из которого запущен Jarvis", turn.speech)
 
     def test_voice_speech_has_words_not_digits(self):
         self.assertEqual(prepare_for_speech("Яркость 90 процентов."), "Яркость девяносто процентов.")

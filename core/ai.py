@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from urllib.parse import urlparse
 
-from core import installed_apps, journal, prompts, safety, web
+from core import durations, installed_apps, journal, prompts, safety, topics, web
+from core.apps import registry
 from core.cache import cacheable_actions
 from core.errors import ActionError, Done
 from core.fragments import FRAGMENT_REPLY, is_fragment
@@ -49,7 +50,9 @@ REMEMBER_ACTIONS = {"remember", "remember_alias"}
 NOT_ASKED_SHORT = "запоминаю только по вашей просьбе со словом «запомни»"
 NOT_FOUND_SHORT = "не нашёл"
 # Простые действия: при успехе модели результат не возвращаем — фраза по шаблону, на 1 запрос меньше
-TEMPLATE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url", *TOOL_FUNCS}
+TEMPLATE_ACTIONS = {"open_app", "quit_app", "set_volume", "open_url", *TOOL_FUNCS, *registry.names()}
+# Инструменты с готовыми фразами: отказ с готовым reply («Нужно разрешение…») озвучивается без второго запроса к модели
+DIRECT_REPLY_TOOLS = {*TOOL_FUNCS, *registry.names()}
 MAX_TEMPLATE_PARTS = 3
 # Данные из интернета: после них в этой фразе нельзя менять память, открывать ссылки, удалять и закрывать
 WEB_ACTIONS = {"web_search", "get_weather", "get_exchange_rate", "read_page"}
@@ -66,11 +69,52 @@ RESTRICTED_AFTER_WEB = {"remember", "remember_alias", "forget_memory", "clear_me
                         "quit_app"}
 WEB_RESTRICTED_SHORT = "в ответе были данные из интернета"
 WEB_REFUSAL_REPLY = "Ссылки из поиска я без вашей команды не открываю. Скажите: открой первую ссылку."
+GENERIC_REFUSAL_REPLY = ("В полученных данных могли быть чужие указания, поэтому это действие я без вашей команды "
+                         "не выполняю. Скажите его отдельной фразой.")
+MORE_ACTIONS = {"more_tools"}   # подключение схем темы: выполняет сам AIClient
 SLOW_TOOL_REPLY = "Секунду, ищу."
 SLOW_TOOL_AFTER = 2.0  # веб-инструмент дольше — «Секунду, ищу.» (один раз за фразу, не блокируя инструмент)
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
                                 re.IGNORECASE)
+
+
+def is_external(action):
+    """Результат действия содержит чужой текст (интернет, события, заметки, напоминания, Быстрые команды)."""
+    if not isinstance(action, dict):
+        return False
+    if action.get("name") in WEB_ACTIONS:
+        return True
+    tool = registry.get(action.get("name"))
+    return tool is not None and tool.is_external(action.get("args"))
+
+
+def _from_phrase(value, phrase):
+    """Текст (метка, заголовок) взят из реальной фразы пользователя: все его слова есть во фразе (по основе)."""
+    phrase_words = [w for w in re.findall(r"\w+", str(phrase).lower().replace("ё", "е"))]
+    for word in re.findall(r"\w+", str(value).lower().replace("ё", "е")):
+        if not any(p.startswith(word[:5]) or word.startswith(p[:5]) for p in phrase_words):
+            return False
+    return True
+
+
+def restricted_after_external(action, phrase):
+    """После чужих данных в этой фразе запрещено: память, ссылки, удаление, закрытие, любые delete/send/move/run
+    и создание таймеров, будильников, напоминаний, событий и заметок с текстом, которого нет во фразе пользователя."""
+    if not isinstance(action, dict):
+        return False
+    if action.get("name") in RESTRICTED_AFTER_WEB:
+        return True
+    tool = registry.get(action.get("name"))
+    if tool is None:
+        return False
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    if tool.is_destructive(args):
+        return True
+    if args.get(tool.action_param) in tool.creates:
+        return any(isinstance(args.get(p), str) and args[p].strip() and not _from_phrase(args[p], phrase)
+                   for p in tool.text_params)
+    return False
 
 
 def claims_unperformed_action(phrase, answer):
@@ -249,6 +293,8 @@ def describe_action(action):
         return f"запомнить: {args.get('text')}"
     if name == "remember_alias":
         return f"запомнить: {args.get('spoken')} — это {args.get('app')}"
+    if action.get("preview"):
+        return str(action["preview"])
     return str(name)
 
 
@@ -305,10 +351,12 @@ class Turn:
 
 
 class AIClient:
-    def __init__(self, llm=None, tools=TOOLS, allowed_actions=None, memory=None, cache=None):
+    def __init__(self, llm=None, tools=None, allowed_actions=None, memory=None, cache=None):
         # Провайдеры (Gemini → Groq → LM Studio) с запасными вариантами — core/llm, настройки из .env
         self.llm = llm if llm is not None else build_default_client()
-        self.tools = tools
+        self.tools = tools  # None — набор выбирается под фразу (core/topics.py); список — фиксированный набор
+        self._extra_topics = set()  # темы, которые модель попросила через more_tools (на одну фразу)
+        self._carry = set()         # инструменты прошлой реплики: «а завтра?» без ключевых слов
         self.allowed_actions = allowed_actions  # None — весь белый список (подмножество — для проверки связи)
         self.history = ConversationHistory()
         # Память: по умолчанию только в памяти процесса; файл (~/Library/Application Support/Jarvis) — из main
@@ -385,7 +433,10 @@ class AIClient:
         """Инструменты: SAFE — выполнить и вернуть модели результат (до 3 кругов), CONFIRM — вопрос
         пользователю, BLOCKED — отклонить весь ответ. Модели без инструментов — режим JSON."""
         history = self.history.messages()
-        user = {"role": "user", "content": text}
+        hint = durations.duration_hint(text)
+        # Подсказка считана кодом по фразе пользователя: «через 25 минут» = 1500 секунд (в уме модель ошибается)
+        user = {"role": "user", "content": f"{text}\n[{hint[0]}]" if hint else text}
+        self._extra_topics = set()
         messages = [{"role": "system", "content": prompts.tools_prompt(**self._prompt_kwargs())}, *history, user]
         json_messages = [{"role": "system", "content": prompts.json_prompt(**self._prompt_kwargs())}, *history, user]
         executed = []
@@ -394,7 +445,7 @@ class AIClient:
         while True:
             try:
                 # json_messages только в первом запросе: без инструментов результаты им не вернуть
-                response = self.llm.chat(messages, tools=self.tools,
+                response = self.llm.chat(messages, tools=self._request_tools(text),
                                          json_messages=json_messages if requests == 0 else None)
                 requests += 1
             except Exception as e:
@@ -431,21 +482,24 @@ class AIClient:
                 self.reject_actions(actions, text, "в ответе есть опасное действие")
                 return self._finish(text, Turn(BLOCKED_REPLY, blocked=blocked, results=executed))
 
-            # Веб-данные в этой фразе (уже получены или запрошены в этом же круге) — запрет на память,
-            # ссылки, удаление и закрытие: текст из интернета мог подсказать модели такие вызовы
-            web_seen = web_seen or any(a and a.get("name") in WEB_ACTIONS for _, a, _ in calls)
-            if web_seen and any(a and a.get("name") in RESTRICTED_AFTER_WEB for _, a, _ in calls):
+            # Чужие данные в этой фразе (интернет, события, заметки, напоминания, Быстрые команды — уже получены или
+            # запрошены в этом же круге): запрет на память, ссылки, удаление, закрытие, delete/send/move/run и
+            # создание записей с чужим текстом — он мог подсказать модели такие вызовы
+            restricted = self._restricted(actions, text, web_seen)
+            web_seen = web_seen or any(is_external(a) for a in actions)
+            if restricted:
                 # Модели причину не отдаём и больше её не спрашиваем: полученные данные + готовая фраза
-                restricted = [a for _, a, _ in calls if a and a.get("name") in RESTRICTED_AFTER_WEB]
                 self.reject_actions(restricted, text, WEB_RESTRICTED_SHORT)
                 allowed, _, _ = self.split_actions([a for a in actions if a not in restricted], phrase=text)
                 executed += self.run_actions(allowed, phrase=text)
-                return self._finish(text, self._web_refusal_turn(executed))
+                return self._finish(text, self._web_refusal_turn(executed, restricted))
             if confirm:
                 # SAFE — сейчас, CONFIRM — после «да»; модели ничего не возвращаем, пока пользователь не ответит
                 results = self.run_actions(safe, phrase=text)
                 executed += results
-                ok, summary = summarize_results(results)
+                confirm, failed = self._preview_confirmations(confirm, text)
+                executed += failed
+                ok, summary = summarize_results(results + failed)
                 return self._finish(text, Turn(summary, pending=confirm, results=executed))
 
             tool_rounds += 1
@@ -458,6 +512,10 @@ class AIClient:
                 # Всё простое и успешное — фраза по шаблону, второй запрос к модели не нужен
                 executed += round_results
                 return self._finish(text, Turn(template_speech(round_results), results=executed))
+            if self._direct_reply(calls, round_results):
+                # Отказ с готовой фразой («Нужно разрешение…», «Создайте команду Jarvis Alarm…») — без модели
+                executed += round_results
+                return self._finish(text, Turn(self._direct_speech(round_results), results=executed))
             results = iter(round_results)
             messages = messages + [assistant_message(response)]
             for call, action, error in calls:
@@ -470,6 +528,72 @@ class AIClient:
                 executed.append(result)
                 messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
                                              error=result["short"], web=result.get("web", False)))
+
+    @staticmethod
+    def _restricted(actions, phrase, seen_before):
+        """Запрещённые после чужих данных: данные из прошлых кругов или от ДРУГОГО действия этого круга. Действие,
+        которое само вернёт чужие данные (запуск Быстрой команды), из-за этого не отклоняется."""
+        external = [a for a in actions if is_external(a)]
+        return [a for a in actions if restricted_after_external(a, phrase)
+                and (seen_before or any(e is not a for e in external))]
+
+    def _request_tools(self, text):
+        """Схемы для запроса: фиксированный набор или выбранный по теме фразы (core/topics.py)."""
+        if self.tools is not None:
+            return self.tools
+        from core.tools import TOOLS
+        tools, info = topics.select(text, TOOLS, self._extra_topics, self._carry)
+        log.info("Инструменты для запроса: %s, ≈%s токенов%s", ", ".join(info["topics"]) or "база",
+                 topics.estimate_tokens(topics.size(tools)), " (запасной набор)" if info["fallback"] else "")
+        return tools
+
+    def _more_tools(self, area):
+        if area not in registry.TOPICS:
+            raise ActionError(f"more_tools: тема {area!r}", "неизвестная тема")
+        self._extra_topics.add(area)
+        names = ", ".join(topics.topic_tools(area))
+        return Done(f"Подключено: {names}", None, for_model=f"Подключены инструменты: {names}. Вызови нужный.")
+
+    @staticmethod
+    def _direct_reply(calls, results):
+        """Все действия круга — либо готовый успех, либо отказ с готовой фразой у инструментов с такими фразами."""
+        if not results or not all(action is not None for _, action, _ in calls):
+            return False
+        failed = [r for r in results if not r["ok"]]
+        return bool(failed) and all(
+            (r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS)
+            or (not r["ok"] and r.get("reply") and r["action"].get("name") in DIRECT_REPLY_TOOLS) for r in results)
+
+    @staticmethod
+    def _direct_speech(results):
+        done = [r for r in results if r["ok"]]
+        replies = list(dict.fromkeys(r["reply"] for r in results if not r["ok"]))
+        return " ".join(([template_speech(done)] if done else []) + replies)
+
+    def _preview_confirmations(self, confirm, phrase):
+        """Перед вопросом «Удалить …?» читающий поиск цели (preview): в вопросе называется найденное; не найдено
+        или несколько — вопроса нет, честный отказ."""
+        kept, failed = [], []
+        for action in confirm:
+            tool = registry.get(action.get("name"))
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            if tool is None or tool.preview is None:
+                kept.append(action)
+                continue
+            try:
+                kept.append({**action, "preview": tool.preview(**args)})
+            except TypeError:
+                short, reply = "неверные параметры", None
+            except ActionError as e:
+                short, reply = e.short, e.reply
+            else:
+                continue
+            log.info("⛔ Не выполнено: %s — %s", action, short)
+            journal.record(phrase, action, safety.CONFIRM, None, False, short)
+            failed.append({"action": action, "level": safety.CONFIRM, "ok": False, "message": f"⛔ {short}",
+                           "short": short, "speech": None, "result": None, "reply": reply, "web": False,
+                           "page": None})
+        return kept, failed
 
     @staticmethod
     def _template_ok(calls, results):
@@ -491,6 +615,8 @@ class AIClient:
         return Turn(summary if not ok else (summary or "Готово."), results=executed)
 
     def _finish(self, text, turn):
+        used = {r["action"].get("name") for r in turn.results if isinstance(r.get("action"), dict)}
+        self._carry = used & set(topics.catalog())   # инструменты этой реплики подскажут набор для следующей
         said = " ".join(p for p in [turn.speech, confirmation_question(turn.pending) if turn.pending else ""] if p)
         self.remember(text, said, turn.results)
         return turn
@@ -504,11 +630,15 @@ class AIClient:
         if blocked:
             self.reject_actions(actions, text, "в ответе есть опасное действие")
             return Turn(BLOCKED_REPLY, blocked=blocked)
-        if isinstance(actions, list) and any(isinstance(a, dict) and a.get("name") in WEB_ACTIONS for a in actions):
-            restricted = [a for a in actions if isinstance(a, dict) and a.get("name") in RESTRICTED_AFTER_WEB]
+        confirm, preview_failed = self._preview_confirmations(confirm, text)
+        if preview_failed and not safe and not confirm:
+            return Turn(summarize_results(preview_failed)[1], results=preview_failed)
+        if isinstance(actions, list) and any(is_external(a) for a in actions):
+            restricted = self._restricted(actions, text, False)
             if restricted:
                 self.reject_actions(restricted, text, WEB_RESTRICTED_SHORT)
-                return self._web_refusal_turn(self.run_actions([a for a in safe if a not in restricted], phrase=text))
+                return self._web_refusal_turn(self.run_actions([a for a in safe if a not in restricted], phrase=text),
+                                              restricted)
         if not safe:
             if not confirm and not actions and claims_unperformed_action(text, response_text):
                 return Turn(PROMISE_FAIL_REPLY)  # «Открываю Safari» / «Тема включена» без единого действия
@@ -583,10 +713,13 @@ class AIClient:
             self._slow_said.set()
             self.on_slow_tool(SLOW_TOOL_REPLY)
 
-    def _web_refusal_turn(self, executed):
-        """Запрещённое действие после веб-данных: уже полученные данные + готовая фраза, без модели."""
+    def _web_refusal_turn(self, executed, restricted=()):
+        """Запрещённое действие после чужих данных: уже полученные данные + готовая фраза, без модели.
+        Про ссылку из поиска — прежняя фраза, про остальное — общая."""
         data = " ".join(r["speech"] for r in executed if r.get("ok") and r.get("web") and r.get("speech"))
-        return Turn(" ".join(p for p in [data, WEB_REFUSAL_REPLY] if p), results=executed)
+        legacy = all(a.get("name") in RESTRICTED_AFTER_WEB for a in restricted)   # память, ссылки, удаление, закрытие
+        return Turn(" ".join(p for p in [data, WEB_REFUSAL_REPLY if legacy else GENERIC_REFUSAL_REPLY] if p),
+                    results=executed)
 
     def _read_page(self, link_number=None, url=None, phrase=""):
         """read_page: по номеру сохранённой ссылки (1–5) или по адресу, который ЕСТЬ во фразе пользователя.
@@ -702,7 +835,12 @@ class AIClient:
             elif level == safety.CONFIRM and not confirmed:
                 message, short = f"⛔ Нужно подтверждение: {action} — {reason}", "нужно подтверждение"
             else:
-                if action["name"] in PAGE_ACTIONS:
+                tool = registry.get(action["name"])
+                if action["name"] in MORE_ACTIONS:
+                    func = self._more_tools
+                elif tool is not None:
+                    func = partial(tool.run, phrase=phrase)   # реестр: действие знает свою фразу (разбуди, «в Часах»)
+                elif action["name"] in PAGE_ACTIONS:
                     func = partial(self._read_page, phrase=phrase)
                 elif action["name"] in MEMORY_ACTIONS:
                     func = self._memory_action(action["name"], phrase, confirmed)

@@ -39,7 +39,9 @@ def describe_now(now=None):
 
 
 def now_line(now=None):
-    return f"Сейчас {describe_now(now)}.\n"
+    """«Сейчас: вторник, 27 октября 2026 года, 14:51 (2026-10-27 14:51).» — ISO для расчёта дат в инструментах."""
+    now = now or datetime.now().astimezone()
+    return f"Сейчас: {describe_now(now)} ({now:%Y-%m-%d %H:%M}).\n"
 
 
 def _persona(name, memory_block):
@@ -64,6 +66,13 @@ JSON_FORMAT = (
     '- list_memory {}; forget_memory {"query": "кофе"}; clear_memory {}\n'
     '- web_search {"query": "..."}; get_weather {"city": "Душанбе"}; get_exchange_rate {"base": "USD", "target": "TJS"}\n'
     '- read_page {"link_number": 1} — страница из последнего поиска\n'
+    '- timer {"action": "start|status|cancel|list", "seconds": 300, "label": ""}; alarm {"action": "set|cancel|list", '
+    '"when": "ГГГГ-ММ-ДД ЧЧ:ММ", "label": ""}\n'
+    '- reminders {"action": "add|list|complete|delete", "title": "", "when": "", "list_name": ""}\n'
+    '- calendar {"action": "add|list_today|list_tomorrow|list_week|delete", "title": "", "start": "", "minutes": 60}\n'
+    '- notes {"action": "create|append|list_titles|read_last", "title": "", "text": ""}\n'
+    '- shortcuts {"action": "list|run", "name": "", "input": ""}; settings {"pane": "wifi|bluetooth|sound|display|battery|'
+    'notifications|focus|keyboard|privacy|accessibility|storage|general|network"}\n'
     '- system_info {"what": "battery|storage|memory|cpu|uptime|wifi|ip|macos|running_apps|frontmost_app"}\n'
     '- display {"action": "brightness_up|brightness_down|brightness_set|dark_mode_on|dark_mode_off|'
     'dark_mode_toggle|lock_screen|sleep_display|screenshot", "value": "яркость 0-100 или пусто"}\n'

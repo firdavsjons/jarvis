@@ -11,6 +11,7 @@ from core.cache import CACHE_FILE, CLEARED_REPLY, CommandCache, is_forget_cache_
 from core.history import FORGET_REPLY, is_forget_command
 from core.links import parse_link_command, parse_read_command
 from core.memory import MEMORY_FILE, UserMemory, is_clear_memory_command
+from core import scheduler as timers
 from core.journal import setup_journal
 from core.llm import build_default_client
 from core.logger import LOG_DIR, setup_logging
@@ -72,6 +73,11 @@ class VoiceApp:
         # «Секунду, ищу.» — из таймера, параллельно с медленным веб-инструментом
         self.ai.on_slow_tool = self.engine.speak
         self.mac = MacControl()
+        # Таймеры и будильники: фоновый планировщик; озвучка через общий замок SpeechEngine.speak
+        self.scheduler = timers.set_scheduler(timers.Scheduler(timers.TIMERS_FILE))
+        self.scheduler.on_fire = timers.make_fire_handler(self.engine.speak)
+        self.scheduler.on_missed = timers.make_missed_handler(self.engine.speak)
+        self.scheduler.start()
         self.is_listening = False
         self.stop_event = Event()
         self.listen_thread = None
