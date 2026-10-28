@@ -45,31 +45,37 @@ class TestSetting(unittest.TestCase):
         def setting(text):
             with patch("core.settings.ENV_FILE", env_file(text)):
                 return tg.paste_method_setting()
-        self.assertEqual(setting(""), ("keystroke", None))
+        self.assertEqual(setting(""), ("keycode", None))
         self.assertEqual(setting("TELEGRAM_PASTE_METHOD=menu\n"), ("menu", None))
         self.assertEqual(setting("TELEGRAM_PASTE_METHOD= KeyCode \n"), ("keycode", None))
         self.assertEqual(setting("TELEGRAM_PASTE_METHOD=keystroke\n"), ("keystroke", None))
         for bad in ("type", "click", "мусор", "key code"):
-            self.assertEqual(setting(f"TELEGRAM_PASTE_METHOD={bad}\n"), ("keystroke", bad))
+            self.assertEqual(setting(f"TELEGRAM_PASTE_METHOD={bad}\n"), ("keycode", bad))
 
-    def test_unsupported_warns_and_uses_keystroke(self):
+    def test_unsupported_warns_and_uses_keycode(self):
         with patch("core.settings.ENV_FILE", env_file("TELEGRAM_PASTE_METHOD=click\n")):
             with self.assertLogs("core.apps.telegram", level="WARNING") as logs:
-                self.assertEqual(tg.paste_method(), "keystroke")
+                self.assertEqual(tg.paste_method(), "keycode")
         self.assertIn("TELEGRAM_PASTE_METHOD=click не поддерживается", logs.output[0])
 
     def test_env_example(self):
         text = Path(__file__).with_name(".env.example").read_text(encoding="utf-8")
-        self.assertIn("TELEGRAM_PASTE_METHOD=keystroke", text)
+        self.assertIn("TELEGRAM_PASTE_METHOD=keycode", text)
 
 
 class TestMethodsInPhase1(PasteCase):
-    def test_default_is_keystroke_without_menu_reads(self):
+    def test_default_is_keycode_without_menu_reads(self):
         self.ask()
         names = self.mac.names()
-        self.assertEqual(names.count("paste"), 1)
-        for forbidden in ("paste_keycode", "menu_bar", "menu_items", "menu_enabled", "menu_click"):
+        self.assertEqual(names.count("paste_keycode"), 1)
+        for forbidden in ("paste", "menu_bar", "menu_items", "menu_enabled", "menu_click"):
             self.assertNotIn(forbidden, names)
+
+    def test_keystroke_is_still_available(self):
+        self.ask("keystroke")
+        names = self.mac.names()
+        self.assertEqual(names.count("paste"), 1)
+        self.assertNotIn("paste_keycode", names)
 
     def test_keycode(self):
         self.ask("keycode")
@@ -219,7 +225,7 @@ class TestBufferCheck(PasteCase):
     def test_match_is_checked_after_focus_and_before_paste(self):
         self.ask()
         names = self.mac.names()
-        self.assertEqual(names[names.index("pbcopy"):names.index("pbcopy") + 4], ["pbcopy", "front", "pbpaste", "paste"])
+        self.assertEqual(names[names.index("pbcopy"):names.index("pbcopy") + 4], ["pbcopy", "front", "pbpaste", "paste_keycode"])
 
     def test_check_covers_text_difference_not_only_length(self):
         class Altered(FakeMac):

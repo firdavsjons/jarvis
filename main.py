@@ -18,6 +18,7 @@ from core.journal import loggable_action, loggable_phrase, setup_journal
 from core.llm import build_default_client
 from core.logger import LOG_DIR, setup_logging
 from core.speech_text import confirmation_question
+from core.stt.truncated import TRUNCATED_REPLY, is_truncated
 from modules.mac_control import MacControl
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class VoiceApp:
         self.stop_btn.pack(pady=5)
 
         self.engine = SpeechEngine()
+        self.engine.start_stt()   # локальная модель распознавания грузится в фоне; пока не готова — Google или просьба подождать
         self.ai = AIClient(llm=build_default_client(usage_path=LOG_DIR / "llm_usage.json"),
                            memory=UserMemory(MEMORY_FILE), cache=CommandCache(CACHE_FILE))
         # «Секунду, ищу.» — из таймера, параллельно с медленным веб-инструментом
@@ -242,6 +244,13 @@ class VoiceApp:
             self.ai.close_message_dialog()
             return
 
+        # Обрезанная фраза («позвонить ма», «напиши себе в»): модель не спрашиваем, она бы догадалась за пользователя
+        if source == "voice" and is_truncated(text):
+            log.info("Отброшено (обрезанная фраза)")
+            self.engine.speak(TRUNCATED_REPLY)
+            self.set_idle_status()
+            return
+
         # «да» / «нет» / «отмена» без ожидающего действия: нечего подтверждать (не модели и не инструментам). Если
         # ассистент только что задал вопрос («Поставить внутренний будильник?»), фраза — ответ на него и идёт дальше
         nothing = self.ai.bare_confirmation_reply(text)
@@ -359,17 +368,22 @@ class VoiceApp:
             if self.stop_event.is_set():
                 break
             if not text:
+                self.engine.flush_notices()     # «Не удалось распознать речь», «Распознавание загружается…»
                 continue
             if self.engine.speech_overlaps(started):
                 # Во время записи ассистент заговорил — микрофон мог услышать его самого
                 log.info("Отброшено (ассистент говорил во время записи): %s", loggable_phrase(text))
+                self.engine.flush_notices()
                 continue
 
             if self.engine.is_echo(text):
                 # Микрофон услышал саму речь ассистента (его вопрос подтверждения, ответ): не команда
                 log.info("Отброшено (эхо ассистента)")
+                self.engine.flush_notices()
                 continue
 
+            # Оповещения распознавания (один раз за запуск) звучат после проверок: иначе сама фраза была бы отброшена
+            self.engine.flush_notices()
             self.process_command(text, source="voice")
         log.info("Цикл прослушивания остановлен")
 

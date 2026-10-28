@@ -333,7 +333,7 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(confirmation_question(turn.pending), "Отправить Мама сообщение: «привет»?")
         names = self.mac.names()
         # чат открывается по ссылке дважды подряд (диагностика: фокус в поле ставит второе открытие)
-        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "pbpaste", "paste", "pbcopy"])
+        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "pbpaste", "paste_keycode", "pbcopy"])
         self.assertNotIn("enter", names)                                     # до «да» Enter не нажат
         events = [e for e in self.mac.events if e[0] != "sleep"]
         self.assertEqual(events[2], ("open", "tg://resolve?domain=mama_user"))
@@ -363,7 +363,7 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(self.mac.events[-1], ("pbcopy", ""))
 
     def test_clipboard_restored_when_paste_fails(self):
-        self.mac.fail_on = {"paste": "osascript is not allowed to send keystrokes. (1002)"}
+        self.mac.fail_on = {"paste_keycode": "osascript is not allowed to send keystrokes. (1002)"}
         client, turn = self.ask()
         self.assertEqual(turn.pending, [])
         self.assertIn("Универсальный доступ", turn.speech)
@@ -378,7 +378,7 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(turn.pending, [])
         self.assertIn("Telegram не открылся", turn.speech)
         self.assertEqual(self.mac.pasteboard, "старый буфер")
-        self.assertNotIn("paste", self.mac.names())
+        self.assertNotIn("paste_keycode", self.mac.names())
 
     def test_clipboard_restored_when_open_fails(self):
         self.mac.fail_on = {"open": "Unable to find application"}
@@ -403,7 +403,7 @@ class TestTwoPhaseSend(TelegramCase):
                  "(-1743)": "Автоматизация, System Events"}
         for code, section in cases.items():
             with self.subTest(code=code):
-                self.mac = FakeMac(fail_on={"paste": f"Not authorized {code}"})
+                self.mac = FakeMac(fail_on={"paste_keycode": f"Not authorized {code}"})
                 tg._state = None
                 client, turn = self.ask()
                 self.assertIn(section, turn.speech)
@@ -491,7 +491,7 @@ class TestTwoPhaseSend(TelegramCase):
                                          self.send_call(to="Анна", text="привет", call_id="b")))
         turn = client.respond("напиши маме и Анне в телеграм привет")
         self.assertEqual(len(turn.pending), 1)
-        self.assertEqual(self.mac.names().count("paste"), 1)
+        self.assertEqual(self.mac.names().count("paste_keycode"), 1)
         self.assertIn("только одно", turn.speech)
 
     def test_refusals_happen_before_anything_is_touched(self):

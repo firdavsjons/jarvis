@@ -85,8 +85,8 @@ class TestOrderAndLayout(CheckCase):
         self.assertEqual(code, 0)
         positions = [text.index(f"Вариант {v}:") for v in ("Е", "З1", "А", "Б", "Ж", "З2", "Д", "Г", "В", "И")]
         self.assertEqual(positions, sorted(positions))
-        # Cmd+V по порядку вариантов: З1 (key code 9), А, Б, Ж (keystroke), З2 (меню), Д, Г, В
-        self.assertEqual(self.pastes(), ["paste_keycode", "paste", "paste", "paste", "menu_click", "paste", "paste", "paste"])
+        # Cmd+V по порядку вариантов: З1 (key code 9), А и Б (боевой путь, умолчание keycode), Ж (keystroke), З2 (меню), Д, Г, В (keystroke)
+        self.assertEqual(self.pastes(), ["paste_keycode", "paste_keycode", "paste_keycode", "paste", "menu_click", "paste", "paste", "paste"])
 
     def test_clipboard_check_runs_before_any_paste_and_asks_nothing(self):
         user = User(verdicts=SAFE_ALL_NO + ["н", "н"], confirms=["д", "д"])
@@ -359,7 +359,7 @@ class TestConclusions(CheckCase):
         self.assertNotIn("    TELEGRAM_FOCUS_MODE=", text)
 
     def test_errors_do_not_count_as_no(self):
-        self.mac.fail_on = {"paste": "not allowed to send keystrokes (1002)"}
+        self.mac.fail_on = {"paste": "not allowed to send keystrokes (1002)", "paste_keycode": "not allowed to send keystrokes (1002)"}
         code, text, user = self.run_check(User(), "--only", "А,Б")
         self.assertEqual(sum("Появился ли текст" in q for q in user.questions), 0)
         self.assertNotIn("Опишите, пожалуйста", text)                        # ошибка прав — не «ничего не сработало»

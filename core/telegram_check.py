@@ -665,7 +665,7 @@ def main(argv=None, input_fn=input, out=sys.stdout):
     if unsupported is not None:
         report.say(f"  (TELEGRAM_FOCUS_MODE={unsupported} не поддерживается — боевой код использует reopen)")
     if tg.paste_method_setting()[1] is not None:
-        report.say(f"  (TELEGRAM_PASTE_METHOD={tg.paste_method_setting()[1]} не поддерживается — боевой код использует keystroke)")
+        report.say(f"  (TELEGRAM_PASTE_METHOD={tg.paste_method_setting()[1]} не поддерживается — боевой код использует {tg.DEFAULT_PASTE_METHOD})")
     report.say(f"В чат «{args.to}» вставляется только фиксированный тест: «{TEST_TEXT}»"
                + (f" (и «{ASCII_TEXT}» в варианте Ж)." if only is not None else ".") + "\n")
 

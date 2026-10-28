@@ -37,7 +37,7 @@ class TestPhase1Logging(TelegramCase):
         with self.assertLogs("core.apps.telegram", level="INFO") as logs:
             client, turn = self.ask(text=text, phrase=f"напиши маме в телеграм {text}")
         joined = "\n".join(logs.output)
-        for expected in ("чат «мама» открыт по ссылке", "на переднем плане с окном — да, ждали", "вставка нажата (способ keystroke), длина текста 20",
+        for expected in ("чат «мама» открыт по ссылке", "на переднем плане с окном — да, ждали", "вставка нажата (способ keycode), длина текста 20",
                          "после вставки ждали 1.0 с", "прежний буфер обмена возвращён"):
             self.assertIn(expected, joined)
         self.assertNotIn(text, joined)
@@ -51,7 +51,7 @@ class TestPhase1Logging(TelegramCase):
             client, turn = self.ask()
         self.assertEqual(turn.pending, [])
         self.assertEqual(turn.speech, "Не получилось: Telegram не в фокусе.")
-        self.assertNotIn("paste", self.mac.names())                        # Cmd+V не нажат
+        self.assertNotIn("paste_keycode", self.mac.names())                # Cmd+V не нажат
         self.assertNotIn("enter", self.mac.names())
         self.assertEqual(self.mac.pasteboard, "старый буфер")              # буфер возвращён
         self.assertIn("Telegram: перед вставкой впереди другое приложение", "\n".join(logs.output))
@@ -65,7 +65,7 @@ class TestPhase1Logging(TelegramCase):
     def test_buffer_restored_only_after_the_wait(self):
         self.ask()
         events = self.mac.events
-        paste = events.index(("paste",))
+        paste = events.index(("paste_keycode",))
         self.assertEqual(events[paste + 1], ("sleep", 1.0))                 # TELEGRAM_PASTE_WAIT
         self.assertEqual(events[paste + 2], ("pbcopy", "старый буфер"))     # и только потом возврат прежнего буфера
 
@@ -73,7 +73,7 @@ class TestPhase1Logging(TelegramCase):
         with patch("core.apps.telegram.paste_wait", return_value=0.3):
             self.ask()
         events = self.mac.events
-        self.assertEqual(events[events.index(("paste",)) + 1], ("sleep", 0.3))
+        self.assertEqual(events[events.index(("paste_keycode",)) + 1], ("sleep", 0.3))
 
     def test_buffer_restored_even_if_wait_is_interrupted(self):
         self.mac.sleep = lambda s: (_ for _ in ()).throw(RuntimeError("прервано")) if s == 1.0 else None

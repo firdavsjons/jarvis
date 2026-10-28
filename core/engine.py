@@ -11,12 +11,15 @@ import speech_recognition as sr
 from core import journal
 from core.settings import env_float
 from core.speech_text import prepare_for_speech
+from core.stt.base import Audio
+from core.stt.factory import build_stt
 
 log = logging.getLogger(__name__)
 
 PREFERRED_VOICE = "Milena"
 DEFAULT_SPEECH_PAUSE = 1.2
 DEFAULT_TAIL_PAUSE = 0.8      # SPEECH_TAIL_PAUSE: пауза после озвучки перед прослушиванием
+DEFAULT_PHRASE_LIMIT = 20     # SPEECH_PHRASE_LIMIT: самая длинная фраза, секунд (раньше 5)
 ECHO_RATIO = 0.75             # фраза похожа на недавнюю речь ассистента (difflib)
 ECHO_SHARE = 0.6              # или столько слов фразы (от 3 слов) есть в ней
 ECHO_PHRASES = 3              # сколько последних озвученных фраз помним
@@ -32,6 +35,11 @@ def speech_pause():
 def speech_tail_pause():
     """SPEECH_TAIL_PAUSE из .env (0–5 с): после речи ассистента микрофон ещё секунду слышит хвост и комнату."""
     return env_float("SPEECH_TAIL_PAUSE", DEFAULT_TAIL_PAUSE, 0.0, 5.0)
+
+
+def speech_phrase_limit():
+    """SPEECH_PHRASE_LIMIT из .env (3–60 с): запись фразы обрывается через столько секунд, даже если пауза не наступила."""
+    return env_float("SPEECH_PHRASE_LIMIT", DEFAULT_PHRASE_LIMIT, 3.0, 60.0)
 
 
 def pick_voice(say_voices_output):
@@ -73,6 +81,7 @@ class SpeechEngine:
         # Пауза, после которой фраза считается законченной: 1.2 с, чтобы не обрезать на середине
         self.recognizer.pause_threshold = speech_pause()
         self.microphone = sr.Microphone()
+        self.phrase_limit = speech_phrase_limit()
 
         self.voice = _detect_voice()
         log.info("Голос озвучки: %s", self.voice or "системный по умолчанию")
@@ -84,6 +93,21 @@ class SpeechEngine:
         self.speaking = threading.Event()
         self.tail_pause = speech_tail_pause()
         self.recent_spoken = deque(maxlen=ECHO_PHRASES)   # последние озвученные фразы — для фильтра эха
+        # Распознавание речи (core/stt): модель не грузится, пока не вызван start_stt(). Голосовые оповещения движка
+        # («не установлено, использую Google») откладываются до flush_notices(): озвученные внутри listen(), они
+        # заставили бы цикл отбросить саму фразу как «ассистент говорил во время записи»
+        self.notices = []
+        self.stt = build_stt(self.recognizer, notify=self.notices.append)
+
+    def flush_notices(self):
+        """Озвучивает накопленные оповещения распознавания; вызывает цикл прослушивания после проверок фразы."""
+        notices, self.notices[:] = list(self.notices), []
+        for text in notices:
+            self.speak(text)
+
+    def start_stt(self):
+        """Запускает фоновую загрузку локальной модели (с Google модель не нужна)."""
+        self.stt.start()
 
     def speak(self, text):
         # В лог — исходный текст, в say — без ссылок, путей, Markdown и эмодзи
@@ -147,14 +171,19 @@ class SpeechEngine:
         with self.microphone as source:
             log.debug("🎤 Слушаю...")
             try:
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
-                text = self.recognizer.recognize_google(audio, language="ru-RU")
-                log.info("👤 Вы: %s", journal.loggable_phrase(text))
-                return text.lower()
+                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=self.phrase_limit)
             except sr.WaitTimeoutError:
-                return None
-            except sr.UnknownValueError:
                 return None
             except Exception as e:
                 log.error("Ошибка микрофона: %s", e)
                 return None
+        # Микрофон уже свободен: распознавание (до нескольких секунд) его не держит
+        try:
+            result = self.stt.recognize(Audio(audio))
+        except Exception as e:
+            log.error("Ошибка распознавания: %s", type(e).__name__)
+            return None
+        if result is None:
+            return None
+        log.info("👤 Вы: %s", journal.loggable_phrase(result.text))
+        return result.text.lower()

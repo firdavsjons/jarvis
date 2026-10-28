@@ -5,3 +5,7 @@ pyaudio
 httpx==0.28.1
 httpcore==1.0.9
 ddgs==9.16.1
+
+# Локальное распознавание речи (Этап 8.1). Не устанавливать без docs/stt.md: пакеты и модель ставятся вручную.
+# pywhispercpp==1.5.1      # основной движок whisper_cpp: whisper.cpp с Metal, ≈17 МБ вместе с numpy, requests, tqdm, platformdirs
+# faster-whisper==1.2.1    # запасной движок faster_whisper: на процессоре, ≈63 МБ

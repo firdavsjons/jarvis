@@ -87,7 +87,7 @@ class TestPhase1Reopen(ModeCase):
             URL, ("sleep", 1.0),                 # открыть ту же ссылку ещё раз (2/2) и подождать TELEGRAM_REOPEN_WAIT
             ("pbcopy", "привет"), ("front",),    # текст в буфер, Telegram впереди
             ("pbpaste",),                        # буфер принял текст (длина), без вывода текста
-            ("paste",), ("sleep", 1.0),          # Cmd+V, подождать TELEGRAM_PASTE_WAIT
+            ("paste_keycode",), ("sleep", 1.0),          # Cmd+V, подождать TELEGRAM_PASTE_WAIT
             ("pbcopy", OLD),                     # вернуть прежний буфер
         ])
 
@@ -103,16 +103,16 @@ class TestPhase1Reopen(ModeCase):
         self.assertEqual(len(turn.pending), 1)
         names = self.mac.names()
         self.assertNotIn("enter", names)
-        for forbidden in ("delete", "space", "click", "paste_keycode", "menu_click"):
+        for forbidden in ("delete", "space", "click", "paste", "menu_click"):
             self.assertNotIn(forbidden, names)
-        self.assertEqual(names.count("paste"), 1)                           # единственное нажатие клавиш — Cmd+V
+        self.assertEqual(names.count("paste_keycode"), 1)                           # единственное нажатие клавиш — Cmd+V
 
     def test_second_open_failure_is_reported_and_buffer_restored(self):
         self.mac.fail_open_number = 2
         client, turn = self.ask()
         self.assertEqual(turn.pending, [])
         self.assertEqual(turn.speech, "Не получилось: не удалось повторно открыть чат.")
-        self.assertNotIn("paste", self.mac.names())                         # Cmd+V не нажат
+        self.assertNotIn("paste_keycode", self.mac.names())                         # Cmd+V не нажат
         self.assertNotIn("enter", self.mac.names())
         self.assertEqual(self.mac.events[-1], ("pbcopy", OLD))              # буфер возвращён
         self.assertEqual(self.mac.pasteboard, OLD)
@@ -137,7 +137,7 @@ class TestPhase1Reopen(ModeCase):
         self.mac.front = "com.apple.Safari"
         client, turn = self.ask()
         self.assertEqual(turn.speech, "Не получилось: Telegram не в фокусе.")
-        self.assertNotIn("paste", self.mac.names())
+        self.assertNotIn("paste_keycode", self.mac.names())
         self.assertEqual(self.mac.pasteboard, OLD)
 
     def test_log_steps_without_text(self):
@@ -146,7 +146,7 @@ class TestPhase1Reopen(ModeCase):
         joined = "\n".join(logs.output)
         order = [joined.index(x) for x in ("чат «мама» открыт по ссылке (1/2)", "на переднем плане с окном — да, ждали",
                                            "повторное открытие (2/2)", "после повторного открытия ждали 1.0 с",
-                                           "буфер обмена принял текст, длина 6", "вставка нажата (способ keystroke), длина текста 6",
+                                           "буфер обмена принял текст, длина 6", "вставка нажата (способ keycode), длина текста 6",
                                            "после вставки ждали 1.0 с",
                                            "прежний буфер обмена возвращён")]
         self.assertEqual(order, sorted(order))
@@ -165,7 +165,7 @@ class TestPhase1Direct(ModeCase):
         self.ask()
         self.assertEqual(self.mac.events, [
             ("clipboard_info",), ("pbpaste",), URL, ("wait",), ("sleep", tg.PASTE_DELAY), ("pbcopy", "привет"),
-            ("front",), ("pbpaste",), ("paste",), ("sleep", 1.0), ("pbcopy", OLD)])
+            ("front",), ("pbpaste",), ("paste_keycode",), ("sleep", 1.0), ("pbcopy", OLD)])
         self.assertEqual(self.mac.names().count("open"), 1)
 
     def test_log_says_one_of_one(self):
@@ -298,7 +298,7 @@ class TestDiagnosticsUseProductionValues(CheckCase):
         names = self.mac.names()
         start = names.index("clipboard_info")
         self.assertEqual(names[start:], ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "pbpaste",
-                                         "paste", "pbcopy"])
+                                         "paste_keycode", "pbcopy"])
         self.mac = FakeMac()
         with patch("core.settings.ENV_FILE", env_file("TELEGRAM_FOCUS_MODE=direct\n")):
             self.run_check(User(verdicts=["н"]), "--only", "Б")
@@ -306,7 +306,7 @@ class TestDiagnosticsUseProductionValues(CheckCase):
 
     def test_variant_a_is_the_same_path_with_zero_wait(self):
         self.run_check(User(verdicts=["н"]), "--only", "А")
-        paste = self.mac.events.index(("paste",))
+        paste = self.mac.events.index(("paste_keycode",))
         self.assertEqual(self.mac.events[paste + 1:paste + 3], [("sleep", 0.0), ("pbcopy", OLD)])     # пауза 0, сразу
         self.assertEqual(self.mac.names().count("open"), 3)                # шаг 3 диагностики + 2 открытия боевого пути
 

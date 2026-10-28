@@ -7,6 +7,9 @@
    ~/Desktop, ~/Documents и ~/Downloads бросают ForbiddenInTests. Пути данных приложения (DATA_DIR, MEMORY_FILE,
    CACHE_FILE, TIMERS_FILE, SHORTCUTS_FILE, LOG_DIR) заменены на временную папку, поэтому код, который пишет «по
    умолчанию», пишет туда, а не к пользователю.
+3. Распознавание речи (Этап 8.1): загрузка настоящей модели Whisper (`_import_backend` в core/stt/whisper_cpp.py и
+   core/stt/faster.py) и `Recognizer.recognize_google` (звук в интернет) бросают ForbiddenInTests, пока тест не подменил их
+   фальшивкой. Микрофон тесты не открывают (`sr.Microphone` подменяется).
 Исключений (osacompile, py_compile) сейчас нет: тестам они не нужны. Если понадобятся — отдельным явным
 разрешением здесь, а не ослаблением защиты.
 
@@ -28,6 +31,7 @@ class ForbiddenInTests(BaseException):
 
 
 VIOLATIONS = []
+REAL_IMPORT_BACKEND = {}   # настоящие core.stt.*._import_backend: тест вызывает их только с подменённым importlib
 SUBPROCESS_MESSAGE = "настоящий запуск запрещён в тестах: подмените {name} моком (patch)"
 
 HOME = Path.home()
@@ -166,6 +170,16 @@ def install():
     for name in ("replace", "rename"):
         setattr(os, name, two_paths(name))
     _redirect_app_paths()
+    _block_speech_recognition()
+
+
+def _block_speech_recognition():
+    import speech_recognition as sr
+    from core.stt import faster, whisper_cpp
+    for module in (faster, whisper_cpp):
+        REAL_IMPORT_BACKEND[module.__name__] = module._import_backend     # чтобы проверить сообщение «пакет не установлен»
+        module._import_backend = _blocked_call(f"{module.__name__}._import_backend (загрузка модели Whisper)")
+    sr.Recognizer.recognize_google = _blocked_call("recognize_google (звук ушёл бы в интернет)")
 
 
 install()

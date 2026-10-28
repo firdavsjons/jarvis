@@ -141,6 +141,19 @@ class TestLoop(unittest.TestCase):
         main.VoiceApp.background_loop(app)
         app.process_command.assert_called_once_with("поставь таймер на пять минут", source="voice")
 
+    def test_notices_flushed_after_checks_and_before_command(self):
+        app = self.make_app(["открой сафари"], echo=(False,))
+        order = []
+        app.engine.flush_notices.side_effect = lambda: order.append("notices")
+        app.process_command.side_effect = lambda *a, **k: order.append("command")
+        main.VoiceApp.background_loop(app)
+        self.assertEqual(order[:2], ["notices", "command"])
+
+    def test_notices_flushed_when_nothing_was_recognized(self):
+        app = self.make_app([None, "привет"])
+        main.VoiceApp.background_loop(app)
+        self.assertGreaterEqual(app.engine.flush_notices.call_count, 1)
+
     def test_answers_reach_command_processing(self):
         app = self.make_app(["да"], echo=(False,))
         main.VoiceApp.background_loop(app)

@@ -72,7 +72,7 @@ def reopen_wait():
 
 
 PASTE_METHODS = ("keystroke", "keycode", "menu")
-DEFAULT_PASTE_METHOD = "keystroke"
+DEFAULT_PASTE_METHOD = "keycode"
 EDIT_MENUS = {"правка", "изменить", "edit"}      # как называется меню «Правка» в разных локализациях Telegram
 PASTE_ITEMS = {"вставить", "paste"}              # пункт меню (точное совпадение: «Вставить и согласовать стиль» не подходит)
 MENU_RECHECK_DELAY = 0.5                          # пункт «Вставить» серый — перед отказом прочитать его ещё раз
@@ -90,12 +90,12 @@ def paste_method_setting():
 
 
 def paste_method():
-    """TELEGRAM_PASTE_METHOD: keystroke (по умолчанию, `keystroke "v"`), keycode (`key code 9`, физическая клавиша V) или
-    menu (меню «Правка / Изменить → Вставить»). Другое значение — keystroke и предупреждение."""
+    """TELEGRAM_PASTE_METHOD: keycode (по умолчанию, `key code 9`, физическая клавиша V: диагностика 3 из 3), keystroke
+    (`keystroke "v"`, 2 из 3) или menu (меню «Правка / Изменить → Вставить», 3 из 3). Другое значение — keycode и предупреждение."""
     method, unsupported = paste_method_setting()
     if unsupported is not None:
-        log.warning("TELEGRAM_PASTE_METHOD=%s не поддерживается (допустимо keystroke, keycode, menu), использую keystroke",
-                    unsupported)
+        log.warning("TELEGRAM_PASTE_METHOD=%s не поддерживается (допустимо keystroke, keycode, menu), использую %s",
+                    unsupported, DEFAULT_PASTE_METHOD)
     return method
 
 

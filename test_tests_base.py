@@ -194,6 +194,35 @@ class TestAppPathsRedirected(BaseCase):
         self.assertEqual(real.stat().st_mtime_ns if real.exists() else None, before)
 
 
+class TestSpeechRecognitionIsGuarded(BaseCase):
+    """Этап 8.1: настоящая модель Whisper и звук в Google в тестах запрещены."""
+
+    def test_loading_a_real_model_raises(self):
+        from core.stt import faster, whisper_cpp
+        for module in (whisper_cpp, faster):
+            with self.subTest(module=module.__name__), self.assertRaises(ForbiddenInTests) as ctx:
+                module._import_backend()
+            self.assertIn("загрузка модели Whisper", str(ctx.exception))
+
+    def test_recognize_google_raises(self):
+        import speech_recognition as sr
+        with self.assertRaises(ForbiddenInTests) as ctx:
+            sr.Recognizer().recognize_google(None, language="ru-RU")
+        self.assertIn("звук ушёл бы в интернет", str(ctx.exception))
+
+    def test_load_error_in_engine_is_not_swallowed(self):
+        """Загрузчик модели ловит Exception, но не BaseException: нарушение защиты не превращается в «недоступно»."""
+        from core.stt.whisper_cpp import WhisperCppEngine
+        engine = WhisperCppEngine(models_dir=TEMP_ROOT, unload_minutes=0)
+        with self.assertRaises(ForbiddenInTests):
+            engine.ensure_loaded()
+
+    def test_patched_backend_is_allowed(self):
+        from core.stt import whisper_cpp
+        with patch("core.stt.whisper_cpp._import_backend", return_value="фальшивка"):
+            self.assertEqual(whisper_cpp._import_backend(), "фальшивка")
+
+
 class TestEveryTestFileIsProtected(unittest.TestCase):
     def test_all_test_files_import_tests_base(self):
         files = sorted(ROOT.glob("test_*.py")) + [ROOT / "verify_local_ai.py"]
