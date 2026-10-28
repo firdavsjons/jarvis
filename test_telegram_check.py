@@ -340,8 +340,8 @@ class TestConclusions(CheckCase):
             with self.subTest(expected=expected):
                 self.mac = FakeMac()
                 code, text, _ = self.run_check(User(verdicts=answers, confirms=["д", "д"]), "--only", "Г,Д,В")
-                self.assertIn(f"TELEGRAM_FOCUS_MODE={expected}", text)
-                self.assertEqual(text.count("TELEGRAM_FOCUS_MODE="), 1)
+                self.assertIn(f"    TELEGRAM_FOCUS_MODE={expected}", text)               # строка в списке для .env
+                self.assertEqual(text.count("    TELEGRAM_FOCUS_MODE="), 1)
 
     def test_nothing_worked_gives_request_and_three_checks(self):
         code, text, _ = self.run_check(User(verdicts=SAFE_ALL_NO + ["н", "н"], confirms=["д", "д"], manual=["н"]))
@@ -351,7 +351,7 @@ class TestConclusions(CheckCase):
         self.assertIn("курсор", text)
         for number in ("1)", "2)", "3)"):
             self.assertIn(number, text)
-        self.assertNotIn("TELEGRAM_FOCUS_MODE", text)
+        self.assertNotIn("    TELEGRAM_FOCUS_MODE=", text)
 
     def test_errors_do_not_count_as_no(self):
         self.mac.fail_on = {"paste": "not allowed to send keystrokes (1002)"}
@@ -538,7 +538,9 @@ class TestScripts(unittest.TestCase):
 class TestProductionUntouched(unittest.TestCase):
     def test_production_telegram_code_does_not_use_diagnostic_modes(self):
         source = open(tg.__file__, encoding="utf-8").read()
-        for name in ("TELEGRAM_FOCUS_MODE", "TELEGRAM_PASTE_METHOD", "TELEGRAM_CLIPBOARD_METHOD", "key code 9",
+        # режимы reopen и direct боевые; type, click, key code 9, меню и клик из диагностики в боевой код не подключены
+        self.assertEqual(tg.FOCUS_MODES, ("reopen", "direct"))
+        for name in ("TELEGRAM_PASTE_METHOD", "TELEGRAM_CLIPBOARD_METHOD", "key code 9",
                      "click at", "key code 51", "import core.telegram_check", "from core import telegram_check"):
             self.assertNotIn(name, source)
 

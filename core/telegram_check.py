@@ -7,7 +7,7 @@
 Порядок: раскладка → разрешения → контакт → открыть чат → варианты
   Е  проверка буфера (AppleScript и pbcopy), без вопроса;
   З1 Cmd+V по физической клавише (key code 9, не зависит от раскладки);
-  А  буфер возвращается сразу после Cmd+V;      Б  через 1,0 с (так делает боевой код);
+  А  боевой путь (режим и паузы из .env), буфер возвращается сразу;  Б  боевой способ целиком (значения из .env);
   Ж  латиница «jarvis test», порядок шагов как в Б;
   З2 меню «Правка → Вставить»;                   Д  чат по ссылке открывается второй раз, пауза 1,0 с, Cmd+V;
   Г  (рискованный) пробел, Delete, Cmd+V;        В  (рискованный) один клик в поле ввода, Cmd+V;
@@ -381,7 +381,8 @@ def analyse(results, clipboard):
                             ("В", "click", "помог клик в поле ввода")):
         if results.get(vid) is True:
             lines.append(f"Фокус: сработал вариант {vid} ({text}).")
-            env.append(f"TELEGRAM_FOCUS_MODE={mode}")
+            env.append(f"TELEGRAM_FOCUS_MODE={mode}" + ("" if mode in tg.FOCUS_MODES else
+                                                       "   # боевой код пока поддерживает только reopen и direct"))
             break
     for vid in RISKY_VARIANTS:
         if results.get(vid) == "skip-safe":
@@ -467,6 +468,11 @@ def main(argv=None, input_fn=input, out=sys.stdout):
     report.say("Диагностика вставки черновика в Telegram. Enter в Telegram не нажимается.")
     report.say(f"Раскладка сейчас: {layout}")
     report.say(LAYOUT_WARNING)
+    mode, unsupported = tg.focus_mode_setting()
+    report.say(f"Боевой режим из .env: TELEGRAM_FOCUS_MODE={mode}, TELEGRAM_REOPEN_WAIT={tg.reopen_wait():.1f}, "
+               f"TELEGRAM_PASTE_WAIT={tg.paste_wait():.1f}")
+    if unsupported is not None:
+        report.say(f"  (TELEGRAM_FOCUS_MODE={unsupported} не поддерживается — боевой код использует reopen)")
     report.say(f"В чат «{args.to}» вставляется только фиксированный тест: «{TEST_TEXT}» (и «{ASCII_TEXT}» в варианте Ж).\n")
 
     report.say("1. Разрешения macOS")
@@ -502,9 +508,10 @@ def main(argv=None, input_fn=input, out=sys.stdout):
         clipboard = check_clipboard(ctx)
     plan = (
         ("З1", "Cmd+V по физической клавише (key code 9)", lambda: _flow(ctx, TEST_TEXT, ONE_WAIT, paste=_paste_keycode), None),
-        ("А", "буфер возвращается сразу после Cmd+V", lambda: tg.paste_draft(client, contact, TEST_TEXT, 0.0), None),
-        ("Б", f"буфер возвращается через {ONE_WAIT:.1f} с после Cmd+V (боевой способ)",
-         lambda: tg.paste_draft(client, contact, TEST_TEXT, ONE_WAIT), None),
+        ("А", "боевой путь (режим и паузы из .env), но буфер возвращается сразу после Cmd+V",
+         lambda: tg.paste_draft(client, contact, TEST_TEXT, 0.0), None),
+        ("Б", "боевой способ: режим и паузы из .env (TELEGRAM_FOCUS_MODE, TELEGRAM_REOPEN_WAIT, TELEGRAM_PASTE_WAIT)",
+         lambda: tg.paste_draft(client, contact, TEST_TEXT, tg.paste_wait()), None),
         ("Ж", "латиница «jarvis test», порядок шагов как в Б", lambda: _flow(ctx, ASCII_TEXT, ONE_WAIT), None),
         ("З2", "меню «Правка → Вставить»", lambda: _flow(ctx, TEST_TEXT, ONE_WAIT, paste=_paste_menu), None),
         ("Д", "чат открывается по ссылке второй раз, пауза 1,0 с, потом Cmd+V",

@@ -21,7 +21,7 @@ from core.apps import common
 from core.apps.registry import CONFIRM, SAFE, AppTool, words_of
 from core.errors import ActionError
 from core.memory import contains_secret
-from core.settings import env_float
+from core.settings import env_float, env_value
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +38,37 @@ WINDOW_WAIT_TENTHS = 50     # ждать окно Telegram до 5 секунд
 PASTE_DELAY = 0.6           # чат успевает загрузиться и получить фокус
 DEFAULT_PASTE_WAIT = 1.0    # TELEGRAM_PASTE_WAIT из .env: сколько ждать после Cmd+V, прежде чем вернуть буфер
 BEFORE_ENTER_DELAY = 0.4
+
+
+FOCUS_MODES = ("reopen", "direct")
+DEFAULT_FOCUS_MODE = "reopen"
+DEFAULT_REOPEN_WAIT = 1.0   # TELEGRAM_REOPEN_WAIT из .env: пауза после повторного открытия чата
+NOT_OPENED = ("Telegram не открылся за 5 с", "Telegram не открылся")
+
+
+def focus_mode_setting():
+    """(режим, значение из .env, если оно не поддерживается). Диагностика покажет: по умолчанию reopen."""
+    raw = env_value("TELEGRAM_FOCUS_MODE")
+    if raw is None:
+        return DEFAULT_FOCUS_MODE, None
+    mode = raw.strip().lower()
+    if mode in FOCUS_MODES:
+        return mode, None
+    return DEFAULT_FOCUS_MODE, raw
+
+
+def focus_mode():
+    """TELEGRAM_FOCUS_MODE: reopen (по умолчанию — чат открывается по ссылке дважды подряд, и только второе открытие
+    ставит курсор в поле ввода) или direct (прежнее поведение). Другое значение (type, click, опечатка) — reopen."""
+    mode, unsupported = focus_mode_setting()
+    if unsupported is not None:
+        log.warning("TELEGRAM_FOCUS_MODE=%s не поддерживается (допустимо reopen и direct), использую reopen", unsupported)
+    return mode
+
+
+def reopen_wait():
+    """Пауза после повторного открытия чата (0–5 с): фокус успевает встать в поле ввода."""
+    return env_float("TELEGRAM_REOPEN_WAIT", DEFAULT_REOPEN_WAIT, 0.0, 5.0)
 
 
 def paste_wait():
@@ -270,18 +301,36 @@ def _question(contact, text):
 
 # --- Фаза 1 ---
 
-def paste_draft(client, contact, text, wait):
-    """Черновик в поле ввода: открыть чат, дождаться Telegram впереди, проверить фокус, положить текст в буфер,
-    Cmd+V, подождать wait секунд. Буфер возвращает вызывающий (после этой паузы). Каждый шаг — в лог без текста.
-    Telegram не впереди в момент Cmd+V — клавиша не нажимается."""
+def _open_for_input(client, contact, mode, pause, not_ready=NOT_OPENED):
+    """Открыть чат так, чтобы курсор встал в поле ввода. reopen: ссылка (1/2), Telegram впереди с окном (до 5 с), та же
+    ссылка ещё раз (2/2), пауза pause — диагностика показала, что фокус в поле ставит именно повторное открытие.
+    direct: одна ссылка, ожидание окна, короткая пауза. Каждый шаг — в лог без текста. Клавиши здесь не нажимаются."""
+    total = 2 if mode == "reopen" else 1
     _open_chat(client, contact)
-    log.info("Telegram: чат «%s» открыт по ссылке", contact.key)
+    log.info("Telegram: чат «%s» открыт по ссылке (1/%d)", contact.key, total)
     started = time.monotonic()
     ready = _wait_window(client)
     log.info("Telegram: на переднем плане с окном — %s, ждали %.1f с", "да" if ready else "нет", time.monotonic() - started)
     if not ready:
-        raise ActionError("Telegram не открылся за 5 с", "Telegram не открылся")
-    time.sleep(PASTE_DELAY)
+        raise ActionError(*not_ready)
+    if mode == "reopen":
+        try:
+            _open_chat(client, contact)
+        except ActionError as e:
+            raise ActionError(f"повторное открытие чата: {e}", "не удалось повторно открыть чат")
+        log.info("Telegram: повторное открытие (2/2)")
+        time.sleep(pause)
+        log.info("Telegram: после повторного открытия ждали %.1f с", pause)
+    else:
+        time.sleep(PASTE_DELAY)
+
+
+def paste_draft(client, contact, text, wait, mode=None, pause=None):
+    """Черновик в поле ввода: открыть чат (см. _open_for_input; режим и паузы из .env), положить текст в буфер,
+    проверить, что Telegram впереди, Cmd+V, подождать wait секунд. Буфер возвращает вызывающий (после этой паузы).
+    Telegram не впереди в момент Cmd+V — клавиша не нажимается."""
+    mode = mode or focus_mode()
+    _open_for_input(client, contact, mode, reopen_wait() if pause is None else pause)
     common.run_cmd(["pbcopy"], stdin=text, env=_utf8_env())
     front = _frontmost()
     if front != client:
@@ -344,10 +393,19 @@ def _send(to, text, phrase):
     contact = resolve_contact(to, phrase)
     state = _take_state(contact, common.clean_text(text, "текст", MAX_TEXT, multiline=True))
     client = state["client"]
-    _open_chat(client, contact)         # тот же чат ещё раз: за 20 с вы могли переключиться
-    if not _wait_window(client) or _frontmost() != client:
-        raise ActionError("Telegram не в фокусе перед отправкой, Enter не нажат", NOT_FOCUSED)
-    time.sleep(BEFORE_ENTER_DELAY)
+    not_focused = ("Telegram не в фокусе перед отправкой, Enter не нажат", NOT_FOCUSED)
+    mode = focus_mode()
+    if mode == "reopen":
+        # Та же двойная последовательность, что в фазе 1: за 20 с вы могли переключиться, а фокус в поле ставит
+        # именно второе открытие. Курсор в поле после неё проверить нельзя: поле пустое — Enter ничего не отправит.
+        _open_for_input(client, contact, mode, reopen_wait(), not_ready=not_focused)
+        if _frontmost() != client:
+            raise ActionError(*not_focused)
+    else:
+        _open_chat(client, contact)         # прежнее поведение: тот же чат ещё раз, проверка, короткая пауза
+        if not _wait_window(client) or _frontmost() != client:
+            raise ActionError(*not_focused)
+        time.sleep(BEFORE_ENTER_DELAY)
     common.osascript(SYSTEM_EVENTS, _ENTER)
     return common.done(f"Нажал отправку в чате с {contact.title}")
 

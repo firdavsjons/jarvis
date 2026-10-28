@@ -44,6 +44,8 @@ class FakeMac:
         self.menu_items = "Отменить, missing value, Вставить, Вставить и согласовать стиль"
         self.clip_as_ok = True
         self.pbpaste_mangle = False
+        self.fail_open_number = None      # сколько-то-й по счёту `open` завершится ошибкой (повторное открытие чата)
+        self.open_count = 0
         self.clipboard_info, self.front, self.window, self.fail_on = clipboard_info, front, window, fail_on or {}
 
     def names(self):
@@ -55,7 +57,10 @@ class FakeMac:
     def __call__(self, args, **kwargs):
         cmd = args[0]
         if cmd == "open":
+            self.open_count += 1
             self.events.append(("open", args[-1]))
+            if self.open_count == self.fail_open_number:
+                return completed("", 1, "LSOpen failed")
             return self.reply("open")
         if cmd == "defaults":
             self.events.append(("layout",))
@@ -312,17 +317,19 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(turn.pending[0]["preview"], "отправить Мама сообщение: «привет»")
         self.assertEqual(confirmation_question(turn.pending), "Отправить Мама сообщение: «привет»?")
         names = self.mac.names()
-        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "pbcopy", "front", "paste", "pbcopy"])
+        # чат открывается по ссылке дважды подряд (диагностика: фокус в поле ставит второе открытие)
+        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "paste", "pbcopy"])
         self.assertNotIn("enter", names)                                     # до «да» Enter не нажат
         events = [e for e in self.mac.events if e[0] != "sleep"]
         self.assertEqual(events[2], ("open", "tg://resolve?domain=mama_user"))
-        self.assertEqual(events[4], ("pbcopy", "привет"))                    # черновик через буфер обмена
+        self.assertEqual(events[4], ("open", "tg://resolve?domain=mama_user"))   # повторное открытие
+        self.assertEqual(events[5], ("pbcopy", "привет"))                    # черновик через буфер обмена
         before = len(self.mac.names())
         results = client.run_actions(turn.pending, phrase=self.PHRASE, confirmed=True)
         self.assertTrue(results[0]["ok"], results[0])
         self.assertEqual(results[0]["speech"], "Нажал отправку в чате с Мама.")
         phase2 = self.mac.names()[before:]
-        self.assertEqual(phase2, ["open", "wait", "front", "enter"])         # повторное открытие → фокус → Enter
+        self.assertEqual(phase2, ["open", "wait", "open", "front", "enter"])  # та же двойная последовательность → Enter
         self.assertEqual(self.mac.names().count("enter"), 1)
         self.assertEqual(self.mac.names().index("enter"), len(self.mac.names()) - 1)
 
@@ -447,7 +454,7 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(result["short"], "Telegram не в фокусе")
         self.assertNotIn("enter", self.mac.names())
         self.assertEqual(tg_summary([result]), "Не получилось: Telegram не в фокусе.")
-        self.assertEqual(self.mac.names()[-2:], ["wait", "front"])           # после повторного открытия ссылки
+        self.assertEqual(self.mac.names()[-2:], ["open", "front"])           # после повторного открытия ссылки
 
     def test_window_did_not_come_forward_before_enter(self):
         client, turn = self.ask()
