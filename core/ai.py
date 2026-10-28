@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from core import durations, installed_apps, journal, prompts, safety, topics, web
 from core.apps import registry
+from core.apps import resolve_app
 from core.cache import cacheable_actions
 from core.errors import ActionError, Done
 from core.fragments import FRAGMENT_REPLY, NOTHING_TO_CONFIRM, asks_question, is_bare_confirmation, is_fragment
@@ -33,6 +34,8 @@ TOO_MANY_ROUNDS_REPLY = "Не получилось завершить запро
 AI_ERROR_REPLY = "Произошла ошибка при обращении к нейросети."
 PROMISE_RETRY_NOTE = "Вызови инструмент или скажи, что не можешь. Не сообщай о результате без вызова."
 PROMISE_FAIL_REPLY = "Не получилось: действие не было выполнено."
+CONFIRM_RETRY_NOTE = "Вызови telegram(action=send); подтверждение запросит сам Jarvis, не проси его словами."
+HISTORY_IN_DIALOG = 4   # сообщений истории, пока открыт диалог о сообщении (2 обмена): важна фраза пользователя
 # Модель обещает действие («Открываю Safari»), но не вызвала ни одного инструмента
 _PROMISE_RE = re.compile(r"(?<!\w)(открываю|закрываю|запускаю|устанавливаю|выполняю|перемещаю)(?!\w)", re.IGNORECASE)
 # Ложный успех: «Светлая тема включена» без единого вызова. Считается только если пользователь дал команду
@@ -41,6 +44,15 @@ _CLAIM_RE = re.compile(
     r"(?<!не )(?<!\w)(включ[её]н[аоы]?|выключ[её]н[аоы]?|включил[аио]?|выключил[аио]?|открыт[аоы]?|закрыт[аоы]?|"
     r"сохран[её]н[аоы]?|сохранил[аио]?|установлен[аоы]?|установил[аио]?|сделан[аоы]|сделал[аио]?|готово|"
     r"выполнен[аоы]?|перемещ[её]н[аоы]?|переместил[аио]?|отправлен[аоы]?|отправил[аио]?)(?!\w)", re.IGNORECASE)
+# Готовые фразы-шаблоны самого Jarvis (template_speech, Done.speech): модель повторяет их как образец «из истории».
+# Такой ответ без вызова инструмента — утверждение результата ВСЕГДА, даже если в фразе пользователя нет глагола-команды
+_TEMPLATE_CLAIM_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:(?:закрыто|открыто) приложение\b|открыта ссылка\b|громкость \d+(?=\s*(?:[.,!]|$))|яркость \d+(?: процент\w*)?(?=\s*(?:[.,!]|$))|"
+    r"(?:тёмная|темная) тема (?:включена|выключена)|тема переключена|скриншот сохранён|экран (?:заблокирован|выключен)|"
+    r"нажал отправку\b|открыл (?:чат|настройки)\b|таймер\b.{0,60}\bзапущен|будильник на\b|"
+    r"напоминание\b.{0,80}\b(?:создано|выполнено|удалено)|событие\b.{0,80}\b(?:создано|удалено)|"
+    r"заметка\b.{0,80}\bсоздана|добавил в заметку\b)", re.IGNORECASE)
+_SERVICE_MARK_RE = re.compile(r"(?:\s*\[[^\[\]]{1,80}\])+\s*$")
 _COMMAND_RE = re.compile(
     r"(?<!\w)(откр(ой|ыть)|закр(ой|ыть)|включи|включить|выключи|выключить|сохрани|сохранить|установи|установить|"
     r"поставь|поставить|сделай|сделать|перемести|переместить|отправь|отправить|запусти|запустить|найди|найти|"
@@ -122,7 +134,68 @@ def restricted_after_external(action, phrase):
 def claims_unperformed_action(phrase, answer):
     """Ответ без вызова инструмента обещает действие («Открываю…») или заявляет результат («Тема включена»)."""
     answer = answer or ""
-    return bool(_PROMISE_RE.search(answer) or (_COMMAND_RE.search(phrase or "") and _CLAIM_RE.search(answer)))
+    return bool(_PROMISE_RE.search(answer) or _TEMPLATE_CLAIM_RE.search(answer)
+                or (_COMMAND_RE.search(phrase or "") and _CLAIM_RE.search(answer)))
+
+
+def strip_service_marks(text):
+    """Служебные хвосты в скобках, которые модель переняла из истории («[ожидание ответа]», «[действие: …]»)."""
+    return _SERVICE_MARK_RE.sub("", str(text or "")).strip()
+
+
+_LIST_VERBS = {"открой", "открыть", "откройте", "закрой", "закрыть", "закройте", "запусти", "запустить", "выйди",
+               "выйти"}
+_LIST_FILLERS = {"приложение", "приложении", "приложения", "приложений", "программу", "программа", "программы",
+                 "пожалуйста", "мне", "все", "всё", "ещё", "еще", "тоже", "также", "потом", "и"}
+_LIST_SPLIT_RE = re.compile(r"\s*(?:,|;|\bа также\b|\bи\b)\s*", re.IGNORECASE)
+
+
+def requested_apps(phrase):
+    """Что перечислено в «закрой календарь, чатгпт и настройки»: сегменты после глагола (≥2), иначе []."""
+    words = re.findall(r"[\w\-]+|[,;]", str(phrase).lower())
+    start = next((i for i, w in enumerate(words) if w in _LIST_VERBS), None)
+    if start is None:
+        return []
+    text = " ".join(words[start + 1:]).replace(" ,", ",").replace(" ;", ";")
+    segments = []
+    for part in _LIST_SPLIT_RE.split(text):
+        kept = [w for w in re.findall(r"[\w\-]+", part) if w not in _LIST_FILLERS and w not in _LIST_VERBS]
+        if kept:
+            segments.append(" ".join(kept))
+    return segments if len(segments) >= 2 else []
+
+
+def incomplete_note(phrase, results):
+    """«Остальное я не сделал: чатгпт, настройки.» — если в фразе перечислено несколько приложений, а вызваны
+    open_app / quit_app только для части. Нет вызовов вовсе — модель отвечала о другом, ничего не добавляем."""
+    segments = requested_apps(phrase)
+    actions = [r["action"] for r in results if isinstance(r.get("action"), dict)]
+    if not segments or not any(a.get("name") in ("open_app", "quit_app") for a in actions):
+        return ""
+
+    def squeeze(value):
+        return "".join(re.findall(r"\w+", str(value).casefold()))
+
+    handled = set()    # всё, что выполненные действия получили в аргументах: приложения, громкость и т. п.
+    for action in actions:
+        for value in (action.get("args") or {}).values():
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                handled.add(squeeze(value))
+                if isinstance(value, str) and action.get("name") in ("open_app", "quit_app"):
+                    resolved = installed_apps.resolve_app_name(value)
+                    handled.add(squeeze(resolved) if resolved else squeeze(value))
+    handled.discard("")
+    left = []
+    for segment in segments:
+        squeezed = squeeze(segment)
+        resolved = installed_apps.resolve_app_name(segment)
+        aliases = {squeeze(resolve_app(w)) for w in segment.split()}
+        mentioned = (squeezed in handled or bool(aliases & handled)
+                     or (resolved is not None and squeeze(resolved) in handled)
+                     or any(len(h) >= 2 and h in squeezed for h in handled))
+        if not mentioned:
+            left.append(segment)
+    return f"Остальное я не сделал: {', '.join(left)}." if left else ""
 
 
 def _run(args):
@@ -389,8 +462,8 @@ class AIClient:
     def forget(self):
         self.history.clear()
 
-    def remember(self, user_text, assistant_text, results=()):
-        self.history.add_exchange(user_text, assistant_text, results)
+    def remember(self, user_text, assistant_text, results=(), templated=False):
+        self.history.add_exchange(user_text, assistant_text, results, templated=templated)
 
     # --- Режим инструментов ---
 
@@ -472,6 +545,10 @@ class AIClient:
         """Инструменты: SAFE — выполнить и вернуть модели результат (до 3 кругов), CONFIRM — вопрос
         пользователю, BLOCKED — отклонить весь ответ. Модели без инструментов — режим JSON."""
         history = self.history.messages()
+        if self._ctx_phrases:
+            # Диалог о сообщении: важна фраза пользователя (она собрана в check_phrase), а не старые ответы ассистента —
+            # последние 2 обмена вместо всей истории экономят токены Groq
+            history = history[-HISTORY_IN_DIALOG:]
         hint = durations.duration_hint(text)
         # Подсказка считана кодом по фразе пользователя: «через 25 минут» = 1500 секунд (в уме модель ошибается)
         user = {"role": "user", "content": f"{text}\n[{hint[0]}]" if hint else text}
@@ -480,6 +557,7 @@ class AIClient:
         json_messages = [{"role": "system", "content": prompts.json_prompt(**self._prompt_kwargs())}, *history, user]
         executed = []
         tool_rounds, requests, retried, web_seen = 0, 0, False, False
+        confirm_retried = False
 
         while True:
             try:
@@ -496,6 +574,13 @@ class AIClient:
             if response.mode == "json":
                 return self._finish(text, self._json_turn(text, response.text))
             if not response.tool_calls:
+                if not executed and not confirm_retried and self._asks_confirmation_in_words(text, response.text):
+                    # Модель просит подтверждение словами вместо вызова send: подтверждение спрашивает сам Jarvis
+                    log.warning("LLM: просит подтверждение словами вместо вызова telegram — повторяю запрос")
+                    confirm_retried = True
+                    messages = messages + [{"role": "assistant", "content": response.text},
+                                           {"role": "user", "content": CONFIRM_RETRY_NOTE}]
+                    continue
                 if not executed and claims_unperformed_action(text, response.text):
                     if not retried:
                         # Обещание без вызова инструмента — переспросить один раз
@@ -505,7 +590,8 @@ class AIClient:
                                                {"role": "user", "content": PROMISE_RETRY_NOTE}]
                         continue
                     return self._finish(text, Turn(PROMISE_FAIL_REPLY))
-                return self._finish(text, Turn(self._honest(response.text, executed), results=executed))
+                return self._finish(text, Turn(self._honest(strip_service_marks(response.text), executed),
+                                               results=executed))
             if tool_rounds == MAX_TOOL_ROUNDS:
                 log.warning("LLM: больше %s кругов с инструментами — прерываю", MAX_TOOL_ROUNDS)
                 return self._finish(text, Turn(TOO_MANY_ROUNDS_REPLY, results=executed))
@@ -567,6 +653,20 @@ class AIClient:
                 executed.append(result)
                 messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
                                              error=result["short"], web=result.get("web", False)))
+
+    def _asks_confirmation_in_words(self, phrase, answer):
+        """Тема messaging, ответ без вызова просит подтверждение словами («Подтвердите отправку…», «Отправить?»), а
+        получатель уже назван в репликах диалога: надо вызвать send, спросит Jarvis."""
+        catalog = topics.catalog()
+        if not (self._ctx_phrases or any(catalog.get(n, ("",))[0] == "messaging" for n in self._last_chosen)):
+            return False
+        low = (answer or "").lower()
+        if "подтверд" not in low and not (asks_question(answer) and "отправ" in low):
+            return False
+        from core.apps import telegram
+        said = " ".join([*self._ctx_phrases, phrase])
+        # получатель И текст уже известны из реплик: иначе вопрос «Какой текст отправить?» — законный уточняющий
+        return telegram.recipient_known(said) and telegram.text_known(said)
 
     @staticmethod
     def _restricted(actions, phrase, seen_before):
@@ -685,6 +785,13 @@ class AIClient:
 
     def _finish(self, text, turn):
         used = {r["action"].get("name") for r in turn.results if isinstance(r.get("action"), dict)}
+        # Ответ целиком по шаблону Jarvis («Закрыто приложение X.») в историю не идёт: вместо него «[действие: …]»
+        templated = bool(turn.results) and not turn.pending and all(
+            r.get("ok") and isinstance(r.get("action"), dict) and r["action"].get("name") in TEMPLATE_ACTIONS
+            for r in turn.results)
+        note = incomplete_note(text, turn.results) if templated else ""
+        if note:
+            turn.speech = f"{turn.speech} {note}".strip()     # перечислено несколько приложений, сделано не всё
         said = " ".join(p for p in [turn.speech, confirmation_question(turn.pending) if turn.pending else ""] if p)
         question = asks_question(turn.speech) and not turn.pending
         self._last_question = question
@@ -705,7 +812,7 @@ class AIClient:
             self._dialog = {"phrases": (self._ctx_phrases + [text])[-MAX_DIALOG_PHRASES:]}
         else:
             self._dialog = None
-        self.remember(text, said, turn.results)
+        self.remember(text, note if templated else said, turn.results, templated=templated)
         return turn
 
     # --- Режим JSON (модели без tool calling) ---

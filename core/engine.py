@@ -1,10 +1,14 @@
+import difflib
 import logging
+import re
 import subprocess
 import threading
 import time
+from collections import deque
 
 import speech_recognition as sr
 
+from core import journal
 from core.settings import env_float
 from core.speech_text import prepare_for_speech
 
@@ -12,11 +16,22 @@ log = logging.getLogger(__name__)
 
 PREFERRED_VOICE = "Milena"
 DEFAULT_SPEECH_PAUSE = 1.2
+DEFAULT_TAIL_PAUSE = 0.8      # SPEECH_TAIL_PAUSE: пауза после озвучки перед прослушиванием
+ECHO_RATIO = 0.75             # фраза похожа на недавнюю речь ассистента (difflib)
+ECHO_SHARE = 0.6              # или столько слов фразы (от 3 слов) есть в ней
+ECHO_PHRASES = 3              # сколько последних озвученных фраз помним
+# Короткие ответы пользователя, которые никогда не считаются эхом
+NEVER_ECHO = {"да", "нет", "отмена", "стоп"}
 
 
 def speech_pause():
     """SPEECH_PAUSE из .env (0.5–5 с); non_speaking_duration распознавателя — 0.5 с, меньше нельзя."""
     return env_float("SPEECH_PAUSE", DEFAULT_SPEECH_PAUSE, 0.5, 5.0)
+
+
+def speech_tail_pause():
+    """SPEECH_TAIL_PAUSE из .env (0–5 с): после речи ассистента микрофон ещё секунду слышит хвост и комнату."""
+    return env_float("SPEECH_TAIL_PAUSE", DEFAULT_TAIL_PAUSE, 0.0, 5.0)
 
 
 def pick_voice(say_voices_output):
@@ -67,6 +82,8 @@ class SpeechEngine:
         self._stop_generation = 0  # растёт при stop_speaking: фразы в очереди отменяются
         self._last_speech_end = 0.0
         self.speaking = threading.Event()
+        self.tail_pause = speech_tail_pause()
+        self.recent_spoken = deque(maxlen=ECHO_PHRASES)   # последние озвученные фразы — для фильтра эха
 
     def speak(self, text):
         # В лог — исходный текст, в say — без ссылок, путей, Markdown и эмодзи
@@ -74,6 +91,7 @@ class SpeechEngine:
         if not spoken:
             return
         generation = self._stop_generation
+        self.recent_spoken.append(spoken)
         with self._speak_lock:
             if generation != self._stop_generation:
                 return  # речь прервали, пока фраза ждала своей очереди
@@ -97,6 +115,25 @@ class SpeechEngine:
         if proc and proc.poll() is None:
             proc.terminate()
 
+    def tail_remaining(self):
+        """Сколько ещё секунд после конца озвучки не слушать (SPEECH_TAIL_PAUSE)."""
+        return max(0.0, self._last_speech_end + self.tail_pause - time.monotonic())
+
+    def is_echo(self, text):
+        """Распознанная фраза — это эхо ассистента: похожа (difflib ≥ 0.75) на одну из последних 3 озвученных или
+        60% её слов (от 3 слов) есть в такой фразе. «да», «нет», «отмена», «стоп» эхом не считаются."""
+        words = re.findall(r"\w+", str(text).lower())
+        if not words or set(words) <= NEVER_ECHO:
+            return False
+        heard = " ".join(words)
+        for spoken in list(self.recent_spoken):
+            spoken_words = re.findall(r"\w+", spoken.lower())
+            if difflib.SequenceMatcher(None, heard, " ".join(spoken_words)).ratio() >= ECHO_RATIO:
+                return True
+            if len(words) >= 3 and sum(1 for w in words if w in set(spoken_words)) / len(words) >= ECHO_SHARE:
+                return True
+        return False
+
     def speech_overlaps(self, since):
         """Говорил ли ассистент после момента since (time.monotonic())."""
         return self.speaking.is_set() or self._last_speech_end > since
@@ -112,7 +149,7 @@ class SpeechEngine:
             try:
                 audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
                 text = self.recognizer.recognize_google(audio, language="ru-RU")
-                log.info("👤 Вы: %s", text)
+                log.info("👤 Вы: %s", journal.loggable_phrase(text))
                 return text.lower()
             except sr.WaitTimeoutError:
                 return None

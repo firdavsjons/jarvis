@@ -230,7 +230,7 @@ class TestCacheInAIClient(unittest.TestCase):
         self.assertEqual(turn.speech, "Открыто приложение Telegram.")
         self.assertEqual(mock_run.call_count, 2)  # действие выполнено обычным путём
         self.assertEqual(client.history.messages()[-1]["content"],
-                         "Открыто приложение Telegram. [open_app Telegram: успешно]")
+                         "[действие: открыто приложение Telegram]")
 
     def test_confirm_and_errors_not_cached(self, mock_run):
         mock_run.return_value.returncode = 0

@@ -349,6 +349,10 @@ class VoiceApp:
             if self.engine.speaking.is_set():
                 time.sleep(0.1)
                 continue
+            tail = self.engine.tail_remaining()
+            if tail > 0:
+                time.sleep(min(tail, 0.1))   # хвост речи ассистента (SPEECH_TAIL_PAUSE)
+                continue
 
             started = time.monotonic()
             text = self.engine.listen()
@@ -359,6 +363,11 @@ class VoiceApp:
             if self.engine.speech_overlaps(started):
                 # Во время записи ассистент заговорил — микрофон мог услышать его самого
                 log.info("Отброшено (ассистент говорил во время записи): %s", loggable_phrase(text))
+                continue
+
+            if self.engine.is_echo(text):
+                # Микрофон услышал саму речь ассистента (его вопрос подтверждения, ответ): не команда
+                log.info("Отброшено (эхо ассистента)")
                 continue
 
             self.process_command(text, source="voice")

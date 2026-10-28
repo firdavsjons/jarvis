@@ -207,6 +207,7 @@ class TestFireHandler(unittest.TestCase):
         engine._proc = None
         engine.speaking = threading.Event()
         engine._last_speech_end = 0.0
+        engine.recent_spoken = __import__("collections").deque(maxlen=3)
         engine.voice = None
         active, overlaps = [], []
 

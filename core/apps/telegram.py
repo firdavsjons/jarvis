@@ -21,6 +21,7 @@ from core.apps import common
 from core.apps.registry import CONFIRM, SAFE, AppTool, words_of
 from core.errors import ActionError
 from core.memory import contains_secret
+from core.settings import env_float
 
 log = logging.getLogger(__name__)
 
@@ -35,18 +36,26 @@ OVERLAP_MIN = 0.6           # доля слов текста, которые е�
 STATE_TTL = 120.0           # черновик живёт дольше 20 с подтверждения с запасом
 WINDOW_WAIT_TENTHS = 50     # ждать окно Telegram до 5 секунд
 PASTE_DELAY = 0.6           # чат успевает загрузиться и получить фокус
-AFTER_PASTE_DELAY = 0.4     # Cmd+V успевает вставить текст до возврата буфера
+DEFAULT_PASTE_WAIT = 1.0    # TELEGRAM_PASTE_WAIT из .env: сколько ждать после Cmd+V, прежде чем вернуть буфер
 BEFORE_ENTER_DELAY = 0.4
+
+
+def paste_wait():
+    """Пауза после Cmd+V до возврата прежнего буфера (0–5 с). Telegram читает буфер не мгновенно: вернуть его сразу —
+    значит вставить старое содержимое или ничего. Подбирается диагностикой `python -m core.telegram_check`."""
+    return env_float("TELEGRAM_PASTE_WAIT", DEFAULT_PASTE_WAIT, 0.0, 5.0)
 
 UNKNOWN_CONTACT = "Не знаю такого контакта. Добавьте его в contacts.json, инструкция в docs/telegram.md."
 UNKNOWN_SELF = "Не знаю такого контакта. Добавьте «себе» в contacts.json, инструкция в docs/telegram.md."
 
 # «Себе»: слова пользователя, которые ведут на контакт «себе» из contacts.json (и только на него)
 SELF_KEY = "себе"
-SELF_SPOKEN = {"себе", "мне", "самому себе", "в избранное", "себе в избранное"}
+SELF_SPOKEN = {"себе", "мне", "самому себе", "в избранное", "себе в избранное",
+               "собой", "собою", "самим собой", "мной", "мною", "со мной", "обо мне"}
 # Что модель иногда подставляет вместо сказанного пользователем; работает, только если во фразе есть слово из SELF_SPOKEN
 MODEL_SELF_NAMES = {"saved messages", "saved", "избранное", "self", "me", "myself"}
-_SELF_PHRASE_WORDS = (("себе",), ("мне",), ("в", "избранное"))
+_SELF_PHRASE_WORDS = (("себе",), ("мне",), ("в", "избранное"), ("собой",), ("собою",), ("мной",), ("мною",),
+                      ("обо", "мне"))
 NOT_IN_PHRASE = "Этого получателя нет в вашей фразе"
 NOT_ASKED = "Не уверен, что вы просили отправить именно это"
 SECRET_REFUSAL = "Такое я отправлять не буду."
@@ -180,6 +189,41 @@ def is_self_request(to, phrase):
             and (name in SELF_SPOKEN or name in MODEL_SELF_NAMES))
 
 
+def recipient_known(phrase):
+    """Во фразе (реплики диалога подряд) назван получатель: контакт из contacts.json или «себе» и его формы."""
+    if phrase_has_self_word(phrase):
+        return True
+    try:
+        book = contacts_store.load_contacts()
+    except OSError:
+        return False
+    return any(contacts_store.matches_phrase(key, phrase) for key in book)
+
+
+_NOT_TEXT_WORDS = {"напиши", "напишите", "отправь", "отправьте", "написать", "отправить", "сообщение", "сообщения",
+                   "сообщению", "в", "во", "на", "телеграм", "телеграме", "telegram", "тг", "что", "пожалуйста", "для",
+                   "чат", "чате", "мне", "избранное", "кому", "ему", "ей", "им", "а", "и", "открой", "открыть", "покажи", "с",
+                   "со"}
+
+
+def text_known(phrase):
+    """В репликах диалога, кроме команды, получателя и служебных слов, осталось что-то похожее на текст сообщения."""
+    try:
+        book = contacts_store.load_contacts()
+    except OSError:
+        book = {}
+    key_words = {w for key in book for w in words_of(key)}
+    self_words = {w for seq in _SELF_PHRASE_WORDS for w in seq}
+    left = []
+    for word in words_of(phrase):
+        if word in _NOT_TEXT_WORDS or word in self_words:
+            continue
+        if any(contacts_store.word_matches(word, key) for key in key_words):
+            continue
+        left.append(word)
+    return bool(left)
+
+
 def resolve_contact(to, phrase=None):
     """Контакт по имени, как его слышит модель. Неизвестный, неоднозначный или не из фразы — ActionError."""
     to = common.clean_text(to, "получатель", common.MAX_LABEL)
@@ -226,6 +270,29 @@ def _question(contact, text):
 
 # --- Фаза 1 ---
 
+def paste_draft(client, contact, text, wait):
+    """Черновик в поле ввода: открыть чат, дождаться Telegram впереди, проверить фокус, положить текст в буфер,
+    Cmd+V, подождать wait секунд. Буфер возвращает вызывающий (после этой паузы). Каждый шаг — в лог без текста.
+    Telegram не впереди в момент Cmd+V — клавиша не нажимается."""
+    _open_chat(client, contact)
+    log.info("Telegram: чат «%s» открыт по ссылке", contact.key)
+    started = time.monotonic()
+    ready = _wait_window(client)
+    log.info("Telegram: на переднем плане с окном — %s, ждали %.1f с", "да" if ready else "нет", time.monotonic() - started)
+    if not ready:
+        raise ActionError("Telegram не открылся за 5 с", "Telegram не открылся")
+    time.sleep(PASTE_DELAY)
+    common.run_cmd(["pbcopy"], stdin=text, env=_utf8_env())
+    front = _frontmost()
+    if front != client:
+        log.warning("Telegram: перед Cmd+V впереди другое приложение (%s), клавиши не нажимаю", front or "неизвестно")
+        raise ActionError("Telegram не в фокусе перед вставкой, Cmd+V не нажат", NOT_FOCUSED)
+    common.osascript(SYSTEM_EVENTS, _PASTE)
+    log.info("Telegram: Cmd+V нажат, длина текста %d", len(text))
+    time.sleep(wait)
+    log.info("Telegram: после Cmd+V ждали %.1f с", wait)
+
+
 def prepare(action, to, text, phrase=""):
     """Все проверки и черновик в Telegram ДО вопроса. Возвращает (вопрос для голоса, вопрос для окна)."""
     global _state
@@ -238,17 +305,12 @@ def prepare(action, to, text, phrase=""):
     saved = _save_clipboard()
     pasted = False
     try:
-        _open_chat(client, contact)
-        if not _wait_window(client):
-            raise ActionError("Telegram не открылся за 5 с", "Telegram не открылся")
-        time.sleep(PASTE_DELAY)
-        common.run_cmd(["pbcopy"], stdin=text, env=_utf8_env())
-        common.osascript(SYSTEM_EVENTS, _PASTE)
+        paste_draft(client, contact, text, paste_wait())
         pasted = True
-        time.sleep(AFTER_PASTE_DELAY)
     finally:
         try:
             _restore_clipboard(saved)
+            log.info("Telegram: прежний буфер обмена возвращён")
         except ActionError as e:
             log.warning("Не удалось вернуть прежний буфер обмена: %s", e.short)
     with _lock:
@@ -340,7 +402,8 @@ def _quick(phrase):
 
 TOOLS = [AppTool(
     name="telegram",
-    description="Telegram: open_chat — открыть чат; send — отправить сообщение (всегда с подтверждением пользователя).",
+    description="Telegram: open_chat — открыть чат; send — отправить сообщение. Подтверждение отправки запрашивает сам "
+                "Jarvis, не проси его словами.",
     topic="messaging",
     keywords=("телеграм", "telegram", "сообщени", "напиши", "напишите", "отправь", "отправьте", "чат"),
     actions={"open_chat": SAFE, "send": CONFIRM},

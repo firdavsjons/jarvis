@@ -40,7 +40,10 @@ class FakeMac:
         self.clipboard_info, self.front, self.window, self.fail_on = clipboard_info, front, window, fail_on or {}
 
     def names(self):
-        return [e[0] for e in self.events]
+        return [e[0] for e in self.events if e[0] != "sleep"]       # паузы видны в events, но не в списке команд
+
+    def sleep(self, seconds):
+        self.events.append(("sleep", seconds))
 
     def __call__(self, args, **kwargs):
         cmd = args[0]
@@ -55,7 +58,8 @@ class FakeMac:
             self.pasteboard = kwargs.get("input")
             return self.reply("pbcopy")
         script = " ".join(a for a in args if a != "-e")
-        for marker, name, out in (("clipboard info", "clipboard_info", self.clipboard_info),
+        for marker, name, out in (("count of windows of (first process", "probe_access", "1"),
+                                  ("clipboard info", "clipboard_info", self.clipboard_info),
                                   ("first process whose frontmost", "front", self.front),
                                   ("repeat tenths times", "wait", self.window),
                                   ('keystroke "v"', "paste", ""), ("key code 36", "enter", "")):
@@ -82,7 +86,8 @@ class TelegramCase(unittest.TestCase):
         self.mac = FakeMac()
         for target, kwargs in (("core.apps.common.subprocess.run", {"side_effect": self.dispatch}),
                                ("core.apps.telegram.detect_client", {"return_value": CLIENT}),
-                               ("core.apps.telegram.time.sleep", {})):
+                               ("core.apps.telegram.time.sleep", {"side_effect": self.mac.sleep}),
+                               ("core.apps.telegram.paste_wait", {"return_value": 1.0})):
             patcher = patch(target, **kwargs)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -279,11 +284,12 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(turn.pending[0]["preview"], "отправить Мама сообщение: «привет»")
         self.assertEqual(confirmation_question(turn.pending), "Отправить Мама сообщение: «привет»?")
         names = self.mac.names()
-        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "pbcopy", "paste", "pbcopy"])
+        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "pbcopy", "front", "paste", "pbcopy"])
         self.assertNotIn("enter", names)                                     # до «да» Enter не нажат
-        self.assertEqual(self.mac.events[2], ("open", "tg://resolve?domain=mama_user"))
-        self.assertEqual(self.mac.events[4], ("pbcopy", "привет"))           # черновик через буфер обмена
-        before = len(self.mac.events)
+        events = [e for e in self.mac.events if e[0] != "sleep"]
+        self.assertEqual(events[2], ("open", "tg://resolve?domain=mama_user"))
+        self.assertEqual(events[4], ("pbcopy", "привет"))                    # черновик через буфер обмена
+        before = len(self.mac.names())
         results = client.run_actions(turn.pending, phrase=self.PHRASE, confirmed=True)
         self.assertTrue(results[0]["ok"], results[0])
         self.assertEqual(results[0]["speech"], "Нажал отправку в чате с Мама.")

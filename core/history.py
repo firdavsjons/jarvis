@@ -35,6 +35,23 @@ def tools_line(results):
     return f"[{line}]" if line else ""
 
 
+def action_line(results):
+    """Результаты одной строкой для ответа по шаблону: «[действие: закрыто приложение Calendar; громкость 50]».
+    Готовая фраза Jarvis в роли ассистента не сохраняется: модель копирует её как образец и «закрывает» без вызова."""
+    parts = []
+    for r in results:
+        action = r.get("action") if isinstance(r.get("action"), dict) else {}
+        if r.get("ok"):
+            text = " ".join(str(r.get("result") or r.get("speech") or action.get("name") or "?").split()).rstrip(".")
+            parts.append(text[:1].lower() + text[1:])
+        else:
+            parts.append(f"{action.get('name', '?')}: ошибка: {r.get('short')}")
+    line = "; ".join(parts)
+    if len(line) > MAX_TOOLS_LINE:
+        line = line[:MAX_TOOLS_LINE - 1] + "…"
+    return f"[действие: {line}]" if line else ""
+
+
 def _clip(text):
     text = " ".join(str(text).split())
     return text if len(text) <= MAX_MESSAGE_CHARS else text[:MAX_MESSAGE_CHARS - 1] + "…"
@@ -47,8 +64,13 @@ class ConversationHistory:
         self._messages = []
         self._lock = Lock()
 
-    def add_exchange(self, user_text, assistant_text, results=()):
-        assistant = " ".join(p for p in [assistant_text, tools_line(results)] if p)
+    def add_exchange(self, user_text, assistant_text, results=(), templated=False):
+        """templated=True — ответ целиком по шаблону самого Jarvis: вместо озвученной фразы в историю идёт
+        «[действие: …]» (assistant_text — только дополнение, например «Остальное я не сделал: …»)."""
+        if templated and results:
+            assistant = " ".join(p for p in [action_line(results), assistant_text] if p)
+        else:
+            assistant = " ".join(p for p in [assistant_text, tools_line(results)] if p)
         with self._lock:
             self._messages += [{"role": "user", "content": _clip(user_text)},
                                {"role": "assistant", "content": _clip(assistant or "…")}]
