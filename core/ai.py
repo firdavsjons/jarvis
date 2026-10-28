@@ -13,7 +13,7 @@ from core import durations, installed_apps, journal, prompts, safety, topics, we
 from core.apps import registry
 from core.cache import cacheable_actions
 from core.errors import ActionError, Done
-from core.fragments import FRAGMENT_REPLY, is_fragment
+from core.fragments import FRAGMENT_REPLY, NOTHING_TO_CONFIRM, asks_question, is_bare_confirmation, is_fragment
 from core.history import ConversationHistory
 from core.links import NO_LINK_REPLY, SearchLinks, urls_in_phrase
 from core.mac_actions import TOOL_FUNCS
@@ -72,6 +72,8 @@ WEB_REFUSAL_REPLY = "Ссылки из поиска я без вашей ком�
 GENERIC_REFUSAL_REPLY = ("В полученных данных могли быть чужие указания, поэтому это действие я без вашей команды "
                          "не выполняю. Скажите его отдельной фразой.")
 MORE_ACTIONS = {"more_tools"}   # подключение схем темы: выполняет сам AIClient
+CARRY_TURNS = 2     # сколько следующих реплик инструменты прошлой реплики остаются в наборе («а завтра?», «себе»)
+MAX_DIALOG_PHRASES = 3   # реплик пользователя, из которых собирается фраза для проверок в диалоге о сообщении
 SLOW_TOOL_REPLY = "Секунду, ищу."
 SLOW_TOOL_AFTER = 2.0  # веб-инструмент дольше — «Секунду, ищу.» (один раз за фразу, не блокируя инструмент)
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
@@ -356,7 +358,11 @@ class AIClient:
         self.llm = llm if llm is not None else build_default_client()
         self.tools = tools  # None — набор выбирается под фразу (core/topics.py); список — фиксированный набор
         self._extra_topics = set()  # темы, которые модель попросила через more_tools (на одну фразу)
-        self._carry = set()         # инструменты прошлой реплики: «а завтра?» без ключевых слов
+        self._carry = {}            # инструмент -> сколько ещё реплик остаётся в наборе («а завтра?» без ключевых слов)
+        self._last_chosen = []      # инструменты, выбранные по ключевым словам для текущей реплики
+        self._last_question = False  # последний ответ ассистента заканчивался вопросом («Кому именно?»)
+        self._dialog = None         # открытый диалог о сообщении: {"phrases": реплики пользователя}
+        self._ctx_phrases = []      # реплики пользователя из открытого диалога — только для проверок инструментов
         self.allowed_actions = allowed_actions  # None — весь белый список (подмножество — для проверки связи)
         self.history = ConversationHistory()
         # Память: по умолчанию только в памяти процесса; файл (~/Library/Application Support/Jarvis) — из main
@@ -391,15 +397,48 @@ class AIClient:
     def respond(self, text):
         """Фраза пользователя -> Turn. Сначала кэш команд; иначе модель (инструменты или режим JSON)."""
         self._slow_said.clear()  # «Секунду, ищу.» — не больше одного раза за фразу
+        reply = self.bare_confirmation_reply(text)
+        if reply:
+            return Turn(reply)
+        self._last_question = False   # новая реплика пользователя: прежний вопрос ассистента отвечен или забыт
+        self._ctx_phrases = list(self._dialog["phrases"]) if self._dialog else []
+        self._last_chosen = []
         turn = self._from_cache(text)
         if turn is None and is_fragment(text):
             # Обрывок речи: запрос к модели не тратим; в историю не пишем
-            log.info("Обрывок речи, модель не спрашиваем: %r", text)
+            log.info("Обрывок речи, модель не спрашиваем: %s", journal.loggable_phrase(text, bool(self._dialog)))
             return Turn(FRAGMENT_REPLY)
         if turn is None:
             turn = self._respond_model(text)
             self._maybe_cache(text, turn)
         return turn
+
+    def bare_confirmation_reply(self, text):
+        """«да» / «нет» / «отмена» без ожидающего действия (ожидающие обрабатывает main раньше) — «Сейчас нечего
+        подтверждать.» без модели. Исключение: последний ответ ассистента был вопросом («Поставить внутренний
+        будильник?», «Кому именно?») — тогда это ответ на него, фраза уходит модели вместе с историей. None — не наш
+        случай. Не голая фраза сбрасывает признак вопроса."""
+        if not is_bare_confirmation(text):
+            self._last_question = False
+            return None
+        if self._last_question:
+            return None    # признак сбросит respond, когда модель получит фразу
+        return NOTHING_TO_CONFIRM
+
+    def message_dialog_open(self):
+        """Ассистент спросил получателя или текст сообщения и ждёт ответа: реплики пользователя не пишем в лог."""
+        return self._dialog is not None
+
+    def close_message_dialog(self):
+        self._dialog = None
+
+    def _tool_phrase(self, name, phrase):
+        """Фраза для проверок инструмента. Для сообщений в открытом диалоге («напиши в телеграм привет» → «кому?» →
+        «себе») это реплики ПОЛЬЗОВАТЕЛЯ подряд — ни ответов модели, ни чужих данных в ней нет."""
+        tool = registry.get(name)
+        if tool is not None and tool.topic == "messaging" and self._ctx_phrases:
+            return " ".join([*self._ctx_phrases, phrase])
+        return phrase
 
     def _from_cache(self, text):
         """Попадание в кэш: без модели, через обычный путь (classify, повторная проверка, журнал)."""
@@ -411,7 +450,7 @@ class AIClient:
         if any(safety.classify(a)[0] != safety.SAFE for a in actions):
             self.cache.remove(text)  # уровень изменился (например, сайт убрали из доверенных) — спросим модель
             return None
-        log.info("Кэш команд: «%s» -> %s", journal.loggable_phrase(text), actions)
+        log.info("Кэш команд: «%s» -> %s", journal.loggable_phrase(text, bool(self._dialog)), actions)
         results = self.run_actions(actions, phrase=text)
         ok, summary = summarize_results(results)
         if ok:
@@ -542,7 +581,9 @@ class AIClient:
         if self.tools is not None:
             return self.tools
         from core.tools import TOOLS
-        tools, info = topics.select(text, TOOLS, self._extra_topics, self._carry)
+        tools, info = topics.select(text, TOOLS, self._extra_topics, set(self._carry))
+        if not self._last_chosen:
+            self._last_chosen = info["chosen"]
         log.info("Инструменты для запроса: %s, ≈%s токенов%s", ", ".join(info["topics"]) or "база",
                  topics.estimate_tokens(topics.size(tools)), " (запасной набор)" if info["fallback"] else "")
         return tools
@@ -585,11 +626,14 @@ class AIClient:
             try:
                 if tool.prepare is not None and tool.name in prepared:
                     raise ActionError("второе такое действие в одном ответе", "за раз можно только одно такое действие")
-                question = hook(phrase=phrase, **args)
+                check = self._tool_phrase(tool.name, phrase)
+                question = hook(phrase=check, **args)
                 if tool.prepare is not None:
                     prepared.add(tool.name)
                 voice, full = question if isinstance(question, tuple) else (question, question)
-                kept.append({**action, "preview": voice, "preview_full": full})
+                # check_phrase: после «да» проверки опираются на ту же фразу (диалог из нескольких реплик)
+                kept.append({**action, "preview": voice, "preview_full": full,
+                             **({"check_phrase": check} if check != phrase else {})})
             except TypeError:
                 short, reply = "неверные параметры", None
             except ActionError as e:
@@ -609,6 +653,7 @@ class AIClient:
         found = registry.quick_actions(phrase)
         if found is None:
             return None
+        self._ctx_phrases, self._last_chosen = [], []     # быстрое правило разбирает одну полную фразу
         action = {"name": found[0], "args": found[1]}
         if safety.classify(action)[0] != safety.CONFIRM:
             return None
@@ -640,8 +685,26 @@ class AIClient:
 
     def _finish(self, text, turn):
         used = {r["action"].get("name") for r in turn.results if isinstance(r.get("action"), dict)}
-        self._carry = used & set(topics.catalog())   # инструменты этой реплики подскажут набор для следующей
         said = " ".join(p for p in [turn.speech, confirmation_question(turn.pending) if turn.pending else ""] if p)
+        question = asks_question(turn.speech) and not turn.pending
+        self._last_question = question
+        # Инструменты этой реплики (даже отклонённые) и, если ассистент задал вопрос, выбранные по ключевым словам
+        # остаются в наборе ещё на CARRY_TURNS реплик: не тратим запасной набор и more_tools на «себе» после «кому?»
+        catalog = topics.catalog()
+        self._carry = {n: t - 1 for n, t in self._carry.items() if t > 1}
+        for name in used & set(catalog):
+            self._carry[name] = CARRY_TURNS
+        if question:
+            for name in self._last_chosen:
+                self._carry[name] = CARRY_TURNS
+        # Диалог о сообщении живёт, пока ассистент задаёт уточняющие вопросы; ожидающая отправка и любой другой исход его
+        # закрывают (на время ожидания лог скрывает main по самому ожидающему действию)
+        messaging = bool(self._ctx_phrases) or any(catalog.get(n, ("",))[0] == "messaging"
+                                                     for n in used | set(self._last_chosen))
+        if question and messaging:
+            self._dialog = {"phrases": (self._ctx_phrases + [text])[-MAX_DIALOG_PHRASES:]}
+        else:
+            self._dialog = None
         self.remember(text, said, turn.results)
         return turn
 
@@ -876,7 +939,8 @@ class AIClient:
                 if action["name"] in MORE_ACTIONS:
                     func = self._more_tools
                 elif tool is not None:
-                    func = partial(tool.run, phrase=phrase)   # реестр: действие знает свою фразу (разбуди, «в Часах»)
+                    # реестр: действие знает свою фразу (разбуди, «в Часах»; для сообщений — вместе с репликами диалога)
+                    func = partial(tool.run, phrase=action.get("check_phrase") or self._tool_phrase(action["name"], phrase))
                 elif action["name"] in PAGE_ACTIONS:
                     func = partial(self._read_page, phrase=phrase)
                 elif action["name"] in MEMORY_ACTIONS:

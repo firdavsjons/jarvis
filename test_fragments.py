@@ -72,7 +72,8 @@ class TestRespond(unittest.TestCase):
             self.assertEqual(client.history.messages(), [])   # в историю обрывок не пишем
 
     def test_control_words_reach_model(self):
-        for text in ["да", "нет", "стоп", "хватит", "ок", "окей", "отмена", "не надо", "ладно", "пока", "привет"]:
+        # «да», «нет», «отмена», «подтверждаю», «выполняй» без ожидающего действия обрабатывает test_confirmations.py
+        for text in ["стоп", "хватит", "ок", "окей", "не надо", "ладно", "пока", "привет"]:
             with self.subTest(text=text):
                 llm = ScriptedLLM(final("Хорошо."))
                 self.assertEqual(AIClient(llm=llm).respond(text).speech, "Хорошо.")

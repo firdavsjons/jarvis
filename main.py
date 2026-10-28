@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from core.engine import SpeechEngine
 from core.ai import BLOCKED_REPLY, AIClient, describe_action, normalize_ai_response, summarize_results
 from core.cache import CACHE_FILE, CLEARED_REPLY, CommandCache, is_forget_cache_command
+from core.apps import registry
+from core.fragments import CANCEL_WORDS, CONFIRM_WORDS
 from core.history import FORGET_REPLY, is_forget_command
 from core.links import parse_link_command, parse_read_command
 from core.memory import MEMORY_FILE, UserMemory, is_clear_memory_command
@@ -20,8 +22,6 @@ from modules.mac_control import MacControl
 
 log = logging.getLogger(__name__)
 
-CONFIRM_WORDS = {"да", "подтверждаю", "выполняй"}
-CANCEL_WORDS = {"нет", "отмена"}
 CONFIRM_TIMEOUT = 20  # секунд на подтверждение после вопроса, потом действия отменяются
 UI_POLL_MS = 100  # как часто главный поток забирает обновления окна из очереди
 
@@ -224,13 +224,31 @@ class VoiceApp:
         self.update_log(f"{summary or 'Готово.'}\n{details}" if ok else f"{summary}\n{details}")
         return ok, summary
 
+    def pending_is_private(self):
+        """Среди ожидающих действий есть отправка сообщения: реплики пользователя в лог не пишем."""
+        with self.pending_lock:
+            tools = [registry.get(a.get("name")) for a in self.pending_actions if isinstance(a, dict)]
+        return any(t is not None and t.private for t in tools)
+
     def process_command(self, text, source="voice"):
         """Единая точка входа для обработки команд (голос или текст)."""
-        log.info("Обработка (%s): %s", source, loggable_phrase(text))
+        # Идёт диалог о сообщении (спросили получателя или текст) или ждём подтверждения отправки — любая реплика скрыта
+        private = self.ai.message_dialog_open() is True or self.pending_is_private() is True
+        log.info("Обработка (%s): %s", source, loggable_phrase(text, private))
 
         # 0. Если ждём подтверждения — это ответ на вопрос
         if self.has_pending():
             self.handle_confirmation(text)
+            self.ai.close_message_dialog()
+            return
+
+        # «да» / «нет» / «отмена» без ожидающего действия: нечего подтверждать (не модели и не инструментам). Если
+        # ассистент только что задал вопрос («Поставить внутренний будильник?»), фраза — ответ на него и идёт дальше
+        nothing = self.ai.bare_confirmation_reply(text)
+        if isinstance(nothing, str) and nothing:
+            self.ai.close_message_dialog()
+            self.engine.speak(nothing)
+            self.set_idle_status()
             return
 
         # 1. «Забудь разговор» — до MacControl и до модели
@@ -340,7 +358,7 @@ class VoiceApp:
                 continue
             if self.engine.speech_overlaps(started):
                 # Во время записи ассистент заговорил — микрофон мог услышать его самого
-                log.info("Отброшено (ассистент говорил во время записи): %s", text)
+                log.info("Отброшено (ассистент говорил во время записи): %s", loggable_phrase(text))
                 continue
 
             self.process_command(text, source="voice")

@@ -22,8 +22,8 @@ FUZZY_CUTOFF = 0.85
 STEM_MIN_LENGTH = 4    # от скольких букв имя склоняется по основе (мама → маме, мамой)
 MAX_ENDING = 3         # длина окончания после основы
 
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
-_PHONE_RE = re.compile(r"^\+?[0-9]{7,15}$")
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")   # username Telegram: 5–32 символа
+_PHONE_RE = re.compile(r"^\+?[0-9]{8,15}$")             # с кодом страны: 8–15 цифр
 
 
 class Contact:

@@ -39,6 +39,14 @@ AFTER_PASTE_DELAY = 0.4     # Cmd+V успевает вставить текст
 BEFORE_ENTER_DELAY = 0.4
 
 UNKNOWN_CONTACT = "Не знаю такого контакта. Добавьте его в contacts.json, инструкция в docs/telegram.md."
+UNKNOWN_SELF = "Не знаю такого контакта. Добавьте «себе» в contacts.json, инструкция в docs/telegram.md."
+
+# «Себе»: слова пользователя, которые ведут на контакт «себе» из contacts.json (и только на него)
+SELF_KEY = "себе"
+SELF_SPOKEN = {"себе", "мне", "самому себе", "в избранное", "себе в избранное"}
+# Что модель иногда подставляет вместо сказанного пользователем; работает, только если во фразе есть слово из SELF_SPOKEN
+MODEL_SELF_NAMES = {"saved messages", "saved", "избранное", "self", "me", "myself"}
+_SELF_PHRASE_WORDS = (("себе",), ("мне",), ("в", "избранное"))
 NOT_IN_PHRASE = "Этого получателя нет в вашей фразе"
 NOT_ASKED = "Не уверен, что вы просили отправить именно это"
 SECRET_REFUSAL = "Такое я отправлять не буду."
@@ -157,10 +165,30 @@ def _overlap(text, phrase):
     return sum(1 for w in words if present(w)) / len(words)
 
 
+def phrase_has_self_word(phrase):
+    """Во фразе пользователя есть «себе», «мне» или «в избранное» (слова подряд, без падежей и нечёткости)."""
+    words = words_of(phrase)
+    return any(all(words[i + j] == w for j, w in enumerate(seq))
+               for seq in _SELF_PHRASE_WORDS for i in range(len(words) - len(seq) + 1))
+
+
+def is_self_request(to, phrase):
+    """`to` — это «себе» (как сказал пользователь или как переименовала модель: Saved Messages, Избранное, Me…) И во
+    фразе есть слово «себе». Единственное исключение из правила «получатель назван во фразе»."""
+    name = " ".join(words_of(to))
+    return (phrase is not None and phrase_has_self_word(phrase)
+            and (name in SELF_SPOKEN or name in MODEL_SELF_NAMES))
+
+
 def resolve_contact(to, phrase=None):
     """Контакт по имени, как его слышит модель. Неизвестный, неоднозначный или не из фразы — ActionError."""
     to = common.clean_text(to, "получатель", common.MAX_LABEL)
     book = contacts_store.load_contacts()
+    if is_self_request(to, phrase):
+        # Только контакт с ключом «себе», напрямую: ни падежи, ни нечёткий поиск сюда не ведут
+        if SELF_KEY not in book:
+            raise ActionError("контакта «себе» нет в contacts.json", "не знаю такого контакта", UNKNOWN_SELF)
+        return book[SELF_KEY]
     found = contacts_store.find(to, book)
     if not found:
         raise ActionError(f"контакт {to!r} не найден", "не знаю такого контакта", UNKNOWN_CONTACT)
@@ -283,12 +311,15 @@ _OPEN_RE = re.compile(r"^\s*(?:пожалуйста[,\s]+)?(?:открой|от�
                       re.IGNORECASE)
 
 
-def _sure_contact(name):
+def _sure_contact(name, phrase):
     """Имя однозначно и уверенно разрешается; иначе None (разбор неуверенный — отдаём модели)."""
     try:
-        found = contacts_store.find(name, contacts_store.load_contacts())
+        book = contacts_store.load_contacts()
     except OSError:
         return None
+    if is_self_request(name, phrase):
+        return book.get(SELF_KEY)
+    found = contacts_store.find(name, book)
     return found[0] if len(found) == 1 else None
 
 
@@ -298,11 +329,11 @@ def _quick(phrase):
         name, text = match.group("name"), match.group("text")
         if match.group("app").lower() == "телеграме" and re.match(r"что\s+\S", text, re.IGNORECASE):
             text = re.sub(r"^что\s+", "", text, flags=re.IGNORECASE)    # «в телеграме что …» — союз, не часть текста
-        if _sure_contact(name) is None:
+        if _sure_contact(name, phrase) is None:
             return None
         return {"args": {"action": "send", "to": name, "text": text.strip()}}
     match = _OPEN_RE.match(phrase)
-    if match and _sure_contact(match.group("name")) is not None:
+    if match and _sure_contact(match.group("name"), phrase) is not None:
         return {"args": {"action": "open_chat", "to": match.group("name"), "text": ""}}
     return None
 
@@ -314,7 +345,8 @@ TOOLS = [AppTool(
     keywords=("телеграм", "telegram", "сообщени", "напиши", "напишите", "отправь", "отправьте", "чат"),
     actions={"open_chat": SAFE, "send": CONFIRM},
     action_description="open_chat или send",
-    params={"to": {"type": "string", "description": "Кому: имя, как сказал пользователь"},
+    params={"to": {"type": "string", "description": "Имя получателя ровно так, как оно сказано в фразе пользователя "
+                                                    "(например «маме», «себе»), не переводи и не заменяй"},
             "text": {"type": "string", "description": "Текст сообщения слово в слово; для open_chat пустая строка"}},
     run=run,
     destructive=frozenset({"send"}),

@@ -91,4 +91,5 @@ def select(phrase, all_tools, extra_topics=(), carry=()):
         dropped.append(chosen.pop())   # меньше всего совпадений — последним
         with_more = True
         tools = build(chosen, with_more)
-    return tools, {"topics": sorted({items[n][0] for n in chosen}), "fallback": fallback, "dropped": dropped}
+    return tools, {"topics": sorted({items[n][0] for n in chosen}), "fallback": fallback, "dropped": dropped,
+                   "chosen": list(chosen)}

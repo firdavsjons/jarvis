@@ -56,11 +56,12 @@ def redact(value):
 _MESSAGE_STEMS = ("телеграм", "telegram", "сообщен", "напиш", "отправ")
 
 
-def loggable_phrase(phrase):
-    """Фраза для лога: про сообщение — «(сообщение, N символов)», остальные как есть."""
+def loggable_phrase(phrase, private=False):
+    """Фраза для лога: про сообщение — «(сообщение, N символов)», остальные как есть. private=True — идёт диалог
+    о сообщении (ассистент спросил получателя или текст, либо ждёт подтверждения отправки): любая реплика скрыта."""
     text = str(phrase or "")
     words = re.findall(r"\w+", text.lower())
-    if any(w.startswith(_MESSAGE_STEMS) for w in words):
+    if private or any(w.startswith(_MESSAGE_STEMS) for w in words):
         return f"(сообщение, {len(text)} символов)"
     return text
 
@@ -84,7 +85,7 @@ def scrub(phrase, action):
     if hidden:
         phrase = f"(сообщение, {hidden} символов)"
     # вопрос подтверждения («отправить … сообщение: «текст»») тоже содержит текст
-    cleaned = {k: v for k, v in action.items() if k not in ("preview", "preview_full")}
+    cleaned = {k: v for k, v in action.items() if k not in ("preview", "preview_full", "check_phrase")}
     return phrase, {**cleaned, "args": args}
 
 
