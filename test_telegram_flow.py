@@ -127,7 +127,7 @@ class TestMainChain(FlowCase):
         app.engine.speak.reset_mock()
         app.take_pending.return_value = (pending, "напиши маме в телеграм привет")
         main.VoiceApp.handle_confirmation(app, "да")
-        self.assertEqual(self.spoken(app), ["Выполняю.", "Нажал отправку в чате с Мама."])
+        self.assertEqual(self.spoken(app), ["Выполняю.", "Нажал Enter в чате с Мама. Если сообщения нет, поле было пустым."])
         self.assertEqual(self.mac.names().count("enter"), 1)
 
     def test_quick_phrase_question_no(self):
@@ -210,7 +210,7 @@ class TestJournalAndLogsHaveNoText(FlowCase):
         self.assertIs(entry["confirmed"], True)
         self.assertTrue(entry["ok"])
         self.assertIn("time", entry)
-        self.assertEqual(entry["result"], "✅ Нажал отправку в чате с Мама.")
+        self.assertEqual(entry["result"], "✅ Нажал Enter в чате с Мама. Если сообщения нет, поле было пустым.")
 
     def test_cancel_logged_without_text_and_with_draft_note(self):
         self.run_flow("no")

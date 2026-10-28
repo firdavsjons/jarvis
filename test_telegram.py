@@ -44,6 +44,8 @@ class FakeMac:
         self.menu_items = "Отменить, missing value, Вставить, Вставить и согласовать стиль"
         self.clip_as_ok = True
         self.pbpaste_mangle = False
+        self.verify_mangle = False        # pbpaste сразу после проверки фокуса возвращает чужой текст (буфер не принял)
+        self.paste_reads = [True]         # состояние «Вставить» при каждом чтении (последнее повторяется)
         self.fail_open_number = None      # сколько-то-й по счёту `open` завершится ошибкой (повторное открытие чата)
         self.open_count = 0
         self.clipboard_info, self.front, self.window, self.fail_on = clipboard_info, front, window, fail_on or {}
@@ -67,7 +69,8 @@ class FakeMac:
             return self.reply("layout", self.layout)
         if cmd == "pbpaste":
             self.events.append(("pbpaste",))
-            return self.reply("pbpaste", "???" if self.pbpaste_mangle else self.pasteboard)
+            wrong = self.pbpaste_mangle or (self.verify_mangle and len(self.events) > 1 and self.events[-2][0] == "front")
+            return self.reply("pbpaste", "???" if wrong else self.pasteboard)
         if cmd == "pbcopy":
             self.events.append(("pbcopy", kwargs.get("input")))
             self.pasteboard = kwargs.get("input")
@@ -83,10 +86,22 @@ class FakeMac:
         if "click at {" in script:
             self.events.append(("click", args[-2], args[-1]))
             return self.reply("click")
+        if "click menu bar item" in script:         # открыть меню кликом по строке меню (диагностика --open-menu)
+            self.events.append(("menu_open", args[-1]))
+            return self.reply("menu_open")
         if "click menu item" in script:
             self.events.append(("menu_click", args[-2], args[-1]))
             return self.reply("menu_click")
-        for marker, name, out in (("name of every menu bar item", "menu_bar", self.menu_bar),
+        if "enabled of every menu item" in script:
+            self.events.append(("menu_enabled",))
+            value = self.paste_reads.pop(0) if len(self.paste_reads) > 1 else self.paste_reads[0]
+            flags = []
+            for item in (p.strip() for p in self.menu_items.split(", ")):
+                flags.append(("true" if value else "false") if item.lower() in ("вставить", "paste") else
+                             "missing value" if item == "missing value" else "true")
+            return self.reply("menu_enabled", ", ".join(flags))
+        for marker, name, out in (("key code 53", "escape", ""),
+                                  ("name of every menu bar item", "menu_bar", self.menu_bar),
                                   ("name of every menu item", "menu_items", self.menu_items),
                                   ("position of w", "geometry", self.geometry),
                                   ('keystroke " "', "space", ""), ("key code 51", "delete", ""),
@@ -318,7 +333,7 @@ class TestTwoPhaseSend(TelegramCase):
         self.assertEqual(confirmation_question(turn.pending), "Отправить Мама сообщение: «привет»?")
         names = self.mac.names()
         # чат открывается по ссылке дважды подряд (диагностика: фокус в поле ставит второе открытие)
-        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "paste", "pbcopy"])
+        self.assertEqual(names, ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "pbpaste", "paste", "pbcopy"])
         self.assertNotIn("enter", names)                                     # до «да» Enter не нажат
         events = [e for e in self.mac.events if e[0] != "sleep"]
         self.assertEqual(events[2], ("open", "tg://resolve?domain=mama_user"))
@@ -327,7 +342,7 @@ class TestTwoPhaseSend(TelegramCase):
         before = len(self.mac.names())
         results = client.run_actions(turn.pending, phrase=self.PHRASE, confirmed=True)
         self.assertTrue(results[0]["ok"], results[0])
-        self.assertEqual(results[0]["speech"], "Нажал отправку в чате с Мама.")
+        self.assertEqual(results[0]["speech"], "Нажал Enter в чате с Мама. Если сообщения нет, поле было пустым.")
         phase2 = self.mac.names()[before:]
         self.assertEqual(phase2, ["open", "wait", "open", "front", "enter"])  # та же двойная последовательность → Enter
         self.assertEqual(self.mac.names().count("enter"), 1)
@@ -344,7 +359,7 @@ class TestTwoPhaseSend(TelegramCase):
         self.mac.pasteboard = ""
         self.ask()
         self.assertEqual(self.mac.events[0], ("clipboard_info",))
-        self.assertNotIn("pbpaste", self.mac.names())
+        self.assertEqual(self.mac.names().count("pbpaste"), 1)               # только проверка буфера перед вставкой
         self.assertEqual(self.mac.events[-1], ("pbcopy", ""))
 
     def test_clipboard_restored_when_paste_fails(self):

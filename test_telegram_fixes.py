@@ -37,12 +37,12 @@ class TestPhase1Logging(TelegramCase):
         with self.assertLogs("core.apps.telegram", level="INFO") as logs:
             client, turn = self.ask(text=text, phrase=f"напиши маме в телеграм {text}")
         joined = "\n".join(logs.output)
-        for expected in ("чат «мама» открыт по ссылке", "на переднем плане с окном — да, ждали", "Cmd+V нажат, длина текста 20",
-                         "после Cmd+V ждали 1.0 с", "прежний буфер обмена возвращён"):
+        for expected in ("чат «мама» открыт по ссылке", "на переднем плане с окном — да, ждали", "вставка нажата (способ keystroke), длина текста 20",
+                         "после вставки ждали 1.0 с", "прежний буфер обмена возвращён"):
             self.assertIn(expected, joined)
         self.assertNotIn(text, joined)
         self.assertNotIn("mama_user", joined)
-        order = [joined.index(x) for x in ("открыт по ссылке", "на переднем плане", "Cmd+V нажат", "после Cmd+V", "буфер")]
+        order = [joined.index(x) for x in ("открыт по ссылке", "на переднем плане", "вставка нажата", "после вставки", "буфер обмена возвращён")]
         self.assertEqual(order, sorted(order))
 
     def test_not_in_front_at_paste_time_aborts_without_keys(self):
@@ -54,13 +54,13 @@ class TestPhase1Logging(TelegramCase):
         self.assertNotIn("paste", self.mac.names())                        # Cmd+V не нажат
         self.assertNotIn("enter", self.mac.names())
         self.assertEqual(self.mac.pasteboard, "старый буфер")              # буфер возвращён
-        self.assertIn("Telegram: перед Cmd+V впереди другое приложение", "\n".join(logs.output))
+        self.assertIn("Telegram: перед вставкой впереди другое приложение", "\n".join(logs.output))
         self.assertIsNone(tg._state)
 
     def test_focus_checked_right_before_paste_after_pbcopy(self):
         self.ask()
         names = self.mac.names()
-        self.assertEqual(names[names.index("pbcopy"):names.index("pbcopy") + 3], ["pbcopy", "front", "paste"])
+        self.assertEqual(names[names.index("pbcopy"):names.index("pbcopy") + 3], ["pbcopy", "front", "pbpaste"])
 
     def test_buffer_restored_only_after_the_wait(self):
         self.ask()
@@ -214,7 +214,7 @@ class AppCase(unittest.TestCase):
 class TestTemplateClaims(AppCase):
     TEMPLATES = ["Закрыто приложение System Settings.", "Открыто приложение Safari.", "Громкость 50.",
                  "Тёмная тема включена.", "Тёмная тема выключена.", "Яркость 80 процентов.", "Скриншот сохранён на рабочем столе.",
-                 "Экран заблокирован.", "Нажал отправку в чате с Избранное.", "Открыл чат с Мама.",
+                 "Экран заблокирован.", "Нажал Enter в чате с Избранное.", "Открыл чат с Мама.",
                  "Открыл настройки Wi-Fi.", "Открыта ссылка ютуб точка ком.", "Таймер на 5 минут запущен.",
                  "Будильник на сегодня в 7:00. Он сработает, только если Jarvis запущен.",
                  "Напоминание «Молоко» создано.", "Событие «Планёрка» создано на завтра в 10:00.",

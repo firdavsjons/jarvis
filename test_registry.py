@@ -331,8 +331,8 @@ class TestNoWritesToPermissionFiles(unittest.TestCase):
             text = py.read_text(encoding="utf-8")
             if py.name == "telegram_check.py":
                 # единственная запись диагностики — собственный итог запуска, не контакты
-                self.assertEqual(text.count("atomic_write_json("), 1)
-                self.assertIn("atomic_write_json(LAST_FILE,", text)
+                self.assertEqual(text.count("atomic_write_json("), text.count("atomic_write_json(LAST_FILE,"))
+                self.assertGreaterEqual(text.count("atomic_write_json(LAST_FILE,"), 1)
                 continue
             if "contacts.json" in text:
                 for forbidden in ("write_text", "write_bytes", "atomic_write", "os.replace"):

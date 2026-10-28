@@ -86,6 +86,7 @@ class TestPhase1Reopen(ModeCase):
             URL, ("wait",),                      # открыть по ссылке, дождаться Telegram впереди (1/2)
             URL, ("sleep", 1.0),                 # открыть ту же ссылку ещё раз (2/2) и подождать TELEGRAM_REOPEN_WAIT
             ("pbcopy", "привет"), ("front",),    # текст в буфер, Telegram впереди
+            ("pbpaste",),                        # буфер принял текст (длина), без вывода текста
             ("paste",), ("sleep", 1.0),          # Cmd+V, подождать TELEGRAM_PASTE_WAIT
             ("pbcopy", OLD),                     # вернуть прежний буфер
         ])
@@ -145,7 +146,8 @@ class TestPhase1Reopen(ModeCase):
         joined = "\n".join(logs.output)
         order = [joined.index(x) for x in ("чат «мама» открыт по ссылке (1/2)", "на переднем плане с окном — да, ждали",
                                            "повторное открытие (2/2)", "после повторного открытия ждали 1.0 с",
-                                           "Cmd+V нажат, длина текста 6", "после Cmd+V ждали 1.0 с",
+                                           "буфер обмена принял текст, длина 6", "вставка нажата (способ keystroke), длина текста 6",
+                                           "после вставки ждали 1.0 с",
                                            "прежний буфер обмена возвращён")]
         self.assertEqual(order, sorted(order))
         self.assertNotIn("привет", joined)
@@ -163,7 +165,7 @@ class TestPhase1Direct(ModeCase):
         self.ask()
         self.assertEqual(self.mac.events, [
             ("clipboard_info",), ("pbpaste",), URL, ("wait",), ("sleep", tg.PASTE_DELAY), ("pbcopy", "привет"),
-            ("front",), ("paste",), ("sleep", 1.0), ("pbcopy", OLD)])
+            ("front",), ("pbpaste",), ("paste",), ("sleep", 1.0), ("pbcopy", OLD)])
         self.assertEqual(self.mac.names().count("open"), 1)
 
     def test_log_says_one_of_one(self):
@@ -184,7 +186,7 @@ class TestPhase2(ModeCase):
     def test_reopen_order_open_wait_open_pause_front_enter(self):
         results, events = self.confirm()
         self.assertTrue(results[0]["ok"], results[0])
-        self.assertEqual(results[0]["speech"], "Нажал отправку в чате с Мама.")
+        self.assertEqual(results[0]["speech"], "Нажал Enter в чате с Мама. Если сообщения нет, поле было пустым.")
         self.assertEqual(events, [URL, ("wait",), URL, ("sleep", 1.0), ("front",), ("enter",)])
         self.assertEqual(self.mac.names().count("enter"), 1)
 
@@ -295,8 +297,8 @@ class TestDiagnosticsUseProductionValues(CheckCase):
         self.run_check(User(verdicts=["н"]), "--only", "Б")
         names = self.mac.names()
         start = names.index("clipboard_info")
-        self.assertEqual(names[start:], ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "paste",
-                                         "pbcopy"])
+        self.assertEqual(names[start:], ["clipboard_info", "pbpaste", "open", "wait", "open", "pbcopy", "front", "pbpaste",
+                                         "paste", "pbcopy"])
         self.mac = FakeMac()
         with patch("core.settings.ENV_FILE", env_file("TELEGRAM_FOCUS_MODE=direct\n")):
             self.run_check(User(verdicts=["н"]), "--only", "Б")

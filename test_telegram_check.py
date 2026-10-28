@@ -52,6 +52,8 @@ class CheckCase(TelegramCase):
 
     def run_check(self, user=None, *argv):
         user, out = user or User(), io.StringIO()
+        if not any(a in ("--only", "--repeat", "--methods", "--open-menu", "--variants") for a in argv):
+            argv = ("--variants", *argv)          # эти тесты — про прежний набор вариантов (Этап 7.1.3)
         code = check.main(list(argv), input_fn=user, out=out)
         return code, out.getvalue(), user
 
@@ -262,7 +264,8 @@ class TestAsciiAndMenuAndKeycode(CheckCase):
     def test_menu_is_read_before_click_and_localised_names_found(self):
         self.run_check(User(verdicts=["д"]), "--only", "З2")
         names = self.mac.names()
-        self.assertEqual(names[names.index("menu_bar"):names.index("menu_bar") + 3], ["menu_bar", "menu_items", "menu_click"])
+        self.assertEqual(names[names.index("menu_bar"):names.index("menu_bar") + 4],
+                         ["menu_bar", "menu_items", "menu_enabled", "menu_click"])        # сначала чтение, потом клик
         self.assertIn(("menu_click", "Правка", "Вставить"), self.mac.events)             # точный пункт, не «…стиль»
 
     def test_english_menu(self):
@@ -274,18 +277,20 @@ class TestAsciiAndMenuAndKeycode(CheckCase):
         self.mac.menu_items = "Отменить, Копировать"
         code, text, _ = self.run_check(User(), "--only", "З2")
         self.assertNotIn("menu_click", self.mac.names())
-        self.assertIn("нет пункта «Вставить»", text)
+        self.assertIn("пункт меню не найден", text)
+        self.assertIn("нет пункта Вставить/Paste", text)
         self.mac = FakeMac()
         self.mac.menu_bar = "Apple, Telegram, Файл"
         code, text, _ = self.run_check(User(), "--only", "З2")
         self.assertNotIn("menu_click", self.mac.names())
-        self.assertIn("нет «Правка»", text)
+        self.assertIn("пункт меню не найден", text)
+        self.assertIn("нет Правка/Изменить/Edit", text)
         self.assertEqual(self.mac.pasteboard, "старый буфер")
 
     def test_menu_names_are_printed(self):
         code, text, _ = self.run_check(User(verdicts=["н"]), "--only", "З2")
-        self.assertIn("меню: Apple, Telegram, Файл, Правка, Вид", text)
         self.assertIn("пункты «Правка»: Отменить, Вставить, Вставить и согласовать стиль", text)
+        self.assertIn("«Вставить»: доступен", text)
 
 
 class TestManualCheck(CheckCase):
@@ -540,8 +545,9 @@ class TestProductionUntouched(unittest.TestCase):
         source = open(tg.__file__, encoding="utf-8").read()
         # режимы reopen и direct боевые; type, click, key code 9, меню и клик из диагностики в боевой код не подключены
         self.assertEqual(tg.FOCUS_MODES, ("reopen", "direct"))
-        for name in ("TELEGRAM_PASTE_METHOD", "TELEGRAM_CLIPBOARD_METHOD", "key code 9",
-                     "click at", "key code 51", "import core.telegram_check", "from core import telegram_check"):
+        self.assertEqual(tg.PASTE_METHODS, ("keystroke", "keycode", "menu"))
+        for name in ("TELEGRAM_CLIPBOARD_METHOD", "click at", "key code 51", "key code 53",
+                     "import core.telegram_check", "from core import telegram_check"):
             self.assertNotIn(name, source)
 
 

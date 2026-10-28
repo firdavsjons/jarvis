@@ -71,6 +71,34 @@ def reopen_wait():
     return env_float("TELEGRAM_REOPEN_WAIT", DEFAULT_REOPEN_WAIT, 0.0, 5.0)
 
 
+PASTE_METHODS = ("keystroke", "keycode", "menu")
+DEFAULT_PASTE_METHOD = "keystroke"
+EDIT_MENUS = {"правка", "изменить", "edit"}      # как называется меню «Правка» в разных локализациях Telegram
+PASTE_ITEMS = {"вставить", "paste"}              # пункт меню (точное совпадение: «Вставить и согласовать стиль» не подходит)
+MENU_RECHECK_DELAY = 0.5                          # пункт «Вставить» серый — перед отказом прочитать его ещё раз
+
+
+def paste_method_setting():
+    """(способ, значение из .env, если оно не поддерживается)."""
+    raw = env_value("TELEGRAM_PASTE_METHOD")
+    if raw is None:
+        return DEFAULT_PASTE_METHOD, None
+    method = raw.strip().lower()
+    if method in PASTE_METHODS:
+        return method, None
+    return DEFAULT_PASTE_METHOD, raw
+
+
+def paste_method():
+    """TELEGRAM_PASTE_METHOD: keystroke (по умолчанию, `keystroke "v"`), keycode (`key code 9`, физическая клавиша V) или
+    menu (меню «Правка / Изменить → Вставить»). Другое значение — keystroke и предупреждение."""
+    method, unsupported = paste_method_setting()
+    if unsupported is not None:
+        log.warning("TELEGRAM_PASTE_METHOD=%s не поддерживается (допустимо keystroke, keycode, menu), использую keystroke",
+                    unsupported)
+    return method
+
+
 def paste_wait():
     """Пауза после Cmd+V до возврата прежнего буфера (0–5 с). Telegram читает буфер не мгновенно: вернуть его сразу —
     значит вставить старое содержимое или ничего. Подбирается диагностикой `python -m core.telegram_check`."""
@@ -93,6 +121,9 @@ SECRET_REFUSAL = "Такое я отправлять не буду."
 CLIPBOARD_NOT_TEXT = "В буфере обмена не текст, я его не сохраню. Скопируйте текст или очистите буфер."
 DISCARD_NOTE = "Отменил, черновик остался в чате, можете стереть его вручную."
 NOT_FOCUSED = "Telegram не в фокусе"
+MENU_NOT_FOUND = "пункт меню не найден"
+BUFFER_REJECTED = "буфер обмена не принял текст"
+FIELD_NOT_FOCUSED = "поле ввода не в фокусе (пункт «Вставить» недоступен)"
 
 # Типы буфера обмена из `clipboard info`: есть текст и нет ничего «кроме текста» — можно сохранить и вернуть
 _TEXT_TYPES = {"«class utf8»", "«class ut16»", "string", "unicode text", "«class rtf »", "«class html»", "text",
@@ -119,7 +150,37 @@ _WAIT_WINDOW = ["on run argv",
                 "return \"timeout\"",
                 "end run"]
 _PASTE = ["on run argv", 'tell application "System Events" to keystroke "v" using command down', "end run"]
+_PASTE_KEYCODE = ["on run argv", 'tell application "System Events" to key code 9 using command down', "end run"]
 _ENTER = ["on run argv", 'tell application "System Events" to key code 36', "end run"]
+# Меню: читаем названия и состояние (enabled) без клика, потом кликаем по найденному пункту. Всё — через argv
+_MENU_BAR = ["on run argv",
+             'tell application "System Events"',
+             "tell (first process whose bundle identifier is (item 1 of argv))",
+             "return name of every menu bar item of menu bar 1",
+             "end tell",
+             "end tell",
+             "end run"]
+_MENU_ITEMS = ["on run argv",
+               'tell application "System Events"',
+               "tell (first process whose bundle identifier is (item 1 of argv))",
+               "return name of every menu item of menu 1 of menu bar item (item 2 of argv) of menu bar 1",
+               "end tell",
+               "end tell",
+               "end run"]
+_MENU_ENABLED = ["on run argv",
+                 'tell application "System Events"',
+                 "tell (first process whose bundle identifier is (item 1 of argv))",
+                 "return enabled of every menu item of menu 1 of menu bar item (item 2 of argv) of menu bar 1",
+                 "end tell",
+                 "end tell",
+                 "end run"]
+_MENU_CLICK = ["on run argv",
+               'tell application "System Events"',
+               "tell (first process whose bundle identifier is (item 1 of argv))",
+               "click menu item (item 3 of argv) of menu 1 of menu bar item (item 2 of argv) of menu bar 1",
+               "end tell",
+               "end tell",
+               "end run"]
 _CLIPBOARD_INFO = ["clipboard info"]
 
 _lock = threading.Lock()
@@ -325,21 +386,80 @@ def _open_for_input(client, contact, mode, pause, not_ready=NOT_OPENED):
         time.sleep(PASTE_DELAY)
 
 
-def paste_draft(client, contact, text, wait, mode=None, pause=None):
+def _raw_list(raw):
+    """Вывод osascript для списка («a, b, missing value») -> элементы с сохранением порядка."""
+    return [part.strip() for part in str(raw).split(", ")] if str(raw).strip() else []
+
+
+def read_paste_item(client):
+    """Меню «Правка / Изменить / Edit» и его пункт «Вставить / Paste» — только чтение, без клика.
+    Возвращает {"menu", "item", "items" (названия), "enabled" (True / False / None — не прочитано)}.
+    Меню или пункт не найдены — ActionError «пункт меню не найден»."""
+    bar = _raw_list(common.osascript(SYSTEM_EVENTS, _MENU_BAR, client))
+    menu = next((n for n in bar if n.lower() in EDIT_MENUS), None)
+    if menu is None:
+        raise ActionError(f"в строке меню Telegram нет Правка/Изменить/Edit: {', '.join(bar)}", MENU_NOT_FOUND)
+    items = _raw_list(common.osascript(SYSTEM_EVENTS, _MENU_ITEMS, client, menu))
+    index = next((i for i, n in enumerate(items) if n.lower() in PASTE_ITEMS), None)
+    if index is None:
+        raise ActionError(f"в меню «{menu}» нет пункта Вставить/Paste: {', '.join(items)}", MENU_NOT_FOUND)
+    enabled = None
+    try:
+        flags = _raw_list(common.osascript(SYSTEM_EVENTS, _MENU_ENABLED, client, menu))
+        if len(flags) == len(items) and flags[index].lower() in ("true", "false"):
+            enabled = flags[index].lower() == "true"
+    except ActionError:
+        pass          # состояние не прочитано — это не ошибка вставки
+    return {"menu": menu, "item": items[index], "items": [n for n in items if n and n != "missing value"],
+            "enabled": enabled}
+
+
+def _press_paste(client, method):
+    """Вставка выбранным способом. menu: прочитать меню → если «Вставить» серый, прочитать ещё раз через 0,5 с (состояние
+    может быть устаревшим) → всё ещё серый: не кликать («поле ввода не в фокусе») → иначе клик. Без повторов."""
+    if method == "keycode":
+        common.osascript(SYSTEM_EVENTS, _PASTE_KEYCODE)
+    elif method == "menu":
+        state = read_paste_item(client)
+        log.info("Telegram: меню «%s», пункт «%s» найден, доступен: %s", state["menu"], state["item"],
+                 {True: "да", False: "нет", None: "не прочитано"}[state["enabled"]])
+        if state["enabled"] is False:
+            time.sleep(MENU_RECHECK_DELAY)
+            state = read_paste_item(client)
+            log.info("Telegram: повторное чтение через %.1f с — доступен: %s", MENU_RECHECK_DELAY,
+                     {True: "да", False: "нет", None: "не прочитано"}[state["enabled"]])
+            if state["enabled"] is False:
+                raise ActionError("пункт «Вставить» недоступен, Cmd+V не нажат", FIELD_NOT_FOCUSED)
+        common.osascript(SYSTEM_EVENTS, _MENU_CLICK, client, state["menu"], state["item"])
+    else:
+        common.osascript(SYSTEM_EVENTS, _PASTE)
+
+
+def paste_draft(client, contact, text, wait, mode=None, pause=None, method=None, probe=None):
     """Черновик в поле ввода: открыть чат (см. _open_for_input; режим и паузы из .env), положить текст в буфер,
-    проверить, что Telegram впереди, Cmd+V, подождать wait секунд. Буфер возвращает вызывающий (после этой паузы).
-    Telegram не впереди в момент Cmd+V — клавиша не нажимается."""
+    проверить, что Telegram впереди и что буфер принял текст (pbpaste, длина), вставить выбранным способом
+    (TELEGRAM_PASTE_METHOD), подождать wait секунд. Буфер возвращает вызывающий (после этой паузы). Telegram не впереди
+    или буфер не совпал — вставка не нажимается. probe — необязательная функция диагностики, вызывается перед вставкой."""
     mode = mode or focus_mode()
+    method = method or paste_method()
     _open_for_input(client, contact, mode, reopen_wait() if pause is None else pause)
     common.run_cmd(["pbcopy"], stdin=text, env=_utf8_env())
     front = _frontmost()
     if front != client:
-        log.warning("Telegram: перед Cmd+V впереди другое приложение (%s), клавиши не нажимаю", front or "неизвестно")
+        log.warning("Telegram: перед вставкой впереди другое приложение (%s), клавиши не нажимаю", front or "неизвестно")
         raise ActionError("Telegram не в фокусе перед вставкой, Cmd+V не нажат", NOT_FOCUSED)
-    common.osascript(SYSTEM_EVENTS, _PASTE)
-    log.info("Telegram: Cmd+V нажат, длина текста %d", len(text))
+    in_buffer = common.run_cmd(["pbpaste"], env=_utf8_env())
+    if in_buffer != text:
+        log.warning("Telegram: буфер обмена не принял текст (в буфере %d симв., нужно %d), вставку не нажимаю",
+                    len(in_buffer), len(text))
+        raise ActionError("буфер обмена не принял текст, вставка не нажата", BUFFER_REJECTED)
+    log.info("Telegram: буфер обмена принял текст, длина %d", len(text))
+    if probe is not None:
+        probe()
+    _press_paste(client, method)
+    log.info("Telegram: вставка нажата (способ %s), длина текста %d", method, len(text))
     time.sleep(wait)
-    log.info("Telegram: после Cmd+V ждали %.1f с", wait)
+    log.info("Telegram: после вставки ждали %.1f с", wait)
 
 
 def prepare(action, to, text, phrase=""):
@@ -407,7 +527,8 @@ def _send(to, text, phrase):
             raise ActionError(*not_focused)
         time.sleep(BEFORE_ENTER_DELAY)
     common.osascript(SYSTEM_EVENTS, _ENTER)
-    return common.done(f"Нажал отправку в чате с {contact.title}")
+    # Что именно попало в поле, прочитать нельзя: честно говорим, что нажато, а не «отправлено»
+    return common.done(f"Нажал Enter в чате с {contact.title}. Если сообщения нет, поле было пустым.")
 
 
 def run(action, to, text, phrase=""):

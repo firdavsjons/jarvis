@@ -1,18 +1,19 @@
-"""Диагностика вставки черновика в Telegram: python -m core.telegram_check [--to <имя>] [--only Е,З1,…]
+"""Диагностика вставки черновика в Telegram: python -m core.telegram_check [--to <имя>] [--repeat N] [--methods …]
 
-Запускает ПОЛЬЗОВАТЕЛЬ (тесты — только на моках). Вставляет ФИКСИРОВАННЫЙ тест «проверка Jarvis (черновик)» (и
-«jarvis test» в варианте Ж) в чат из contacts.json (по умолчанию «себе»). Enter не нажимается ни в одном варианте;
-черновики пользователь стирает вручную. Боевую отправку скрипт не меняет и не использует.
+Запускает ПОЛЬЗОВАТЕЛЬ (тесты — только на моках). Вставляет ФИКСИРОВАННЫЙ тест «проверка Jarvis (черновик)» в чат из
+contacts.json (по умолчанию «себе»). Enter не нажимается нигде; черновики пользователь стирает вручную (скрипт не стирает).
 
-Порядок: раскладка → разрешения → контакт → открыть чат → варианты
-  Е  проверка буфера (AppleScript и pbcopy), без вопроса;
-  З1 Cmd+V по физической клавише (key code 9, не зависит от раскладки);
-  А  боевой путь (режим и паузы из .env), буфер возвращается сразу;  Б  боевой способ целиком (значения из .env);
-  Ж  латиница «jarvis test», порядок шагов как в Б;
-  З2 меню «Правка → Вставить»;                   Д  чат по ссылке открывается второй раз, пауза 1,0 с, Cmd+V;
-  Г  (рискованный) пробел, Delete, Cmd+V;        В  (рискованный) один клик в поле ввода, Cmd+V;
-  И  ручная проверка (только если ничего не сработало).
-Г и В запускаются, только если ни один безопасный вариант (З1, А, Б, Ж, З2, Д) не дал «д».
+РЕЖИМ ПО УМОЛЧАНИЮ — повторы боевой фазы 1 (Этап 7.1.5):
+  для каждого способа вставки (--methods keystroke,keycode,menu) N попыток подряд (--repeat N, по умолчанию 3): боевой
+  путь (режим и паузы из .env), перед каждой попыткой пользователь стирает черновик, после — «Появился ли текст? (д/н/п)».
+  В каждой попытке печатается состояние пункта «Вставить» меню Telegram (доступен / недоступен / не прочитано) — для
+  сопоставления с ответом; --open-menu дополнительно один раз за попытку открывает меню «Изменить» кликом по строке меню и
+  закрывает Escape (по пунктам не кликает), чтобы сравнить состояние до и после открытия. Итог — таблица «способ × попытка»
+  и строка TELEGRAM_PASTE_METHOD=… для .env.
+
+ПРЕЖНИЕ ВАРИАНТЫ (--only Е,З1,А,Б,Ж,З2,Д,Г,В,И, Этап 7.1.3): Е — проверка буфера; З1 — key code 9; А/Б — боевой путь с
+возвратом буфера сразу / через паузу из .env; Ж — латиница; З2 — меню; Д — чат по ссылке дважды; Г — пробел + Delete и
+В — клик (рискованные, только если безопасные не помогли); И — ручная проверка.
 Краткий итог (без текста, username и телефонов) сохраняется в telegram_check_last.json и сравнивается со следующим
 запуском: так видно, влияет ли раскладка клавиатуры.
 """
@@ -41,6 +42,16 @@ CLICK_X_FRACTION = 0.62    # вариант В: x = левый край окна
 CLICK_BOTTOM_OFFSET = 38   # вариант В: y = нижний край окна − 38 пикселей
 CLICK_MIN_WIDTH = 700      # окно уже — вариант В пропускается
 
+STATE_TEXT = {True: "доступен", False: "недоступен", None: "не прочитано"}
+REPEAT_DEFAULT = 3
+REPEAT_MAX = 10
+METHOD_PREFERENCE = ("keystroke", "keycode", "menu")      # при равенстве предпочитаем самый простой
+OPEN_MENU_DELAY = 0.3
+UNRELIABLE_NOTE = ("Состояние пункта «Вставить» не является надёжным индикатором фокуса в вашем Telegram, "
+                   "не используйте режим menu как проверку")
+ERASE_PROMPT = ("Сотрите черновик в Telegram вручную (скрипт его не стирает), затем нажмите Enter здесь "
+                "(или «п» — пропустить попытку): ")
+
 SAFE_VARIANTS = ("З1", "А", "Б", "Ж", "З2", "Д")
 RISKY_VARIANTS = ("Г", "В")
 ORDER = ("Е", "З1", "А", "Б", "Ж", "З2", "Д", "Г", "В", "И")
@@ -52,7 +63,7 @@ LAYOUT_WARNING = "Для сравнения запустите диагност�
 _PROBE_AUTOMATION = ['tell application "System Events" to return name of first process whose frontmost is true']
 _PROBE_ACCESSIBILITY = ['tell application "System Events" to return count of windows of '
                         '(first process whose frontmost is true)']
-_PASTE_KEYCODE = ["on run argv", 'tell application "System Events" to key code 9 using command down', "end run"]
+_PASTE_KEYCODE = tg._PASTE_KEYCODE
 _TYPE_SPACE = ["on run argv", 'tell application "System Events" to keystroke " "', "end run"]
 _DELETE = ["on run argv", 'tell application "System Events" to key code 51', "end run"]
 _CLIPBOARD_AS = ["on run argv",
@@ -75,31 +86,18 @@ _WINDOW_GEOMETRY = ["on run argv",
 _CLICK = ["on run argv",
           'tell application "System Events" to click at {(item 1 of argv) as integer, (item 2 of argv) as integer}',
           "end run"]
-_MENU_BAR = ["on run argv",
-             'tell application "System Events"',
-             "tell (first process whose bundle identifier is (item 1 of argv))",
-             "return name of every menu bar item of menu bar 1",
-             "end tell",
-             "end tell",
-             "end run"]
-_MENU_ITEMS = ["on run argv",
-               'tell application "System Events"',
-               "tell (first process whose bundle identifier is (item 1 of argv))",
-               "return name of every menu item of menu 1 of menu bar item (item 2 of argv) of menu bar 1",
-               "end tell",
-               "end tell",
-               "end run"]
-_MENU_CLICK = ["on run argv",
-               'tell application "System Events"',
-               "tell (first process whose bundle identifier is (item 1 of argv))",
-               "click menu item (item 3 of argv) of menu 1 of menu bar item (item 2 of argv) of menu bar 1",
-               "end tell",
-               "end tell",
-               "end run"]
-EDIT_MENUS = {"правка", "edit"}
-PASTE_ITEMS = {"вставить", "paste"}
+# Скрипты меню общие с боевым кодом (core/apps/telegram.py): диагностика проверяет именно их
+_MENU_BAR, _MENU_ITEMS, _MENU_ENABLED, _MENU_CLICK = tg._MENU_BAR, tg._MENU_ITEMS, tg._MENU_ENABLED, tg._MENU_CLICK
+_MENU_OPEN = ["on run argv",       # только строка меню: клик по названию меню, не по его пунктам
+              'tell application "System Events"',
+              "tell (first process whose bundle identifier is (item 1 of argv))",
+              "click menu bar item (item 2 of argv) of menu bar 1",
+              "end tell",
+              "end tell",
+              "end run"]
+_ESCAPE = ["on run argv", 'tell application "System Events" to key code 53', "end run"]
 ALL_SCRIPTS = (_PROBE_AUTOMATION, _PROBE_ACCESSIBILITY, _PASTE_KEYCODE, _TYPE_SPACE, _DELETE, _CLIPBOARD_AS,
-               _WINDOW_GEOMETRY, _CLICK, _MENU_BAR, _MENU_ITEMS, _MENU_CLICK)    # новые скрипты диагностики
+               _WINDOW_GEOMETRY, _CLICK, _MENU_BAR, _MENU_ITEMS, _MENU_ENABLED, _MENU_CLICK, _MENU_OPEN, _ESCAPE)
 
 
 class Skipped(Exception):
@@ -183,23 +181,15 @@ def _paste_keycode(ctx):
     common.osascript(tg.SYSTEM_EVENTS, _PASTE_KEYCODE)
 
 
-def _names(raw):
-    return [part.strip() for part in raw.split(",") if part.strip() and part.strip() != "missing value"]
-
-
 def _paste_menu(ctx):
-    """Меню «Правка → Вставить»: сначала только чтение названий, потом клик по найденному пункту."""
-    bar = _names(common.osascript(tg.SYSTEM_EVENTS, _MENU_BAR, ctx.client))
-    ctx.report.say(f"     меню: {', '.join(bar) or '(пусто)'}")
-    edit = next((n for n in bar if n.lower() in EDIT_MENUS), None)
-    if edit is None:
-        raise Skipped("в строке меню Telegram нет «Правка» / «Edit»")
-    items = _names(common.osascript(tg.SYSTEM_EVENTS, _MENU_ITEMS, ctx.client, edit))
-    ctx.report.say(f"     пункты «{edit}»: {', '.join(items) or '(пусто)'}")
-    paste = next((n for n in items if n.lower() in PASTE_ITEMS), None)
-    if paste is None:
-        raise Skipped(f"в меню «{edit}» нет пункта «Вставить» / «Paste»")
-    common.osascript(tg.SYSTEM_EVENTS, _MENU_CLICK, ctx.client, edit, paste)
+    """Меню «Правка / Изменить / Edit → Вставить»: сначала только чтение названий и состояния, потом клик."""
+    try:
+        state = tg.read_paste_item(ctx.client)
+    except ActionError as e:
+        raise Skipped(f"{e.short}: {e}")
+    ctx.report.say(f"     пункты «{state['menu']}»: {', '.join(state['items']) or '(пусто)'}")
+    ctx.report.say(f"     «{state['item']}»: {STATE_TEXT[state['enabled']]}")
+    common.osascript(tg.SYSTEM_EVENTS, _MENU_CLICK, ctx.client, state["menu"], state["item"])
 
 
 def _type_space_and_delete(ctx):
@@ -395,16 +385,17 @@ def analyse(results, clipboard):
     return lines, env
 
 
-def _nothing_worked_help():
-    return ["Ни один вариант не сработал. Опишите, пожалуйста, что видно в окне Telegram: есть ли внизу поле ввода "
-            "сообщения, открыт чат или профиль, мигает ли курсор, есть ли кнопки вместо поля (START, Mute, Join).",
+def _nothing_worked_help(heading=True):
+    return [("Ни один вариант не сработал. " if heading else "") + "Опишите, пожалуйста, что видно в окне Telegram: есть "
+            "ли внизу поле ввода сообщения, открыт чат или профиль, мигает ли курсор, есть ли кнопки вместо поля "
+            "(START, Mute, Join).",
             "Следующие три проверки:",
             "  1) переключите раскладку на английскую и запустите диагностику ещё раз, затем с русской (сравнение "
             "покажет, влияет ли раскладка);",
             "  2) откройте тот же чат вручную, кликните в поле, нажмите Cmd+V руками и посмотрите, вставляется ли "
             "что-либо; попробуйте другой контакт (--to);",
-            "  3) проверьте меню «Правка» в строке меню Telegram (пункт «Вставить» должен быть доступен) и "
-            "версию Telegram; при возможности — тот же сценарий в Telegram Desktop."]
+            "  3) проверьте меню «Правка / Изменить» в строке меню Telegram (пункт «Вставить») и версию Telegram; при "
+            "возможности — тот же сценарий в Telegram Desktop."]
 
 
 def compare_with_last(previous, layout_kind, results):
@@ -431,14 +422,204 @@ def _kind_name(kind):
     return {"ru": "русской", "en": "английской"}.get(kind, kind)
 
 
-def summary_for_file(layout, kind, results, clipboard):
-    """Итог для telegram_check_last.json: только исходы вариантов, раскладка и время — без текста и контактов."""
-    return {"time": datetime.now().astimezone().isoformat(timespec="seconds"), "layout": layout, "layout_kind": kind,
+def summary_for_file(layout, kind, results, clipboard, repeat=None):
+    """Итог для telegram_check_last.json: только исходы, раскладка и время — без текста и контактов."""
+    data = {"time": datetime.now().astimezone().isoformat(timespec="seconds"), "layout": layout, "layout_kind": kind,
             "results": {vid: (value if isinstance(value, bool) else None) for vid, value in results.items()},
             "clipboard": {k: v for k, v in clipboard.items() if isinstance(v, bool)}}
+    if repeat is not None:
+        data["repeat"] = {m: [a if isinstance(a, bool) else None for a in answers] for m, answers in repeat.items()}
+    return data
 
 
 # --- Основной сценарий ---
+
+# --- Повторы боевой фазы 1 (режим по умолчанию) ---
+
+def parse_methods(raw):
+    methods = []
+    for part in re.split(r"[,\s]+", (raw or "").strip().lower()):
+        if not part:
+            continue
+        if part not in tg.PASTE_METHODS:
+            raise SystemExit(f"неизвестный способ {part!r}; допустимо: {', '.join(tg.PASTE_METHODS)}")
+        if part not in methods:
+            methods.append(part)
+    if not methods:
+        raise SystemExit("не указан ни один способ вставки")
+    return methods
+
+
+def parse_repeat(value):
+    if not 1 <= value <= REPEAT_MAX:
+        raise SystemExit(f"--repeat должен быть от 1 до {REPEAT_MAX}")
+    return value
+
+
+def state_after_open(ctx, menu_name):
+    """Один раз открыть меню кликом ПО СТРОКЕ МЕНЮ (по пунктам не кликаем), прочитать состояние «Вставить» при
+    открытом меню, закрыть Escape. Меню не открылось — Escape не нажимаем (в Telegram он закрыл бы чат)."""
+    try:
+        common.osascript(tg.SYSTEM_EVENTS, _MENU_OPEN, ctx.client, menu_name)
+    except ActionError:
+        return None
+    try:
+        time.sleep(OPEN_MENU_DELAY)
+        try:
+            return tg.read_paste_item(ctx.client)["enabled"]
+        except ActionError:
+            return None
+    finally:
+        try:
+            common.osascript(tg.SYSTEM_EVENTS, _ESCAPE)
+        except ActionError:
+            pass
+        time.sleep(OPEN_MENU_DELAY)
+
+
+def probe_state(ctx, rec, open_menu):
+    """Перед Cmd+V (вызывается из боевой фазы 1): состояние пункта «Вставить» только чтением; с --open-menu — ещё и после
+    открытия меню."""
+    try:
+        info = tg.read_paste_item(ctx.client)
+    except ActionError as e:
+        rec["menu_error"] = e.short
+        return
+    rec["state"] = info["enabled"]
+    if not ctx.items_shown:
+        ctx.items_shown = True
+        ctx.report.say(f"     меню «{info['menu']}», пункты (чтение, без клика): {', '.join(info['items']) or '(пусто)'}")
+    if open_menu:
+        rec["state_open"] = state_after_open(ctx, info["menu"])
+
+
+def cell(rec):
+    if rec["answer"] is True:
+        return "д"
+    if rec["answer"] is False:
+        return "н"
+    return "—" if rec["note"] in (None, "пропущена") else "О"
+
+
+def run_repeat(ctx, methods, repeat, open_menu):
+    """Для каждого способа N попыток боевой фазы 1; скрипт ничего не стирает, Enter не нажимает."""
+    attempts = []
+    ctx.items_shown = False
+    for method in methods:
+        ctx.report.say(f"\nСпособ {method}")
+        for n in range(1, repeat + 1):
+            rec = {"method": method, "n": n, "answer": None, "state": None, "state_open": None, "note": None}
+            attempts.append(rec)
+            ctx.report.say(f"  Попытка {n}/{repeat}")
+            if ctx.input_fn(ERASE_PROMPT).strip().lower() in SKIP:
+                rec["note"] = "пропущена"
+                ctx.report.say("  пропущена по вашему выбору")
+                continue
+            try:
+                saved = tg._save_clipboard()
+            except ActionError as e:
+                rec["note"] = e.reply or e.short
+                ctx.report.say(f"  [ошибка] буфер обмена — {rec['note']}")
+                continue
+            started = time.monotonic()
+            try:
+                try:
+                    tg.paste_draft(ctx.client, ctx.contact, TEST_TEXT, tg.paste_wait(), method=method,
+                                   probe=lambda: probe_state(ctx, rec, open_menu))
+                    ctx.report.say(f"  [ok] боевая фаза 1, способ {method} ({time.monotonic() - started:.1f} с)")
+                except ActionError as e:
+                    rec["note"] = e.reply or e.short
+                    ctx.report.say(f"  [ошибка] боевая фаза 1, способ {method} — {rec['note']} "
+                                   f"({time.monotonic() - started:.1f} с)")
+            finally:
+                ctx.report.step("вернуть прежний буфер обмена", lambda: tg._restore_clipboard(saved))
+            shown = f"Вставить перед Cmd+V: {STATE_TEXT[rec['state']]}"
+            if open_menu:
+                shown += f"; после открытия меню: {STATE_TEXT[rec['state_open']]}"
+            ctx.report.say(f"  {shown}")
+            if rec["note"] is None:
+                rec["answer"] = ask_choice(f"Появился ли текст в поле ввода? (д/н/п или y/n/s) [{shown}]: ",
+                                           ctx.input_fn, ctx.out)
+    return attempts
+
+
+def repeat_verdict(attempts, methods):
+    """(строки вывода, строки для .env)."""
+    lines, env = [], []
+    stable, partial = [], []
+    for method in methods:
+        rows = [r for r in attempts if r["method"] == method and r["note"] != "пропущена"]
+        answers = [r["answer"] for r in rows]
+        if answers and all(a is True for a in answers):
+            stable.append(method)
+        elif any(a is True for a in answers):
+            partial.append(method)
+    best = next((m for m in METHOD_PREFERENCE if m in stable), None)
+    if best:
+        lines.append(f"Способ «{best}» сработал во всех попытках." + (
+            f" Также стабильны: {', '.join(m for m in stable if m != best)}." if len(stable) > 1 else ""))
+        env.append(f"TELEGRAM_PASTE_METHOD={best}")
+    else:
+        if partial:
+            lines.append("Ни один способ не сработал во всех попытках; частично сработали: " + ", ".join(partial) + ".")
+        else:
+            lines.append("Ни один способ не сработал.")
+        lines.extend(_nothing_worked_help(heading=False))
+    answered = [r for r in attempts if r["answer"] in (True, False) and r["state"] in (True, False)]
+    if any(r["method"] in ("keystroke", "keycode") and r["state"] is False and r["answer"] is True for r in attempts):
+        lines.append(UNRELIABLE_NOTE + ".")
+    elif answered and any(r["answer"] for r in answered) and any(not r["answer"] for r in answered) and all(
+            r["answer"] == r["state"] for r in answered):
+        lines.append("Состояние «Вставить» совпало с результатом (доступен — текст появился, недоступен — нет): "
+                     "режим menu можно использовать как проверку фокуса.")
+    refused = [r for r in attempts if r["note"] == tg.FIELD_NOT_FOCUSED]
+    if refused:
+        lines.append(f"Способ menu отказался нажимать {len(refused)} раз(а): «Вставить» был недоступен.")
+    return lines, env
+
+
+def render_repeat(ctx, attempts, methods):
+    ctx.report.say("\nРЕЗУЛЬТАТ")
+    ctx.report.say("  Способ × попытка (д — текст появился, н — нет, О — ошибка/отказ, — пропуск):")
+    for method in methods:
+        row = "  ".join(f"{r['n']}:{cell(r)}" for r in attempts if r["method"] == method)
+        ctx.report.say(f"    {method:<10} {row}")
+    ctx.report.say("  Подробно: способ | попытка | текст появился | Вставить: доступен/недоступен/не прочитано"
+                   + (" | после открытия меню" if any(r["state_open"] is not None for r in attempts) else ""))
+    for r in attempts:
+        extra = f" | {STATE_TEXT[r['state_open']]}" if r["state_open"] is not None else ""
+        note = f" ({r['note']})" if r["note"] and r["note"] != "пропущена" else ""
+        ctx.report.say(f"    {r['method']:<10} | {r['n']} | {cell(r)} | {STATE_TEXT[r['state']]}{extra}{note}")
+
+
+def repeat_summary(attempts, methods):
+    return {m: [r["answer"] for r in attempts if r["method"] == m] for m in methods}
+
+
+def compare_repeat(previous, layout_kind, repeat_results):
+    """Влияет ли раскладка: сравнение исходов по способам с прошлым запуском."""
+    if not previous or not isinstance(previous.get("repeat"), dict):
+        return "Раскладка: сравнить не с чем — " + LAYOUT_WARNING
+    prev_kind = previous.get("layout_kind")
+    if "?" in (prev_kind, layout_kind) or prev_kind == layout_kind:
+        same = "та же раскладка" if prev_kind == layout_kind else "раскладка не определена"
+        return f"Раскладка: прошлый запуск — {same}, для сравнения переключите раскладку и запустите ещё раз."
+
+    def outcome(answers):
+        answers = [a for a in (answers or []) if a in (True, False)]
+        return None if not answers else ("все «д»" if all(answers) else "есть «н»")
+
+    differs = []
+    for method, now in repeat_results.items():
+        before = outcome(previous["repeat"].get(method))
+        after = outcome(now)
+        if before and after and before != after:
+            differs.append(f"{method}: {_kind_name(prev_kind)} — {before}, {_kind_name(layout_kind)} — {after}")
+    if differs:
+        return "Раскладка ВЛИЯЕТ: " + "; ".join(differs)
+    return (f"Раскладка не влияет: исходы при {_kind_name(prev_kind)} и {_kind_name(layout_kind)} одинаковы "
+            f"(по способам, которые удалось сравнить).")
+
 
 def parse_only(raw):
     if not raw:
@@ -457,10 +638,20 @@ def parse_only(raw):
 def main(argv=None, input_fn=input, out=sys.stdout):
     parser = argparse.ArgumentParser(description="Диагностика вставки черновика в Telegram (запускает пользователь)")
     parser.add_argument("--to", default=tg.SELF_KEY, help="контакт из contacts.json (по умолчанию «себе»)")
-    parser.add_argument("--only", help="только эти варианты, например Е,З1,Д (З = З1 и З2); тогда Г и В запускаются, "
-                                       "если названы явно")
+    parser.add_argument("--only", help="прежние варианты вместо повторов: например Е,З1,Д (З = З1 и З2); тогда Г и В "
+                                       "запускаются, если названы явно")
+    parser.add_argument("--variants", action="store_true",
+                        help="прежний полный набор вариантов Е, З1, А, Б, Ж, З2, Д, Г, В, И вместо повторов (Этап 7.1.3)")
+    parser.add_argument("--repeat", type=int, default=REPEAT_DEFAULT,
+                        help=f"попыток на каждый способ (1–{REPEAT_MAX}, по умолчанию {REPEAT_DEFAULT})")
+    parser.add_argument("--methods", default=",".join(tg.PASTE_METHODS),
+                        help="способы вставки для сравнения: keystroke,keycode,menu (по умолчанию все три)")
+    parser.add_argument("--open-menu", action="store_true",
+                        help="в каждой попытке один раз открыть меню «Изменить» кликом по строке меню и закрыть Escape "
+                             "(по пунктам не кликает), сравнить состояние «Вставить» до и после")
     args = parser.parse_args(argv)
     only = parse_only(args.only)
+    methods, repeat = parse_methods(args.methods), parse_repeat(args.repeat)
     report = Report(out)
     ctx = SimpleNamespace(report=report, input_fn=input_fn, out=out, client=None, contact=None)
 
@@ -470,10 +661,13 @@ def main(argv=None, input_fn=input, out=sys.stdout):
     report.say(LAYOUT_WARNING)
     mode, unsupported = tg.focus_mode_setting()
     report.say(f"Боевой режим из .env: TELEGRAM_FOCUS_MODE={mode}, TELEGRAM_REOPEN_WAIT={tg.reopen_wait():.1f}, "
-               f"TELEGRAM_PASTE_WAIT={tg.paste_wait():.1f}")
+               f"TELEGRAM_PASTE_WAIT={tg.paste_wait():.1f}, TELEGRAM_PASTE_METHOD={tg.paste_method_setting()[0]}")
     if unsupported is not None:
         report.say(f"  (TELEGRAM_FOCUS_MODE={unsupported} не поддерживается — боевой код использует reopen)")
-    report.say(f"В чат «{args.to}» вставляется только фиксированный тест: «{TEST_TEXT}» (и «{ASCII_TEXT}» в варианте Ж).\n")
+    if tg.paste_method_setting()[1] is not None:
+        report.say(f"  (TELEGRAM_PASTE_METHOD={tg.paste_method_setting()[1]} не поддерживается — боевой код использует keystroke)")
+    report.say(f"В чат «{args.to}» вставляется только фиксированный тест: «{TEST_TEXT}»"
+               + (f" (и «{ASCII_TEXT}» в варианте Ж)." if only is not None else ".") + "\n")
 
     report.say("1. Разрешения macOS")
     automation = report.step("Автоматизация → System Events",
@@ -500,6 +694,9 @@ def main(argv=None, input_fn=input, out=sys.stdout):
         report.say("\nСначала исправьте шаг 3 (Telegram должен выходить на передний план), потом повторите.")
         return 1
     report.say(f"     время ожидания: {time.monotonic() - started:.1f} с")
+
+    if only is None and not args.variants:
+        return _main_repeat(ctx, args, methods, repeat, layout, kind)
 
     report.say("\n4. Варианты")
     wanted = lambda vid: only is None or vid in only      # noqa: E731
@@ -571,6 +768,35 @@ def main(argv=None, input_fn=input, out=sys.stdout):
     report.say(f"  {compare_with_last(previous, kind, results)}")
     try:
         atomic_write_json(LAST_FILE, summary_for_file(layout, kind, results, clipboard))
+    except OSError as e:
+        report.say(f"  (итог запуска сохранить не удалось: {e.strerror})")
+    report.say("\nНапоминание: в чате «" + args.to + "» мог остаться черновик «" + TEST_TEXT + "». Он не отправлен — "
+               "сотрите его вручную.")
+    return 0
+
+
+def _main_repeat(ctx, methods_args, methods, repeat, layout, kind):
+    report = ctx.report
+    args = methods_args
+    report.say(f"\n4. Повторы боевой фазы 1: способы {', '.join(methods)}, по {repeat} попытк(и/ок) каждый. "
+               f"Черновики стираете вы, Enter не нажимается.")
+    if args.open_menu:
+        report.say("   --open-menu: в каждой попытке один клик по строке меню «Изменить» и Escape (по пунктам не кликаем).")
+    attempts = run_repeat(ctx, methods, repeat, args.open_menu)
+    render_repeat(ctx, attempts, methods)
+    lines, env = repeat_verdict(attempts, methods)
+    previous = read_json(LAST_FILE, None)
+    report.say("")
+    for line in lines:
+        report.say(f"  Вывод: {line}")
+    if env:
+        report.say("  Строка для .env:")
+        for line in env:
+            report.say(f"    {line}")
+    summary = repeat_summary(attempts, methods)
+    report.say(f"  {compare_repeat(previous, kind, summary)}")
+    try:
+        atomic_write_json(LAST_FILE, summary_for_file(layout, kind, {}, {}, repeat=summary))
     except OSError as e:
         report.say(f"  (итог запуска сохранить не удалось: {e.strerror})")
     report.say("\nНапоминание: в чате «" + args.to + "» мог остаться черновик «" + TEST_TEXT + "». Он не отправлен — "
