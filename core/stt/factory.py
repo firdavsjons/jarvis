@@ -4,6 +4,7 @@ STT_ENGINE=whisper_cpp|faster_whisper|google (по умолчанию whisper_cp
 STT_FALLBACK=google|off      (по умолчанию google; off — звук никуда не уходит, при сбое «Не удалось распознать речь»)
 STT_MODEL                    (пусто — по умолчанию движка: large-v3-turbo-q5_0 / small)
 STT_LANGUAGE=ru
+STT_PROMPT=on|off           (по умолчанию on; off — подсказка Whisper вообще не строится и не передаётся)
 STT_THREADS=4                (не больше половины ядер процессора)
 STT_UNLOAD_MINUTES=10        (простой, после которого модель выгружается из памяти; 0 — не выгружать)
 """
@@ -25,6 +26,7 @@ DEFAULT_ENGINE = "whisper_cpp"
 ENGINE_ALIASES = {"whisper": "whisper_cpp", "whispercpp": "whisper_cpp", "whisper_cpp": "whisper_cpp",
                   "faster_whisper": "faster_whisper", "fasterwhisper": "faster_whisper", "google": "google"}
 FALLBACK_OFF = {"off", "no", "false", "0", "none", "нет"}
+PROMPT_OFF = FALLBACK_OFF      # те же слова: off, no, false, 0, none
 DEFAULT_THREADS = 4
 DEFAULT_UNLOAD_MINUTES = 10
 
@@ -35,6 +37,7 @@ class SttSettings:
     fallback: bool
     model: str
     language: str
+    prompt: bool
     threads: int
     unload_minutes: float
 
@@ -55,8 +58,9 @@ def stt_settings():
     wanted = int(env_float("STT_THREADS", DEFAULT_THREADS, 1, 64))
     if wanted > half:
         log.info("STT_THREADS=%d ограничено половиной ядер: %d", wanted, half)
+    prompt = (env_value("STT_PROMPT", "on") or "on").strip().lower() not in PROMPT_OFF
     return SttSettings(engine=engine, fallback=fallback, model=env_value("STT_MODEL", "") or "",
-                       language=env_value("STT_LANGUAGE", "ru") or "ru", threads=min(wanted, half),
+                       language=env_value("STT_LANGUAGE", "ru") or "ru", prompt=prompt, threads=min(wanted, half),
                        unload_minutes=env_float("STT_UNLOAD_MINUTES", DEFAULT_UNLOAD_MINUTES, 0, 1440))
 
 
@@ -69,4 +73,5 @@ def build_stt(recognizer, notify=None, settings=None):
     engines = {"whisper_cpp": WhisperCppEngine, "faster_whisper": FasterWhisperEngine}
     primary = engines[settings.engine](model=settings.model, language=settings.language, threads=settings.threads,
                                        unload_minutes=settings.unload_minutes, models_dir=models_dir())
-    return SpeechToText(primary, google if settings.fallback else None, PromptProvider(), notify)
+    return SpeechToText(primary, google if settings.fallback else None, PromptProvider() if settings.prompt else None,
+                        notify)

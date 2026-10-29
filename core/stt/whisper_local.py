@@ -15,6 +15,7 @@ import time
 
 from core.stt.base import Engine, Loading, Recognition, Segment, SttError, Unavailable
 from core.stt.blacklist import is_blacklisted
+from core.stt.prompt_echo import is_prompt_echo, strip_labels
 from core.stt.repeats import collapse_repeats
 
 log = logging.getLogger(__name__)
@@ -22,6 +23,9 @@ log = logging.getLogger(__name__)
 NO_SPEECH_MAX = 0.6
 LOGPROB_MIN = -1.0
 WARMUP_SECONDS = 0.5      # тихий фрагмент для прогрева (первый запуск Metal / ядер заметно медленнее)
+ECHO_STREAK_WARNING = 3   # столько фраз подряд с эхом или метками подсказки — предупреждение в лог
+PROMPT_DISTORTS = ("Подсказка искажает распознавание; сравните: python -m core.stt.check --mic --no-prompt, "
+                   "или STT_PROMPT=off")
 
 
 def filter_segments(segments):
@@ -70,6 +74,9 @@ class LocalWhisper(Engine):
         self._timer = None
         self._last_used = clock()
         self.unavailable = None               # Unavailable, если state == unavailable
+        self.echo_total = 0                   # за запуск: фраз, отброшенных как эхо подсказки
+        self.labels_total = 0                 # за запуск: фраз, из которых убраны метки подсказки
+        self._echo_streak = 0                 # подряд фраз с эхом или метками (только когда подсказка передаётся)
         self.load_seconds = None
 
     # --- крючки движка -------------------------------------------------------------------------------------------
@@ -198,9 +205,33 @@ class LocalWhisper(Engine):
             self._last_used = self._clock()
         kept, reason = filter_segments(segments)
         text = " ".join(s.text.strip() for s in kept).strip()
-        collapsed = collapse_repeats(text)
-        if collapsed != text:
-            log.info("Повтор в распознанном тексте схлопнут (было %d симв., стало %d)", len(text), len(collapsed))
-            text = collapsed
+        confidence = confidence_of(kept)
+        discarded = reason
+        if text:
+            text, discarded = self._clean_prompt_echo(text, prompt, audio.seconds, confidence)
+        if text:
+            collapsed = collapse_repeats(text)
+            if collapsed != text:
+                log.info("Повтор в распознанном тексте схлопнут (было %d симв., стало %d)", len(text), len(collapsed))
+                text = collapsed
         return Recognition(text=text, engine=self.name, seconds=elapsed, audio_seconds=audio.seconds,
-                           confidence=confidence_of(kept), discarded=reason)
+                           confidence=confidence, discarded=discarded)
+
+    def _clean_prompt_echo(self, text, prompt, audio_seconds, confidence):
+        """(текст, причина отказа): метки подсказки убираются; пустой остаток или текст-эхо подсказки отбрасываются.
+        Счётчики за запуск и предупреждение о трёх фразах подряд — в лог, без текста."""
+        text, removed = strip_labels(text)
+        if removed:
+            self.labels_total += 1
+            log.info("Убраны метки подсказки, всего: %d", self.labels_total)
+        echo = (removed and not text) or (bool(text) and bool(prompt) and is_prompt_echo(text, prompt, audio_seconds,
+                                                                                         confidence))
+        if echo:
+            self.echo_total += 1
+            log.info("Отброшено (эхо подсказки), всего за запуск: %d", self.echo_total)
+        if prompt:
+            self._echo_streak = self._echo_streak + 1 if (removed or echo) else 0
+            if self._echo_streak >= ECHO_STREAK_WARNING:
+                log.warning(PROMPT_DISTORTS)
+                self._echo_streak = 0
+        return ("", "prompt_echo") if echo else (text, None)

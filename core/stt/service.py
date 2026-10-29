@@ -76,7 +76,8 @@ class SpeechToText:
             log.warning("Распознавание заняло %.1f с (больше %.0f с): %s, запись %.1f с",
                         result.seconds, SLOW_SECONDS, result.engine, result.audio_seconds)
         if result.discarded:
-            log.info(DISCARDED_LOG)
+            if result.discarded == "noise":      # эхо подсказки движок уже записал в лог со счётчиком
+                log.info(DISCARDED_LOG)
             return None
         return result if result.text.strip() else None
 

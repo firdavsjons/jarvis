@@ -1,9 +1,11 @@
-"""Проверка локального распознавания вручную: `python -m core.stt.check [--wav файл] [--mic]`.
+"""Проверка локального распознавания вручную: `python -m core.stt.check [--wav файл] [--mic] [--no-prompt] [--repeat N]`.
 
 Запускает пользователь, не тесты. Без параметров: показывает настройки, наличие пакета и файла модели, загружает
 модель (время загрузки и прогрева) — микрофон не включается, звук никуда не уходит. `--wav` распознаёт файл (любой
-WAV/AIFF/FLAC; текст печатается в консоль), `--mic` записывает одну фразу с микрофона. Откат на Google здесь отключён:
-проверяется только локальный движок. Ничего не скачивает.
+WAV/AIFF/FLAC; текст печатается в консоль), `--mic` записывает фразы с микрофона: `--repeat N` фраз подряд (по умолчанию
+3), для каждой печатаются текст, длина записи и время. `--no-prompt` отключает подсказку Whisper — так сравнивают
+качество с подсказкой и без неё (STT_PROMPT=off в .env делает то же самое). Откат на Google здесь отключён: проверяется
+только локальный движок. Ничего не скачивает.
 """
 import argparse
 import importlib.util
@@ -32,19 +34,27 @@ def read_wav(path):
         return Audio(sr.Recognizer().record(source))
 
 
-def record_phrase():
+def record_phrases(count):
+    """count записей с микрофона подряд (калибровка шума один раз)."""
     import speech_recognition as sr
     recognizer = sr.Recognizer()
     with sr.Microphone() as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
-        print("Говорите (до 20 секунд)...")
-        return Audio(recognizer.listen(source, timeout=10, phrase_time_limit=20))
+        for number in range(1, count + 1):
+            print(f"Говорите ({number} из {count}, до 20 секунд)...")
+            try:
+                yield Audio(recognizer.listen(source, timeout=10, phrase_time_limit=20))
+            except sr.WaitTimeoutError:
+                print("Тишина: ничего не записано")
 
 
 def main(argv=None, out=print):
     parser = argparse.ArgumentParser(description="Проверка локального распознавания речи Jarvis")
     parser.add_argument("--wav", help="распознать этот аудиофайл")
-    parser.add_argument("--mic", action="store_true", help="записать одну фразу с микрофона")
+    parser.add_argument("--mic", action="store_true", help="записать фразы с микрофона")
+    parser.add_argument("--no-prompt", action="store_true", help="не передавать Whisper подсказку (сравнить качество)")
+    parser.add_argument("--repeat", type=int, metavar="N",
+                        help="сколько фраз записать с микрофона (по умолчанию 3) или раз распознать файл (по умолчанию 1)")
     args = parser.parse_args(argv)
 
     settings = stt_settings()
@@ -70,19 +80,35 @@ def main(argv=None, out=print):
         out(f"Не загружено: {getattr(e, 'reason', e)}")
         return 1
     out(f"Модель загружена и прогрета за {time.monotonic() - started:.1f} с")
-    out(f"Подсказка Whisper: {len(build_prompt())} символов")
-    audio = read_wav(args.wav) if args.wav else record_phrase() if args.mic else None
-    if audio is None:
+    if args.no_prompt:
+        prompt = ""
+        out("Подсказка Whisper: выключена (--no-prompt)")
+    elif not settings.prompt:
+        prompt = ""
+        out("Подсказка Whisper: выключена (STT_PROMPT=off в .env)")
+    else:
+        prompt = build_prompt()
+        out(f"Подсказка Whisper ({len(prompt)} символов): {prompt}")
+    if args.wav:
+        audios = [read_wav(args.wav) for _ in range(max(1, min(args.repeat or 1, 20)))]
+    elif args.mic:
+        audios = record_phrases(max(1, min(args.repeat or 3, 20)))
+    else:
         return 0
-    try:
-        result = engine.recognize(audio, build_prompt())
-    except SttError as e:
-        out(f"Ошибка распознавания: {e}")
-        return 1
-    out(f"Запись {result.audio_seconds:.1f} с, распознавание {result.seconds:.1f} с"
-        + (f", уверенность {result.confidence:.2f}" if result.confidence is not None else ""))
-    out("Отброшено как шум/галлюцинация" if result.discarded else f"Текст: {result.text}")
-    return 0
+    status = 0
+    for number, audio in enumerate(audios, 1):
+        try:
+            result = engine.recognize(audio, prompt)
+        except SttError as e:
+            out(f"Ошибка распознавания: {e}")
+            status = 1
+            continue
+        out(f"[{number}] запись {result.audio_seconds:.1f} с, распознавание {result.seconds:.1f} с"
+            + (f", уверенность {result.confidence:.2f}" if result.confidence is not None else ""))
+        reasons = {"noise": "шум/галлюцинация", "prompt_echo": "эхо подсказки"}
+        out(f"[{number}] отброшено: {reasons.get(result.discarded, result.discarded)}" if result.discarded
+            else f"[{number}] текст: {result.text}")
+    return status
 
 
 if __name__ == "__main__":

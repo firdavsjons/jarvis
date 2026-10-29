@@ -1,4 +1,5 @@
 """Этап 8.1: локальное распознавание речи (core/stt). Без модели, сети и микрофона: движки подменены фальшивками."""
+import logging
 import math
 import os
 import sys
@@ -24,8 +25,9 @@ from core.stt import whisper_cpp as cpp_module
 from core.stt.base import MIN_SECONDS, Audio, Engine, Loading, Recognition, Segment, SttError, Unavailable
 from core.stt.blacklist import BLACKLIST, is_blacklisted
 from core.stt.google import GoogleEngine, google_language
-from core.stt.prompt import (COMMAND_VERBS, PROMPT_TOKEN_LIMIT, PromptProvider, build_prompt, estimate_tokens,
-                             russian_app_names)
+from core.stt import prompt_echo
+from core.stt.prompt import (PROMPT_TOKEN_LIMIT, PromptProvider, accusative, build_prompt, contact_names, dative,
+                             estimate_tokens, prepositional, russian_app_names, weather_sentence)
 from core.stt.repeats import collapse_repeats
 from core.stt.service import (FAILED_FALLBACK, FAILED_OFF, FAILED_REPLY, LOADING_REPLY, NOT_INSTALLED_FALLBACK,
                               NOT_INSTALLED_OFF, SpeechToText)
@@ -853,32 +855,96 @@ class PromptCase(unittest.TestCase):
 
 
 class TestPrompt(PromptCase):
-    def test_contains_name_and_apps(self):
+    """Подсказка — обычные командные предложения без меток и списков (Этап 8.1.2)."""
+
+    def test_is_natural_sentences_in_the_expected_style(self):
+        self.write_contacts({"мама": {"username": "mama_user"}})
         text = build_prompt()
-        self.assertTrue(text.startswith("Джарвис."))
-        for app in ("Safari", "Telegram", "Google Chrome"):
-            self.assertIn(app, text)
+        self.assertTrue(text.startswith("Джарвис, открой "))
+        for part in ("Закрой ", "Напиши маме в телеграм привет.", "Поставь таймер на пять минут.", "Какая погода в Душанбе?"):
+            self.assertIn(part, text)
 
-    def test_at_most_fifteen_apps(self):
-        apps = [f"Приложение{n}" for n in range(40)]
-        with patch("core.installed_apps.list_installed_apps", return_value=apps):
+    def test_no_colons_and_no_enumerations(self):
+        self.write_contacts({"мама": {"username": "mama_user"}, "босс": {"username": "boss_user"}})
+        for rotation in range(6):
+            text = build_prompt(rotation)
+            self.assertNotIn(":", text)
+            self.assertLessEqual(text.count(","), 1)                    # только после «Джарвис»
+            if "," in text:
+                self.assertTrue(text.startswith("Джарвис,"))
+            for label in ("Контакты", "Приложения", "Команды", "Программы", "Как я называю"):
+                self.assertNotIn(label, text)
+
+    def test_at_most_80_tokens_even_with_many_contacts(self):
+        self.write_contacts({f"контакт номер {n} длинное имя": {"username": f"user_{n:05d}"} for n in range(80)})
+        for rotation in range(5):
+            text = build_prompt(rotation)
+            self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
+        self.assertEqual(PROMPT_TOKEN_LIMIT, 80)
+        self.assertLessEqual(len(build_prompt()), 160)
+
+    def test_contains_name_and_a_russian_app_name(self):
+        text = build_prompt()
+        self.assertIn("Джарвис", text)
+        self.assertTrue(any(name in text for name in ("калькулятор", "сафари", "телеграм", "заметки")))
+
+    def test_first_prompt_names_calculator_and_safari(self):
+        text = build_prompt(0)
+        self.assertIn("калькулятор", text)
+        self.assertIn("сафари", text)
+
+    def test_no_english_names_and_no_memory_aliases(self):
+        installed_apps.set_user_aliases({"мой браузер": "Safari", "рабочий чат": "Telegram"})
+        for rotation in range(5):
+            text = build_prompt(rotation)
+            for english in ("Safari", "Telegram", "Calculator", "Google Chrome", "YouTube", "Notes", "Mail"):
+                self.assertNotIn(english, text)
+            self.assertNotIn("мой браузер", text)
+            self.assertNotIn("рабочий чат", text)
+
+    def test_at_most_three_apps_and_two_contacts(self):
+        self.write_contacts({k: {"username": f"user_{i:05d}"} for i, k in enumerate(("мама", "папа", "брат", "босс"))})
+        apps = russian_app_names(installed_apps.list_installed_apps())
+        self.assertGreater(len(apps), 3)
+        for rotation in range(4):
+            text = build_prompt(rotation)
+            commands = [s for s in text.split(". ") if s.lower().startswith(("джарвис, открой", "закрой", "открой"))]
+            self.assertLessEqual(len(commands), 3)
+            self.assertLessEqual(text.count("Напиши "), 2)
+
+    def test_not_installed_app_has_no_russian_name(self):
+        with patch("core.installed_apps.list_installed_apps", return_value=["Safari", "Calculator"]):
             text = build_prompt()
-        self.assertEqual(sum(1 for a in apps if a in text), 15)
+        self.assertIn("сафари", text)
+        self.assertNotIn("телеграм", text)
+        self.assertNotIn("календарь", text)
 
-    def test_contact_names_only_no_username_phone_or_title(self):
+    def test_without_apps_or_contacts_still_has_the_name(self):
+        with patch("core.installed_apps.list_installed_apps", return_value=[]):
+            text = build_prompt()
+        self.assertTrue(text.startswith("Джарвис."))
+        self.assertNotIn("Напиши", text)
+        self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
+
+    def test_one_app_fills_all_app_slots(self):
+        with patch("core.installed_apps.list_installed_apps", return_value=["Safari"]):
+            self.assertIn("Закрой сафари.", build_prompt())
+
+    def test_no_username_phone_or_title(self):
         self.write_contacts({"мама": {"username": "mama_user", "phone": "+992900000001", "title": "Мама Иванова"},
                              "себе": {"username": "my_own_name", "title": "Избранное"}})
-        text = build_prompt()
-        self.assertIn("мама", text)
-        self.assertIn("себе", text)
-        for private in ("mama_user", "992900000001", "my_own_name", "Иванова", "Избранное"):
-            self.assertNotIn(private, text)
+        for rotation in range(3):
+            text = build_prompt(rotation)
+            for private in ("mama_user", "992900000001", "my_own_name", "Иванова", "Избранное", "@"):
+                self.assertNotIn(private, text)
+        self.assertIn("маме", build_prompt(0))
 
     def test_contact_keys_that_look_like_username_or_phone_are_skipped(self):
         self.write_contacts({"@durov_x": {"username": "durov_x"}, "89001234567": {"phone": "89001234567"},
                              "босс": {"username": "boss_user"}})
+        self.assertEqual(contact_names(), ["босс"])
         text = build_prompt()
-        self.assertIn("босс", text)
+        self.assertIn("боссу", text)
         self.assertNotIn("durov", text)
         self.assertNotIn("89001234567", text)
 
@@ -887,32 +953,135 @@ class TestPrompt(PromptCase):
         build_prompt()
         self.assertFalse(contacts.CONTACTS_FILE.exists())
 
-    def test_memory_aliases_included(self):
-        installed_apps.set_user_aliases({"мой браузер": "Safari", "рабочий чат": "Telegram"})
-        text = build_prompt()
-        self.assertIn("мой браузер", text)
-        self.assertIn("рабочий чат", text)
+    def test_rotation_changes_apps_and_contacts(self):
+        self.write_contacts({k: {"username": f"user_{i:05d}"} for i, k in enumerate(("мама", "папа", "брат", "босс"))})
+        prompts_ = {build_prompt(r) for r in range(4)}
+        self.assertGreater(len(prompts_), 1)
+        self.assertEqual(build_prompt(2), build_prompt(2))           # одна и та же ротация — тот же текст
 
-    def test_never_more_than_200_tokens(self):
-        self.write_contacts({f"контакт номер {n} длинное имя": {"username": f"user_{n:05d}"} for n in range(80)})
-        installed_apps.set_user_aliases({f"псевдоним {n} очень длинный": "Safari" for n in range(40)})
-        text = build_prompt()
-        self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
-        self.assertTrue(text.startswith("Джарвис."))
-        self.assertIn("Контакты:", text)
-
-    def test_default_prompt_is_well_under_the_limit(self):
-        self.assertLess(estimate_tokens(build_prompt()), PROMPT_TOKEN_LIMIT)
-
-    def test_provider_refreshes_every_ten_minutes(self):
-        clock, builds = Clock(), []
-        provider = PromptProvider(build=lambda: builds.append(1) or f"промпт {len(builds)}", clock=clock)
-        self.assertEqual(provider.get(), "промпт 1")
+    def test_provider_rotates_on_every_refresh_and_caches_in_between(self):
+        clock, calls = Clock(), []
+        provider = PromptProvider(build=lambda rotation: calls.append(rotation) or f"промпт {rotation}", clock=clock)
+        self.assertEqual(provider.get(), "промпт 0")
         clock.now += 599
-        self.assertEqual(provider.get(), "промпт 1")
+        self.assertEqual(provider.get(), "промпт 0")
         clock.now += 2
+        self.assertEqual(provider.get(), "промпт 1")
+        clock.now += 601
         self.assertEqual(provider.get(), "промпт 2")
-        self.assertEqual(len(builds), 2)
+        self.assertEqual(calls, [0, 1, 2])
+
+    def test_real_provider_changes_the_prompt_after_ten_minutes(self):
+        clock = Clock()
+        provider = PromptProvider(clock=clock)
+        first = provider.get()
+        clock.now += 601
+        self.assertNotEqual(provider.get(), first)
+
+    def test_spoken_extras_only_if_installed(self):
+        installed = ["WhatsApp", "YouTube", "Google Chrome", "Viber", "zoom.us", "Slack", "Spotify"]
+        names = russian_app_names(installed)
+        for spoken in ("ватсап", "ютуб", "хром", "вайбер", "зум", "слак"):
+            self.assertIn(spoken, names)
+        self.assertEqual(russian_app_names(["Safari"]), ["сафари"])
+        self.assertEqual(russian_app_names([]), [])
+
+    def test_one_name_per_app(self):
+        names = russian_app_names(["Finder", "WhatsApp"])
+        self.assertEqual(sum(1 for n in names if n in ("файндер", "финдер")), 1)
+        self.assertEqual(sum(1 for n in names if n in ("ватсап", "вотсап")), 1)
+
+    def test_extras_do_not_touch_app_aliases(self):
+        from core.apps import APP_ALIASES
+        before = dict(APP_ALIASES)
+        build_prompt()
+        self.assertEqual(APP_ALIASES, before)
+        for spoken in ("ватсап", "ютуб", "вайбер", "зум", "слак"):
+            self.assertNotIn(spoken, APP_ALIASES)
+
+
+class TestPromptCity(PromptCase):
+    def city_sentence(self, env):
+        with patch("core.settings.ENV_FILE", env_file(env)):
+            return weather_sentence()
+
+    def test_default_city_is_dushanbe(self):
+        self.assertEqual(self.city_sentence(""), "Какая погода в Душанбе?")
+        self.assertIn("Какая погода в Душанбе?", build_prompt())
+
+    def test_city_comes_from_default_city_setting(self):
+        self.assertEqual(self.city_sentence("DEFAULT_CITY=Москва\n"), "Какая погода в Москве?")
+        self.assertEqual(self.city_sentence("DEFAULT_CITY=Худжанд\n"), "Какая погода в Худжанде?")
+        self.assertEqual(self.city_sentence("DEFAULT_CITY=Сочи\n"), "Какая погода в Сочи?")
+        with patch("core.settings.ENV_FILE", env_file("DEFAULT_CITY=Москва\n")):
+            text = build_prompt()
+        self.assertIn("Какая погода в Москве?", text)
+        self.assertNotIn("Душанбе", text)
+
+    def test_city_that_cannot_be_declined_is_left_out(self):
+        for city in ("Нижний Новгород", "London", "Санкт-Петербург"):
+            with self.subTest(city=city):
+                self.assertEqual(self.city_sentence(f"DEFAULT_CITY={city}\n"), "Какая сегодня погода?")
+
+
+class TestCases(unittest.TestCase):
+    def test_dative(self):
+        for key, expected in (("мама", "маме"), ("Аня", "Ане"), ("Иван", "Ивану"), ("босс", "боссу"), ("брат", "брату"),
+                              ("Мария", "Марии"), ("Игорь", "Игорю"), ("Андрей", "Андрею"), ("себе", "себе"),
+                              ("Таню", "Таню"), ("my boss", "my boss"), ("жена мужа", "жена мужа"), ("ma", "ma")):
+            with self.subTest(key=key):
+                self.assertEqual(dative(key), expected)
+
+    def test_accusative(self):
+        for name, expected in (("почта", "почту"), ("музыка", "музыку"), ("калькулятор", "калькулятор"),
+                               ("сафари", "сафари"), ("заметки", "заметки"), ("фото", "фото")):
+            with self.subTest(name=name):
+                self.assertEqual(accusative(name), expected)
+
+    def test_prepositional(self):
+        for city, expected in (("Душанбе", "Душанбе"), ("Москва", "Москве"), ("Лондон", "Лондоне"), ("Казань", "Казани"),
+                               ("Рязань", "Рязани"), ("Сочи", "Сочи"), ("Нижний Новгород", None), ("Paris", None)):
+            with self.subTest(city=city):
+                self.assertEqual(prepositional(city), expected)
+
+
+class TestPromptSetting(unittest.TestCase):
+    def build(self, text):
+        with patch("core.settings.ENV_FILE", env_file(text)):
+            return factory.build_stt(MagicMock(), notify=lambda text: None)
+
+    def test_on_by_default(self):
+        self.assertTrue(factory.SttSettings.__dataclass_fields__["prompt"])
+        with patch("core.settings.ENV_FILE", env_file("")):
+            self.assertTrue(factory.stt_settings().prompt)
+        self.assertIsInstance(self.build("").prompt_provider, PromptProvider)
+        self.assertIsInstance(self.build("STT_PROMPT=on\n").prompt_provider, PromptProvider)
+
+    def test_off_builds_no_provider(self):
+        for raw in ("off", "OFF", "no", "false", "0", "none"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.build(f"STT_PROMPT={raw}\n").prompt_provider)
+
+    def test_off_means_the_engine_gets_an_empty_prompt(self):
+        engine = ready_engine()
+        stt = SpeechToText(engine, None, self.build("STT_PROMPT=off\n").prompt_provider, notify=lambda text: None)
+        stt.recognize(make_audio())
+        self.assertEqual(engine.calls[-1][1], "")
+
+    def test_on_means_the_engine_gets_the_prompt(self):
+        engine = ready_engine()
+        with patch_installed():
+            stt = SpeechToText(engine, None, self.build("").prompt_provider, notify=lambda text: None)
+            stt.recognize(make_audio())
+        self.assertTrue(engine.calls[-1][1].startswith("Джарвис"))
+
+    def test_off_with_google_fallback_nothing_changes(self):
+        stt = self.build("STT_PROMPT=off\nSTT_FALLBACK=google\n")
+        self.assertEqual(stt.fallback.name, "google")
+        self.assertIsNone(stt.prompt_provider)
+
+    def test_env_example_has_the_setting(self):
+        self.assertIn("STT_PROMPT=on", Path(__file__).with_name(".env.example").read_text(encoding="utf-8"))
 
 
 class TestPromptNeverGoesToGoogle(ServiceCase, PromptCase):
@@ -958,81 +1127,184 @@ class TestPromptNeverGoesToGoogle(ServiceCase, PromptCase):
         self.assertNotIn("Джарвис", repr(recognizer.recognize_google.call_args))
 
 
-class TestRussianPrompt(PromptCase):
-    """Этап 8.1.1: Whisper должен слышать «калькулятор», а не «Calculator»."""
+class TestPromptEcho(PromptCase):
+    """Этап 8.1.2: метки и эхо подсказки в распознанном тексте (строки из живого лога)."""
+    PROMPT = "Джарвис, открой калькулятор. Закрой сафари. Поставь таймер на пять минут. Какая погода в Душанбе?"
 
-    def group(self, label, text=None):
-        text = text or build_prompt()
-        start = text.index(f"{label}: ") + len(label) + 2
-        return text[start:text.index(".", start)].split(", ")
+    def recognize(self, text, prompt=PROMPT, seconds=6.0, avg_logprob=-0.2, engine=None):
+        engine = engine or ready_engine(good(text, avg_logprob=avg_logprob))
+        return engine, engine.recognize(make_audio(seconds), prompt)
 
-    def test_spoken_russian_names_of_installed_apps(self):
-        text = build_prompt()
-        for spoken in ("калькулятор", "сафари", "телеграм", "заметки", "терминал"):
-            self.assertIn(spoken, text)
-        self.assertIn("калькулятор", self.group("Приложения"))
+    def test_labels_from_the_live_log_are_stripped(self):
+        for raw, expected in (("Контакты: Да.", "Да."), ("Контакты: закрой, как вы видите?", "закрой, как вы видите?"),
+                              ("Контакты: Светилик.", "Светилик.")):
+            with self.subTest(raw=raw):
+                with self.assertLogs("core.stt.whisper_local", level="INFO"):
+                    _, result = self.recognize(raw)
+                self.assertEqual((result.text, result.discarded), (expected, None))
 
-    def test_not_installed_app_has_no_russian_name(self):
-        with patch("core.installed_apps.list_installed_apps", return_value=["Safari", "Calculator"]):
-            text = build_prompt()
-        self.assertIn("сафари", text)
-        self.assertNotIn("телеграм", text)
-        self.assertNotIn("календарь", text)
+    def test_every_label_in_any_case_and_place(self):
+        for raw, expected in (("контакты: закрой", "закрой"), ("КОНТАКТЫ:закрой", "закрой"), ("Приложения: открой",
+                              "открой"), ("Команды: поставь таймер", "поставь таймер"), ("Программы: открой сафари",
+                              "открой сафари"), ("Как я называю приложения: открой почту", "открой почту"),
+                              ("закрой Контакты: сафари", "закрой сафари"), ("открой Приложения: почту", "открой почту"),
+                              ("Контакты: закрой Команды: сафари", "закрой сафари")):
+            with self.subTest(raw=raw):
+                with self.assertLogs("core.stt.whisper_local", level="INFO"):
+                    _, result = self.recognize(raw)
+                self.assertEqual(result.text, expected)
 
-    def test_group_order(self):
-        self.write_contacts({"мама": {"username": "mama_user"}})
-        installed_apps.set_user_aliases({"мой браузер": "Safari"})
-        text = build_prompt()
-        order = [text.index(marker) for marker in ("Джарвис.", "Приложения:", "Команды:", "Контакты:",
-                                                   "Как я называю приложения:", "Программы:")]
-        self.assertEqual(order, sorted(order))
+    def test_the_word_without_a_colon_is_not_a_label(self):
+        for raw in ("закрой контакты", "открой приложения", "покажи команды", "открой программы"):
+            with self.subTest(raw=raw):
+                _, result = self.recognize(raw)
+                self.assertEqual(result.text, raw)
 
-    def test_command_verbs(self):
-        self.assertEqual(self.group("Команды"), list(COMMAND_VERBS))
-        self.assertEqual(COMMAND_VERBS, ("открой", "закрой", "включи", "выключи", "поставь", "напиши", "найди", "прочитай"))
+    def test_only_a_label_is_dropped_as_echo(self):
+        with self.assertLogs("core.stt.whisper_local", level="INFO") as logs:
+            _, result = self.recognize("Контакты:")
+        self.assertEqual((result.text, result.discarded), ("", "prompt_echo"))
+        self.assertIn("INFO:core.stt.whisper_local:Отброшено (эхо подсказки), всего за запуск: 1", logs.output)
 
-    def test_spoken_extras_only_if_installed(self):
-        installed = ["WhatsApp", "YouTube", "Google Chrome", "Viber", "zoom.us", "Slack", "Spotify"]
-        with patch("core.installed_apps.list_installed_apps", return_value=installed):
-            names = russian_app_names(installed)
-        for spoken in ("ватсап", "вотсап", "ютуб", "хром", "вайбер", "зум", "слак", "спотифай"):
-            self.assertIn(spoken, names)
-        self.assertEqual(russian_app_names(["Safari"]), ["сафари"])
-        self.assertEqual(russian_app_names([]), [])
+    def test_nothing_recognized_is_not_an_echo(self):
+        engine = ready_engine()
+        engine.segments = []
+        result = engine.recognize(make_audio(), self.PROMPT)
+        self.assertEqual((result.text, result.discarded), ("", None))
+        self.assertEqual(engine.echo_total, 0)
 
-    def test_extras_do_not_touch_app_aliases(self):
-        from core.apps import APP_ALIASES
-        before = dict(APP_ALIASES)
-        build_prompt()
-        self.assertEqual(APP_ALIASES, before)
-        for spoken in ("ватсап", "ютуб", "вайбер", "зум", "слак"):
-            self.assertNotIn(spoken, APP_ALIASES)
+    def test_whole_prompt_sentence_on_a_short_recording_is_echo(self):
+        # 14–28 символов текста на 0,5 с записи: сказать столько невозможно
+        for text in ("Закрой сафари.", "Какая погода в Душанбе?", "Поставь таймер на пять минут", "открой калькулятор",
+                     "Джарвис, открой калькулятор."):
+            with self.subTest(text=text):
+                with self.assertLogs("core.stt.whisper_local", level="INFO"):
+                    _, result = self.recognize(text, seconds=0.5)
+                self.assertEqual((result.text, result.discarded), ("", "prompt_echo"))
 
-    def test_at_most_fifteen_russian_names(self):
-        installed = ["Calculator", "Safari", "Telegram", "Google Chrome", "Notes", "Music", "Mail", "Calendar",
-                     "System Settings", "Terminal", "Photos", "Messages", "Finder", "Spotify", "WhatsApp", "YouTube",
-                     "Viber", "zoom.us", "Slack"]
-        self.assertEqual(len(russian_app_names(installed)), 15)
+    def test_whole_prompt_sentence_with_low_confidence_is_echo(self):
+        with self.assertLogs("core.stt.whisper_local", level="INFO"):
+            _, result = self.recognize("Закрой сафари.", seconds=5.0, avg_logprob=math.log(0.4))
+        self.assertEqual((result.text, result.discarded), ("", "prompt_echo"))
 
-    def test_english_names_are_cut_first_when_the_limit_is_hit(self):
-        self.write_contacts({f"контакт номер {n} длинное имя": {"username": f"user_{n:05d}"} for n in range(80)})
-        installed_apps.set_user_aliases({f"псевдоним {n} очень длинный": "Safari" for n in range(40)})
-        text = build_prompt()
-        self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
-        self.assertIn("калькулятор", text)
-        self.assertIn("Команды:", text)
-        self.assertNotIn("Программы:", text)
+    def test_real_command_equal_to_a_prompt_sentence_is_kept(self):
+        for text in ("Закрой сафари.", "поставь таймер на пять минут", "Какая погода в Душанбе?"):
+            with self.subTest(text=text):
+                engine, result = self.recognize(text, seconds=3.5, avg_logprob=math.log(0.9))
+                self.assertEqual((result.text, result.discarded), (text, None))
+                self.assertEqual(engine.echo_total, 0)
 
-    def test_limit_with_everything_installed(self):
-        text = build_prompt()
-        self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
+    def test_text_that_only_resembles_a_prompt_sentence_is_kept(self):
+        for text in ("закрой телеграм", "поставь таймер на десять минут", "какая погода в Москве"):
+            with self.subTest(text=text):
+                _, result = self.recognize(text, seconds=0.9, avg_logprob=math.log(0.4))
+                self.assertEqual(result.text, text)
 
-    def test_no_username_or_phone_with_russian_names(self):
-        self.write_contacts({"мама": {"username": "mama_user", "phone": "+992900000001", "title": "Мама Иванова"}})
-        text = build_prompt()
-        for private in ("mama_user", "992900000001", "Иванова"):
-            self.assertNotIn(private, text)
-        self.assertIn("мама", text)
+    def test_thresholds_are_named_constants(self):
+        self.assertEqual(prompt_echo.ECHO_MAX_CHARS_PER_SECOND, 20)
+        self.assertEqual(prompt_echo.ECHO_MAX_CONFIDENCE, 0.5)
+        source = Path(prompt_echo.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("Оценочные, подобрать по логу"), 2)
+
+    def test_no_prompt_means_no_echo_check_but_labels_still_stripped(self):
+        engine = ready_engine(good("Закрой сафари.", avg_logprob=math.log(0.4)))
+        self.assertEqual(engine.recognize(make_audio(0.9), "").text, "Закрой сафари.")
+        engine = ready_engine(good("Контакты: Да."))
+        with self.assertLogs("core.stt.whisper_local", level="INFO"):
+            self.assertEqual(engine.recognize(make_audio(), "").text, "Да.")
+
+    def test_counters_and_log_lines_without_text(self):
+        engine = ready_engine(good("Контакты: Светилик."))
+        with self.assertLogs("core.stt.whisper_local", level="INFO") as logs:
+            engine.recognize(make_audio(), self.PROMPT)
+            engine.recognize(make_audio(), self.PROMPT)
+            engine.segments = [good("Закрой сафари.")]
+            engine.recognize(make_audio(0.5), self.PROMPT)
+            engine.recognize(make_audio(0.5), self.PROMPT)
+        self.assertEqual((engine.labels_total, engine.echo_total), (2, 2))
+        self.assertIn("INFO:core.stt.whisper_local:Убраны метки подсказки, всего: 1", logs.output)
+        self.assertIn("INFO:core.stt.whisper_local:Убраны метки подсказки, всего: 2", logs.output)
+        self.assertIn("INFO:core.stt.whisper_local:Отброшено (эхо подсказки), всего за запуск: 1", logs.output)
+        self.assertIn("INFO:core.stt.whisper_local:Отброшено (эхо подсказки), всего за запуск: 2", logs.output)
+        joined = "\n".join(logs.output)
+        for secret in ("Светилик", "Закрой сафари"):
+            self.assertNotIn(secret, joined)
+
+    def test_service_does_not_double_log_the_echo(self):
+        engine = ready_engine(good("Закрой сафари."))
+        stt = SpeechToText(engine, FakeGoogle(), type("P", (), {"get": lambda self: self_prompt})(), notify=lambda t: None)
+        self_prompt = self.PROMPT
+        with self.assertLogs("core.stt", level="INFO") as logs:
+            self.assertIsNone(stt.recognize(make_audio(0.5)))
+        joined = "\n".join(logs.output)
+        self.assertEqual(joined.count("Отброшено (эхо подсказки)"), 1)
+        self.assertNotIn("шум/галлюцинация", joined)
+
+    def test_echo_does_not_go_to_google(self):
+        engine = ready_engine(good("Закрой сафари."))
+        google = FakeGoogle()
+        provider = type("P", (), {"get": lambda self: TestPromptEcho.PROMPT})()
+        with self.assertLogs("core.stt", level="INFO"):
+            SpeechToText(engine, google, provider, notify=lambda t: None).recognize(make_audio(0.5))
+        self.assertEqual(google.calls, [])
+
+
+class TestEchoStreakWarning(unittest.TestCase):
+    PROMPT = TestPromptEcho.PROMPT
+    WARNING = ("Подсказка искажает распознавание; сравните: python -m core.stt.check --mic --no-prompt, "
+               "или STT_PROMPT=off")
+
+    def run_phrases(self, texts, prompt=PROMPT):
+        engine = ready_engine()
+        warnings = []
+        for text in texts:
+            engine.segments = [good(text)]
+            with self.assertLogs("core.stt.whisper_local", level="DEBUG") as logs:
+                logging.getLogger("core.stt.whisper_local").debug("отметка")
+                engine.recognize(make_audio(6.0), prompt)
+            warnings += [line for line in logs.output if line.startswith("WARNING")]
+        return warnings
+
+    def test_three_phrases_in_a_row_warn_once(self):
+        warnings = self.run_phrases(["Контакты: Да.", "Контакты: закрой", "Контакты: Светилик."])
+        self.assertEqual(warnings, [f"WARNING:core.stt.whisper_local:{self.WARNING}"])
+
+    def test_mixed_labels_and_echo_count_together(self):
+        warnings = self.run_phrases(["Контакты: Да.", "Контакты:", "Контакты: закрой"])
+        self.assertEqual(len(warnings), 1)
+
+    def test_a_clean_phrase_resets_the_streak(self):
+        warnings = self.run_phrases(["Контакты: Да.", "Контакты: закрой", "открой сафари", "Контакты: Светилик.",
+                                     "Контакты: нет"])
+        self.assertEqual(warnings, [])
+
+    def test_four_in_a_row_warns_once_then_starts_over(self):
+        warnings = self.run_phrases(["Контакты: а"] * 4)
+        self.assertEqual(len(warnings), 1)
+        warnings = self.run_phrases(["Контакты: а"] * 6)
+        self.assertEqual(len(warnings), 2)
+
+    def test_two_phrases_are_not_enough(self):
+        self.assertEqual(self.run_phrases(["Контакты: Да.", "Контакты: закрой"]), [])
+
+    def test_no_warning_when_the_prompt_is_off(self):
+        self.assertEqual(self.run_phrases(["Контакты: Да."] * 5, prompt=""), [])
+
+    def test_noise_discarded_phrases_do_not_break_the_streak(self):
+        engine = ready_engine()
+        with self.assertLogs("core.stt.whisper_local", level="INFO") as logs:
+            for text in ("Контакты: Да.", "Контакты: закрой"):
+                engine.segments = [good(text)]
+                engine.recognize(make_audio(6.0), self.PROMPT)
+            engine.segments = [good("Продолжение следует...")]       # шум: отброшен фильтром, серия не прервана
+            engine.recognize(make_audio(6.0), self.PROMPT)
+            engine.segments = [good("Контакты: Светилик.")]
+            engine.recognize(make_audio(6.0), self.PROMPT)
+        self.assertEqual(sum(1 for line in logs.output if line.startswith("WARNING")), 1)
+
+    def test_warning_text_names_the_remedies(self):
+        self.assertIn("--no-prompt", self.WARNING)
+        self.assertIn("STT_PROMPT=off", self.WARNING)
 
 
 class TestCollapseRepeats(unittest.TestCase):
@@ -1267,7 +1539,7 @@ class TestCheckCli(unittest.TestCase):
         lines = []
         patches = [patch("core.settings.ENV_FILE", env_file(env)),
                    patch("core.stt.check.importlib.util.find_spec", return_value=object() if installed else None),
-                   patch("core.stt.check.build_prompt", return_value="Джарвис.")]
+                   patch_installed()]
         if engine is not None:
             patches.append(patch("core.stt.check.local_engine", return_value=engine))
         for p in patches:
@@ -1304,8 +1576,8 @@ class TestCheckCli(unittest.TestCase):
         with patch("core.stt.check.read_wav", return_value=make_audio(2.0)):
             code, text = self.run_check("", "--wav", "файл.wav", engine=engine)
         self.assertEqual(code, 0)
-        self.assertIn("Текст: открой сафари", text)
-        self.assertIn("Запись 2.0 с", text)
+        self.assertIn("[1] текст: открой сафари", text)
+        self.assertIn("[1] запись 2.0 с", text)
 
     def test_check_never_falls_back_to_google(self):
         engine = StubWhisper([good()])
@@ -1314,6 +1586,84 @@ class TestCheckCli(unittest.TestCase):
                 patch("core.stt.google.GoogleEngine.recognize") as google:
             self.run_check("", "--wav", "файл.wav", engine=engine)
         google.assert_not_called()
+
+    def mic_engine(self, texts):
+        engine = StubWhisper([good(texts[0])])
+        engine.model_path = lambda: Path("/нет/такого/ggml-x.bin")
+        queue = list(texts)
+        original = engine._transcribe
+
+        def transcribe(model, pcm, prompt):
+            if engine.calls:
+                engine.segments = [good(queue.pop(0))]
+            return original(model, pcm, prompt)
+        engine._transcribe = transcribe
+        return engine
+
+    def test_mic_records_three_phrases_by_default(self):
+        engine = self.mic_engine(["открой сафари", "закрой почту", "который час"])
+        recorded = []
+
+        def record(count):
+            recorded.append(count)
+            for _ in range(count):
+                yield make_audio(2.0)
+        with patch("core.stt.check.record_phrases", side_effect=record), patch_installed():
+            code, text = self.run_check("", "--mic", engine=engine)
+        self.assertEqual((code, recorded), (0, [3]))
+        for line in ("[1] текст: открой сафари", "[2] текст: закрой почту", "[3] текст: который час"):
+            self.assertIn(line, text)
+        self.assertIn("Подсказка Whisper (", text)
+        self.assertIn("Джарвис, открой ", text)
+
+    def test_repeat_sets_the_number_of_phrases(self):
+        engine = self.mic_engine(["раз", "два"])
+        with patch("core.stt.check.record_phrases", side_effect=lambda n: (make_audio() for _ in range(n))) as record, \
+                patch_installed():
+            self.run_check("", "--mic", "--repeat", "2", engine=engine)
+        record.assert_called_once_with(2)
+
+    def test_no_prompt_passes_an_empty_prompt(self):
+        engine = self.mic_engine(["открой сафари", "закрой почту", "который час"])
+        with patch("core.stt.check.record_phrases", side_effect=lambda n: (make_audio() for _ in range(n))), patch_installed():
+            code, text = self.run_check("", "--mic", "--no-prompt", engine=engine)
+        self.assertIn("выключена (--no-prompt)", text)
+        self.assertNotIn("Джарвис, открой", text)
+        self.assertEqual([prompt for _, prompt in engine.calls[1:]], ["", "", ""])      # [0] — прогрев
+
+    def test_with_prompt_the_engine_receives_it(self):
+        engine = self.mic_engine(["открой сафари", "закрой почту", "который час"])
+        with patch("core.stt.check.record_phrases", side_effect=lambda n: (make_audio() for _ in range(n))), patch_installed():
+            self.run_check("", "--mic", engine=engine)
+        for _, prompt in engine.calls[1:]:
+            self.assertTrue(prompt.startswith("Джарвис, открой "))
+
+    def test_stt_prompt_off_in_env_disables_the_prompt(self):
+        engine = self.mic_engine(["открой сафари", "закрой почту", "который час"])
+        with patch("core.stt.check.record_phrases", side_effect=lambda n: (make_audio() for _ in range(n))):
+            code, text = self.run_check("STT_PROMPT=off\n", "--mic", engine=engine)
+        self.assertIn("выключена (STT_PROMPT=off в .env)", text)
+        self.assertEqual([prompt for _, prompt in engine.calls[1:]], ["", "", ""])
+
+    def test_echo_is_reported_as_discarded(self):
+        engine = self.mic_engine(["Контакты:"])
+        with patch("core.stt.check.record_phrases", side_effect=lambda n: (make_audio() for _ in range(1))), patch_installed(), \
+                self.assertLogs("core.stt.whisper_local", level="INFO"):
+            code, text = self.run_check("", "--mic", "--repeat", "1", engine=engine)
+        self.assertIn("[1] отброшено: эхо подсказки", text)
+
+    def test_wav_repeat(self):
+        engine = self.mic_engine(["раз", "два", "три"])
+        with patch("core.stt.check.read_wav", return_value=make_audio(2.0)), patch_installed():
+            code, text = self.run_check("", "--wav", "файл.wav", "--repeat", "3", engine=engine)
+        self.assertEqual(text.count("] запись 2.0 с"), 3)
+
+    def test_without_flags_nothing_is_recorded(self):
+        engine = self.mic_engine(["раз"])
+        with patch("core.stt.check.record_phrases") as record, patch_installed():
+            code, _ = self.run_check("", engine=engine)
+        record.assert_not_called()
+        self.assertEqual(code, 0)
 
     def test_read_wav_reads_a_real_file(self):
         path = Path(tempfile.mkdtemp(dir=tests_base.TEMP_ROOT)) / "тест.wav"
