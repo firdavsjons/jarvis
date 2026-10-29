@@ -4,18 +4,21 @@ Whisper распознаёт всю речь рядом, поэтому без �
 Слово ищется в уже распознанном тексте (детектор слова без Whisper — отдельный шаг, не сделан).
 
 Фраза обращена к Jarvis, если слово стоит
-- в начале (слово 1 либо слово 2 после одного междометия: «эй», «ну», «окей», «ок», «слушай», «привет»); допускается
-  одна ошибка (difflib ≥ 0,8);
-- в самом конце («открой калькулятор, Джарвис»), только точное слово.
+- в начале (слово 1 либо слово 2 после одного междометия: «эй», «ну», «окей», «ок», «слушай», «привет»); кроме слов
+  списка допускается одна ошибка (difflib ≥ 0,8), если слово не из NOT_WAKE_WORDS;
+- в самом конце («открой калькулятор, Джарвис»), только точное слово списка.
 В середине слово не считается. Слово и междометие вырезаются, остаток обрабатывается как обычная команда.
+
+Список (Этап 8.2.1) включает искажения, которые Whisper действительно выдаёт на слове «Джарвис» («червис», «джервис»,
+«жарусь», «джарис»…), и слова из WAKE_WORDS в .env.
 
 Окно диалога: после озвученного ответа на команду или вопрос Jarvis (не «Секунду.», не таймер, не оповещения
 распознавания) слово не требуется WAKE_WINDOW секунд от конца озвучки; пока Jarvis ждёт ответа на вопрос — 20 секунд.
 Подтверждение (main.has_pending), «стоп», «хватит», «отмена» и текстовый ввод слова не требуют.
 
 Слово может прийти из подсказки Whisper («Джарвис, открой …»): тогда оно засчитывается, только если после него есть
-остаток из 2+ слов и уверенность не ниже порога. Отброшенный текст нигде не записывается: ни в лог, ни в историю,
-ни в кэш, ни в журнал.
+команда и уверенность не ниже порога. Отброшенный текст нигде не записывается: ни в лог, ни в историю, ни в кэш, ни в
+журнал действий.
 """
 import difflib
 import logging
@@ -28,7 +31,12 @@ from core.settings import env_float, env_value
 
 log = logging.getLogger(__name__)
 
-WAKE_WORDS = ("джарвис", "jarvis", "жарвис", "джарвес", "дарвис", "чарвис", "ярвис")
+CANONICAL_WORDS = ("джарвис", "jarvis")
+# Слова, которые Whisper выдаёт на «Джарвис» (по живым данным диагностики) и обычные варианты
+WAKE_WORDS = ("червис", "чарвис", "джервис", "джервез", "жарвис", "жарвес", "джарвес", "джарвус", "джарис", "джарус",
+              "дарвис", "ярвис", "jarvis", "джарвис", "жарусь", "жарус")
+# Настоящие слова, похожие на слова списка: нечётким поиском не засчитываются («Сервис недоступен» ≈ «червис» 0,83)
+NOT_WAKE_WORDS = ("дарвин", "сервис", "парус", "червь", "жаров", "жара")
 INTERJECTIONS = ("эй", "ну", "окей", "ок", "слушай", "привет")
 FUZZY_CUTOFF = 0.8
 STOP_WORDS = ("стоп", "хватит")         # остановить озвучку и закрыть окно, ответа нет
@@ -39,13 +47,22 @@ DEFAULT_WINDOW = 8.0
 ANSWER_TIMEOUT = 20.0                    # окно, пока Jarvis ждёт ответа на вопрос (как таймаут подтверждения)
 DROP_REPORT_EVERY = 10
 
-# Слово в начале могло прийти из подсказки Whisper. Оценочные, подобрать по логу:
+# Свои слова (WAKE_WORDS в .env)
+EXTRA_WORDS_MAX = 10
+EXTRA_WORD_MIN_LENGTH = 4
+
+# Слово в начале могло прийти из подсказки Whisper. Оценочные, подобрать по логу (значения — по живым логам):
 PROMPT_WAKE_MAX_RECORDING = 1.2          # запись короче (с) — слишком коротка, чтобы в ней прозвучало слово
-PROMPT_WAKE_MIN_CONFIDENCE = 0.5         # уверенность Whisper ниже — слову не верим
-PROMPT_WAKE_MIN_REST_WORDS = 2           # такое слово засчитывается, только если после него команда из 2+ слов
+WAKE_PROMPT_MIN_CONFIDENCE = 0.3         # оценочный, по живым логам: уверенность ниже — слову из подсказки не верим
+WAKE_PROMPT_MIN_CONFIDENCE_ONE_WORD = 0.4    # оценочный, по живым логам: для команды из одного слова («Джарвис, громче»)
+WAKE_LISTEN_WINDOW_MIN_CONFIDENCE = 0.4  # оценочный, по живым логам: окно после «Слушаю.» открывается от этой уверенности
 
 DROPPED_LOG = "Отброшено (нет слова «Джарвис»)"
 LISTENING_REPLY = "Слушаю."
+
+
+def normalize_word(word):
+    return str(word).strip().lower().replace("ё", "е")
 
 
 def wake_settings(path=None):
@@ -53,6 +70,29 @@ def wake_settings(path=None):
     raw = (env_value("WAKE_WORD", "on", path) or "on").strip().lower()
     window = env_float("WAKE_WINDOW", DEFAULT_WINDOW, 3.0, 30.0, path)
     return raw not in {"off", "no", "false", "0", "none", "нет"}, window
+
+
+def extra_wake_words(path=None):
+    """Дополнительные слова из WAKE_WORDS (через запятую): не короче 4 символов, только буквы одного алфавита (без смеси
+    кириллицы и латиницы), не больше 10. Неподходящие пропускаются с предупреждением. Читается при запуске."""
+    raw = env_value("WAKE_WORDS", "", path) or ""
+    words = []
+    for item in raw.split(","):
+        word = normalize_word(item)
+        if not word:
+            continue
+        if len(word) < EXTRA_WORD_MIN_LENGTH:
+            log.warning("WAKE_WORDS: слово «%s» пропущено (короче %d символов)", word, EXTRA_WORD_MIN_LENGTH)
+        elif not re.fullmatch(r"[а-я]+|[a-z]+", word):
+            log.warning("WAKE_WORDS: слово «%s» пропущено (допустимы только буквы одного алфавита, без смеси кириллицы и "
+                        "латиницы)", word)
+        elif word in WAKE_WORDS or word in words:
+            continue
+        elif len(words) >= EXTRA_WORDS_MAX:
+            log.warning("WAKE_WORDS: слово «%s» пропущено (не больше %d слов)", word, EXTRA_WORDS_MAX)
+        else:
+            words.append(word)
+    return tuple(words)
 
 
 # --- поиск слова -------------------------------------------------------------------------------------------------------
@@ -64,17 +104,24 @@ class Token:
 
 
 def tokens(text):
-    return [Token(m.group().lower().replace("ё", "е"), m.start(), m.end()) for m in re.finditer(r"\w+", str(text))]
+    return [Token(normalize_word(m.group()), m.start(), m.end()) for m in re.finditer(r"\w+", str(text))]
 
 
-def is_wake_word(word, fuzzy):
-    if word in WAKE_WORDS:
-        return True
-    return fuzzy and any(difflib.SequenceMatcher(None, word, w).ratio() >= FUZZY_CUTOFF for w in WAKE_WORDS)
+def _ratio(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def _trim(text):
-    return text.strip(PUNCTUATION)
+def match_word(word, fuzzy, words=WAKE_WORDS):
+    """(слово списка, сходство, откуда) или None. Откуда: "list" — слово из встроенного списка, "extra" — из WAKE_WORDS,
+    "fuzzy" — не из списка, но похоже (≥ FUZZY_CUTOFF) на слово списка. Сходство слова списка — с «джарвис»/«jarvis»."""
+    if word in words:
+        if word in WAKE_WORDS:
+            return word, max(_ratio(word, c) for c in CANONICAL_WORDS), "list"
+        return word, 1.0, "extra"
+    if not fuzzy or word in NOT_WAKE_WORDS:
+        return None
+    ratio, nearest = max((_ratio(word, w), w) for w in words)
+    return (nearest, ratio, "fuzzy") if ratio >= FUZZY_CUTOFF else None
 
 
 def _words(text):
@@ -89,58 +136,88 @@ class Judgement:
     counted: bool = False               # слово засчитано как обращение
     reason: str = ""
     from_prompt: bool = False
+    heard: str = ""                     # какое слово услышано (нормализованное)
+    nearest: str = ""                   # слово списка, с которым совпало
+    ratio: float = 0.0                  # сходство с ним (1,0 — совпало полностью)
+    via: str = ""                       # "list" | "extra" | "fuzzy"
+
+    @property
+    def distorted(self):
+        """Слово засчитано не как «джарвис»/«jarvis», а как искажение, свой вариант или нечёткое совпадение."""
+        return self.found and self.heard not in CANONICAL_WORDS
+
+    def describe(self):
+        """«червис ≈ джарвис, 0.62, из списка» — для диагностики."""
+        if not self.found:
+            return ""
+        source = {"list": "из списка", "extra": "из WAKE_WORDS", "fuzzy": "по искажению"}[self.via]
+        target = self.nearest if self.via == "fuzzy" else (self.heard if self.via == "extra" else
+                                                           max(CANONICAL_WORDS, key=lambda c: _ratio(self.heard, c)))
+        return f"{self.heard} ≈ {target}, {self.ratio:.2f}, {source}"
 
 
-def find_wake(text):
+def find_wake(text, words=WAKE_WORDS):
     """Judgement без учёта подсказки: где слово и что останется после его вырезания."""
     toks = tokens(text)
     if not toks:
         return Judgement(reason="слова нет: пустой текст")
     first = 1 if toks[0].word in INTERJECTIONS and len(toks) > 1 else 0
-    start_idx = first if is_wake_word(toks[first].word, fuzzy=True) else None
-    end_idx = len(toks) - 1 if toks[-1].word in WAKE_WORDS and (start_idx is None or len(toks) - 1 > start_idx) else None
+    start = match_word(toks[first].word, True, words)
+    start_idx = first if start else None
+    end = match_word(toks[-1].word, False, words)
+    end_idx = len(toks) - 1 if end and (start_idx is None or len(toks) - 1 > start_idx) else None
     if start_idx is None and end_idx is None:
-        inside = any(t.word in WAKE_WORDS for t in toks)
+        inside = any(match_word(t.word, False, words) for t in toks)
         return Judgement(reason="слово в середине фразы" if inside else "слова нет")
     begin = toks[start_idx].end if start_idx is not None else 0
     finish = toks[end_idx].start if end_idx is not None else len(text)
     rest = _trim(text[begin:finish]) if begin <= finish else ""
     position = "start" if start_idx is not None else "end"
-    return Judgement(found=True, position=position, rest=rest, reason="слово в начале" if position == "start"
-                     else "слово в конце")
+    nearest, ratio, via = start if start_idx is not None else end
+    heard = toks[start_idx if start_idx is not None else end_idx].word
+    return Judgement(found=True, position=position, rest=rest, heard=heard, nearest=nearest, ratio=ratio, via=via,
+                     reason="слово в начале" if position == "start" else "слово в конце")
 
 
-def prompt_induced(text, audio_seconds, confidence):
+def _trim(text):
+    return text.strip(PUNCTUATION)
+
+
+def prompt_induced(text, audio_seconds, confidence, words=WAKE_WORDS):
     """Текст начинается со слова «Джарвис», а запись слишком коротка или Whisper не уверен: слово, возможно, пришло из
     подсказки (она начинается с «Джарвис»), а не из речи."""
-    found = find_wake(text)
+    found = find_wake(text, words)
     if not (found.found and found.position == "start"):
         return False
     return (audio_seconds is not None and audio_seconds < PROMPT_WAKE_MAX_RECORDING) or \
-        (confidence is not None and confidence < PROMPT_WAKE_MIN_CONFIDENCE)
+        (confidence is not None and confidence < WAKE_PROMPT_MIN_CONFIDENCE)
 
 
-def judge(text, from_prompt=False, confidence=None):
-    """Засчитано ли слово как обращение и почему. from_prompt — Recognition.wake_from_prompt."""
-    result = find_wake(text)
+def judge(text, from_prompt=False, confidence=None, words=WAKE_WORDS):
+    """Засчитано ли слово как обращение и почему. from_prompt — Recognition.wake_from_prompt.
+
+    Слово, возможно пришедшее из подсказки: остаток из 2+ слов — нужна уверенность ≥ WAKE_PROMPT_MIN_CONFIDENCE, из одного
+    слова — ≥ WAKE_PROMPT_MIN_CONFIDENCE_ONE_WORD, остаток пуст — не засчитывается (одно «Джарвис» из подсказки не зовёт)."""
+    result = find_wake(text, words)
     if not result.found:
         return result
     result.from_prompt = bool(from_prompt)
-    rest_words = len(_words(result.rest))
-    if from_prompt:
-        sure = confidence is None or confidence >= PROMPT_WAKE_MIN_CONFIDENCE
-        if rest_words >= PROMPT_WAKE_MIN_REST_WORDS and sure:
-            result.counted = True
-            result.reason = f"{result.reason}; возможно из подсказки, но после слова команда из {rest_words} слов"
-        else:
-            why = []
-            if rest_words < PROMPT_WAKE_MIN_REST_WORDS:
-                why.append(f"остаток короче {PROMPT_WAKE_MIN_REST_WORDS} слов")
-            if not sure:
-                why.append(f"уверенность {confidence:.2f} < {PROMPT_WAKE_MIN_CONFIDENCE:.2f}")
-            result.reason = "слово возможно из подсказки Whisper (" + ", ".join(why) + ")"
+    if not from_prompt:
+        result.counted = True
         return result
-    result.counted = True
+    rest_words = len(_words(result.rest))
+    needed = WAKE_PROMPT_MIN_CONFIDENCE if rest_words >= 2 else WAKE_PROMPT_MIN_CONFIDENCE_ONE_WORD
+    why = None
+    if rest_words == 0:
+        why = "остаток пуст"
+    elif confidence is not None and confidence < needed:
+        kind = "" if rest_words >= 2 else " для остатка из 1 слова"
+        why = f"уверенность {confidence:.2f} < порога {needed:.2f}{kind}"
+    if why is None:
+        result.counted = True
+        result.reason = f"{result.reason}; возможно из подсказки, но после слова команда из {rest_words} слов"
+    else:
+        result.reason = f"слово возможно из подсказки Whisper ({why})"
     return result
 
 
@@ -168,16 +245,18 @@ class Phrase:
 class Decision:
     action: str          # "process" | "drop" | "listen" | "stop"
     text: str = ""
+    opens_window: bool = True    # для "listen": открывать ли окно диалога после «Слушаю.»
 
 
 class WakeGate:
     def __init__(self, window=DEFAULT_WINDOW, answer_timeout=ANSWER_TIMEOUT, anchor=lambda: None,
                  speaking=lambda: False, expects_answer=lambda: False, stop_speech=lambda: None,
-                 close_anchor=lambda: None, clock=time.monotonic):
+                 close_anchor=lambda: None, clock=time.monotonic, words=WAKE_WORDS):
         self.window, self.answer_timeout = window, answer_timeout
         self._anchor, self._speaking = anchor, speaking             # конец озвучки, открывающей окно / идёт ли озвучка
         self._expects_answer, self._stop_speech = expects_answer, stop_speech
         self._close_anchor, self._clock = close_anchor, clock
+        self.words = tuple(words)
         self.dropped = 0                                           # за запуск
 
     # окно диалога
@@ -203,15 +282,16 @@ class WakeGate:
             self._stop_speech()
             self.close_window()
             return Decision("process", text)
-        result = judge(text, phrase.from_prompt, phrase.confidence)
+        result = judge(text, phrase.from_prompt, phrase.confidence, self.words)
         in_window = self.window_open(phrase.started_at)
         if result.found:
             if is_stop_phrase(result.rest):
                 return self._stop()
             if result.counted:
+                if result.distorted:
+                    log.info("слово «Джарвис» засчитано по искажению (расстояние %.2f)", result.ratio)
                 if not result.rest:
-                    log.info("Обращение «Джарвис» без команды")
-                    return Decision("listen")
+                    return self._listen(phrase)
                 if is_cancel_phrase(result.rest):
                     self._stop_speech()
                     self.close_window()
@@ -223,6 +303,15 @@ class WakeGate:
         if in_window:
             return Decision("process", text)
         return self._drop()
+
+    def _listen(self, phrase):
+        opens = phrase.confidence is None or phrase.confidence >= WAKE_LISTEN_WINDOW_MIN_CONFIDENCE
+        if opens:
+            log.info("Обращение «Джарвис» без команды")
+        else:
+            log.info("Обращение «Джарвис» без команды: окно диалога не открыто (уверенность %.2f < %.2f)",
+                     phrase.confidence, WAKE_LISTEN_WINDOW_MIN_CONFIDENCE)
+        return Decision("listen", opens_window=opens)
 
     def _stop(self):
         self._stop_speech()
@@ -239,12 +328,15 @@ class WakeGate:
 
 
 def build_gate(engine, ai, answer_timeout=ANSWER_TIMEOUT, path=None):
-    """Шлюз по WAKE_WORD / WAKE_WINDOW из .env или None, если слово выключено."""
+    """Шлюз по WAKE_WORD / WAKE_WINDOW / WAKE_WORDS из .env или None, если слово выключено."""
     enabled, window = wake_settings(path)
     if not enabled:
         log.info("Слово-активатор выключено (WAKE_WORD=off): Jarvis отвечает на любую услышанную фразу")
         return None
-    log.info("Слово-активатор «Джарвис» включено, окно диалога %.0f с", window)
+    extra = extra_wake_words(path)
+    log.info("Слово-активатор «Джарвис» включено, окно диалога %.0f с, слов в списке %d (своих: %d)", window,
+             len(WAKE_WORDS) + len(extra), len(extra))
     return WakeGate(window, answer_timeout, anchor=lambda: engine.window_opened_at,
                     speaking=engine.speaking.is_set, expects_answer=ai.expects_answer,
-                    stop_speech=engine.stop_speaking, close_anchor=engine.close_window)
+                    stop_speech=engine.stop_speaking, close_anchor=engine.close_window,
+                    words=(*WAKE_WORDS, *extra))

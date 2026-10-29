@@ -5,11 +5,13 @@
 WAV/AIFF/FLAC; текст печатается в консоль), `--mic` записывает фразы с микрофона: `--repeat N` фраз подряд (по умолчанию
 3), для каждой печатаются текст, длина записи и время. `--no-prompt` отключает подсказку Whisper — так сравнивают
 качество с подсказкой и без неё (STT_PROMPT=off в .env делает то же самое). Откат на Google здесь отключён: проверяется
-только локальный движок. `--wake` для каждой записи показывает, засчитано ли слово «Джарвис» и почему (окно диалога
-в проверке не учитывается). Ничего не скачивает.
+только локальный движок. `--wake` для каждой записи показывает, засчитано ли слово «Джарвис», какое слово услышано и насколько оно похоже на
+слово списка («червис ≈ джарвис, 0.62, из списка»), а в конце — сводку: сколько записей засчитано, сколько нет,
+медианная уверенность (окно диалога в проверке не учитывается). Ничего не скачивает.
 """
 import argparse
 import importlib.util
+import statistics
 import sys
 import time
 
@@ -99,6 +101,9 @@ def main(argv=None, out=print):
     else:
         return 0
     status = 0
+    words = (*wake.WAKE_WORDS, *wake.extra_wake_words())
+    counted = not_counted = filtered = 0
+    confidences = []
     for number, audio in enumerate(audios, 1):
         try:
             result = engine.recognize(audio, prompt)
@@ -108,17 +113,32 @@ def main(argv=None, out=print):
             continue
         out(f"[{number}] запись {result.audio_seconds:.1f} с, распознавание {result.seconds:.1f} с"
             + (f", уверенность {result.confidence:.2f}" if result.confidence is not None else ""))
+        if result.confidence is not None:
+            confidences.append(result.confidence)
         reasons = {"noise": "шум/галлюцинация", "prompt_echo": "эхо подсказки"}
         out(f"[{number}] отброшено: {reasons.get(result.discarded, result.discarded)}" if result.discarded
             else f"[{number}] текст: {result.text}")
-        if args.wake and not result.discarded:
-            from_prompt = bool(prompt) and wake.prompt_induced(result.text, result.audio_seconds, result.confidence)
-            verdict = wake.judge(result.text, from_prompt, result.confidence)
+        if args.wake and result.discarded:
+            filtered += 1
+        elif args.wake:
+            from_prompt = bool(prompt) and wake.prompt_induced(result.text, result.audio_seconds, result.confidence, words)
+            verdict = wake.judge(result.text, from_prompt, result.confidence, words)
+            match = f"; {verdict.describe()}" if verdict.found else ""
             if verdict.found and verdict.counted:
-                out(f"[{number}] слово «Джарвис»: ЗАСЧИТАНО — {verdict.reason}; команда: «{verdict.rest}»"
-                    if verdict.rest else f"[{number}] слово «Джарвис»: ЗАСЧИТАНО — {verdict.reason}; команды нет, ответ «Слушаю.»")
+                counted += 1
+                tail = (f"команда: «{verdict.rest}»" if verdict.rest else "команды нет, ответ «Слушаю.»"
+                        + ("" if result.confidence is None or result.confidence >= wake.WAKE_LISTEN_WINDOW_MIN_CONFIDENCE
+                           else f", окно не откроется (уверенность {result.confidence:.2f} < "
+                                f"{wake.WAKE_LISTEN_WINDOW_MIN_CONFIDENCE:.2f})"))
+                out(f"[{number}] слово «Джарвис»: ЗАСЧИТАНО — {verdict.reason}{match}; {tail}")
             else:
-                out(f"[{number}] слово «Джарвис»: не засчитано — {verdict.reason}")
+                not_counted += 1
+                out(f"[{number}] слово «Джарвис»: не засчитано — {verdict.reason}{match}")
+    if args.wake and (counted or not_counted or filtered):
+        median = f"{statistics.median(confidences):.2f}" if confidences else "нет данных"
+        out(f"Сводка --wake: записей {counted + not_counted + filtered}; слово засчитано {counted}; не засчитано "
+            f"{not_counted}" + (f"; отброшено фильтром шума {filtered}" if filtered else "")
+            + f"; медианная уверенность {median}")
     return status
 
 

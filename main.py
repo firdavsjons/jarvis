@@ -255,7 +255,8 @@ class VoiceApp:
                 self.set_idle_status()
                 return
             if decision.action == "listen":
-                self.engine.speak(LISTENING_REPLY, opens_window=True)   # после одного «Джарвис» окно нужно
+                # После одного «Джарвис» окно нужно, но при слабой уверенности (0,3–0,4) только «Слушаю.», окно не открывается
+                self.engine.speak(LISTENING_REPLY, opens_window=decision.opens_window)
                 self.set_idle_status()
                 return
             text = decision.text
