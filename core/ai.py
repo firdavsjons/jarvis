@@ -9,10 +9,10 @@ from dataclasses import dataclass, field
 from functools import partial
 from urllib.parse import urlparse
 
-from core.phrase_lists import requested_apps  # noqa: F401 — также используется кэшем команд
+from core.phrase_lists import requested_apps, strip_leading  # noqa: F401 — также используется кэшем команд
 from core import durations, installed_apps, journal, prompts, safety, topics, web
 from core.apps import registry
-from core.apps import resolve_app
+from core.apps import resolve_app, spoken_variant
 from core.cache import cacheable_actions
 from core.errors import ActionError, Done
 from core.fragments import FRAGMENT_REPLY, NOTHING_TO_CONFIRM, asks_question, is_bare_confirmation, is_fragment
@@ -37,6 +37,7 @@ PROMISE_RETRY_NOTE = "Вызови инструмент или скажи, чт�
 PROMISE_FAIL_REPLY = "Не получилось: действие не было выполнено."
 CONFIRM_RETRY_NOTE = "Вызови telegram(action=send); подтверждение запросит сам Jarvis, не проси его словами."
 APPS_RETRY_NOTE = "В фразе названы ещё приложения: {apps}. Вызови инструменты для них."
+MAX_APP_RETRIES = 2        # повторов запроса за фразу для невыполненных приложений (три приложения — по одному за раз)
 CANT_READ_CHATS_REPLY = "Читать ваши чаты я не умею."
 CHAT_READ_BLOCKED = {"web_search", "read_page"}      # поиск и чтение страниц не подменяют чтение личных сообщений
 HISTORY_IN_DIALOG = 4   # сообщений истории, пока открыт диалог о сообщении (2 обмена): важна фраза пользователя
@@ -148,14 +149,29 @@ def strip_service_marks(text):
     return _SERVICE_MARK_RE.sub("", str(text or "")).strip()
 
 
-def spoken_app_name(segment):
-    """Как назвать невыполненное приложение: известное (resolve_app_name) — по-русски, как сказал пользователь, с большой
-    буквы («часы» -> «Часы»), или каноническим именем, если сказано латиницей («app store» -> «App Store»); неизвестное
-    остаётся как сказано."""
+def known_app(segment):
+    """Каноническое имя установленного приложения для сегмента фразы («ватсап» -> WhatsApp) или None. Сначала
+    resolve_app_name (псевдонимы, русские названия), затем «как говорят» из core.apps.SPOKEN_VARIANTS — если приложение
+    установлено."""
     resolved = installed_apps.resolve_app_name(segment)
-    if not resolved:
+    if resolved:
+        return resolved
+    variant = spoken_variant(segment)
+    if variant and variant.casefold() in {a.casefold() for a in installed_apps.list_installed_apps()}:
+        return variant
+    return None
+
+
+def spoken_app_name(segment):
+    """Как назвать невыполненное приложение. Предлоги и союзы в начале убираются («в whatsapp», «и телеграм»). Известное
+    (resolve_app_name или «как говорят»), сказанное по-русски — по-русски с большой буквы («часы» -> «Часы», «и ватсап» ->
+    «Ватсап»); сказанное латиницей — каноническим именем («app store» -> «App Store», «в whatsapp» -> «WhatsApp»);
+    неизвестное остаётся как сказано."""
+    segment = strip_leading(segment)
+    canonical = installed_apps.resolve_app_name(segment) or spoken_variant(segment)
+    if not canonical:
         return segment
-    return segment.capitalize() if re.search(r"[а-яё]", segment.lower()) else resolved
+    return segment.capitalize() if re.search(r"[а-яё]", segment.lower()) else canonical
 
 
 _MESSENGER_RE = re.compile(r"телеграм|telegram|ватсап|whatsapp|вотсап|сообщен|\bчат|переписк|мессенджер", re.IGNORECASE)
@@ -195,9 +211,11 @@ def unfinished_segments(phrase, results):
     for segment in segments:
         squeezed = squeeze(segment)
         resolved = installed_apps.resolve_app_name(segment)
+        variant = spoken_variant(segment)       # «ватсап» / «вацап» = WhatsApp: выполненный open_app WhatsApp засчитывается
         aliases = {squeeze(resolve_app(w)) for w in segment.split()}
         mentioned = (squeezed in handled or bool(aliases & handled)
                      or (resolved is not None and squeeze(resolved) in handled)
+                     or (variant is not None and squeeze(variant) in handled)
                      or any(len(h) >= 2 and h in squeezed for h in handled))
         if not mentioned:
             left.append(segment)
@@ -585,12 +603,14 @@ class AIClient:
         executed = []
         tool_rounds, requests, retried, web_seen = 0, 0, False, False
         confirm_retried = False
-        apps_retried = False       # «В фразе названы ещё приложения…» — повтор не больше одного раза за фразу
+        apps_retries, previous_left = 0, None    # повторы «В фразе названы ещё приложения…» (до MAX_APP_RETRIES за фразу)
+        request_tools = None
 
         while True:
             try:
                 # json_messages только в первом запросе: без инструментов результаты им не вернуть
-                response = self.llm.chat(messages, tools=self._request_tools(text),
+                request_tools = self._request_tools(text)
+                response = self.llm.chat(messages, tools=request_tools,
                                          json_messages=json_messages if requests == 0 else None)
                 requests += 1
             except Exception as e:
@@ -618,7 +638,7 @@ class AIClient:
                                                {"role": "user", "content": PROMISE_RETRY_NOTE}]
                         continue
                     return self._finish(text, Turn(PROMISE_FAIL_REPLY))
-                if apps_retried and executed and all(r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS
+                if apps_retries and executed and all(r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS
                                                      for r in executed):
                     # После повтора модель только сказала текст: говорим по выполненному сами, «Остальное…» добавит _finish
                     return self._finish(text, Turn(template_speech(self._distinct(executed)), results=executed))
@@ -680,14 +700,21 @@ class AIClient:
                 # Всё простое и успешное — фраза по шаблону, второй запрос к модели не нужен
                 executed += round_results
                 left = self._known_unfinished_apps(text, executed)
-                if left and not apps_retried and tool_rounds < MAX_TOOL_ROUNDS:
-                    # Модель сделала не всё, а оставшиеся приложения известны: один повтор, только потом «Остальное…»
-                    log.warning("LLM: в фразе названы ещё приложения — повторяю запрос один раз")
-                    apps_retried = True
-                    messages = messages + [assistant_message(response), *self._tool_messages(calls, round_results),
-                                           {"role": "user", "content": APPS_RETRY_NOTE.format(apps=", ".join(left))}]
-                    continue
-                speech = template_speech(self._distinct(executed)) if apps_retried and all(
+                if (left and apps_retries < MAX_APP_RETRIES and tool_rounds < MAX_TOOL_ROUNDS
+                        and (previous_left is None or len(left) < len(previous_left))):
+                    # Модель сделала не всё, а оставшиеся приложения известны: повтор (до MAX_APP_RETRIES), каждый раз с
+                    # актуальным списком; без прогресса на прошлом повторе — не повторяем; «Остальное…» — только после
+                    retry = messages + [assistant_message(response), *self._tool_messages(calls, round_results),
+                                        {"role": "user", "content": APPS_RETRY_NOTE.format(apps=", ".join(left))}]
+                    if self._llm_can_accept(retry, request_tools):
+                        apps_retries += 1
+                        previous_left = left
+                        log.warning("LLM: в фразе названы ещё приложения — повторяю запрос (%d из %d)", apps_retries,
+                                    MAX_APP_RETRIES)
+                        messages = retry
+                        continue
+                    log.warning("LLM: лимит запросов — повтор для невыполненных приложений не делаю")
+                speech = template_speech(self._distinct(executed)) if apps_retries and all(
                     r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS for r in executed) else \
                     template_speech(round_results)
                 return self._finish(text, Turn(speech, results=executed))
@@ -712,7 +739,18 @@ class AIClient:
     def _known_unfinished_apps(text, executed):
         """Названия приложений из фразы-перечисления, которые модель не обработала и которые известны системе
         (resolve_app_name): для них стоит повторить запрос. Неизвестные попадут только в «Остальное я не сделал»."""
-        return [spoken_app_name(s) for s in unfinished_segments(text, executed) if installed_apps.resolve_app_name(s)]
+        return [spoken_app_name(s) for s in unfinished_segments(text, executed) if known_app(s)]
+
+    def _llm_can_accept(self, messages, tools):
+        """Необязательный запрос (повтор) делаем, только если провайдер не на лимите; клиент без can_accept — всегда."""
+        check = getattr(self.llm, "can_accept", None)
+        if not callable(check):
+            return True
+        try:
+            return bool(check(messages, tools))
+        except Exception as e:
+            log.warning("LLM: не удалось проверить лимит: %s", type(e).__name__)
+            return True
 
     @staticmethod
     def _distinct(results):

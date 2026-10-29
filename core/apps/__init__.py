@@ -20,6 +20,20 @@ APP_ALIASES = {
 }
 ALIAS_PREFIX_MIN = 5  # ключи короче (например «хром») — только точное совпадение
 
+# Как говорят вслух приложения, которых нет в APP_ALIASES (открытие приложений они не меняют). Используются подсказкой
+# Whisper (core/stt/prompt.py) и разбором фраз-перечислений («Остальное я не сделал: Ватсап», core/ai.py)
+SPOKEN_EXTRAS = (("ватсап", "WhatsApp"), ("вотсап", "WhatsApp"), ("вацап", "WhatsApp"), ("ютуб", "YouTube"),
+                 ("хром", "Google Chrome"), ("вайбер", "Viber"), ("зум", "zoom.us"), ("слак", "Slack"),
+                 ("спотифай", "Spotify"))
+# Варианты названий, которые Whisper пишет латиницей или с лишней буквой
+SPOKEN_VARIANTS = {**dict(SPOKEN_EXTRAS), "whatsapp": "WhatsApp", "телеграм": "Telegram", "телеграмм": "Telegram",
+                   "telegram": "Telegram", "youtube": "YouTube"}
+
+
+def spoken_variant(word):
+    """«ватсап» / «вацап» / «whatsapp» -> WhatsApp, «телеграмм» -> Telegram, «ютуб» -> YouTube; иначе None."""
+    return SPOKEN_VARIANTS.get(" ".join(str(word).lower().replace("ё", "е").split()))
+
 
 def resolve_app(app):
     """Русское название -> имя в macOS. Падежи: «калькулятора» начинается с «калькулятор»."""

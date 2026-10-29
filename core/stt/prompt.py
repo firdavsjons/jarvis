@@ -23,7 +23,7 @@ import re
 import time
 
 from core import contacts, installed_apps
-from core.apps import APP_ALIASES
+from core.apps import APP_ALIASES, SPOKEN_EXTRAS
 from core.settings import env_value
 
 PROMPT_TOKEN_LIMIT = 80
@@ -33,10 +33,8 @@ CONTACTS_PER_PROMPT = 2
 REFRESH_SECONDS = 600
 BASE = "Джарвис."
 DEFAULT_CITY = "Душанбе"   # как core.web.DEFAULT_CITY (web здесь не импортируем: тянет httpx)
-# Как говорят вслух приложения, которых нет в APP_ALIASES: только для подсказки (открытие приложений они не меняют).
-# Попадают в подсказку, лишь если приложение установлено
-SPOKEN_EXTRAS = (("ватсап", "WhatsApp"), ("вотсап", "WhatsApp"), ("ютуб", "YouTube"), ("хром", "Google Chrome"),
-                 ("вайбер", "Viber"), ("зум", "zoom.us"), ("слак", "Slack"), ("спотифай", "Spotify"))
+# «Произносимые добавки» (SPOKEN_EXTRAS) живут в core/apps: их знает и разбор фраз-перечислений. Попадают в подсказку,
+# лишь если приложение установлено
 
 
 def estimate_tokens(text):

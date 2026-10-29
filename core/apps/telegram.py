@@ -351,12 +351,65 @@ def _text_hash(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# --- Текст мог распознаться неточно (Этап 8.2.4) ------------------------------------------------------------------------
+INACCURATE_WARNING = "Текст мог распознаться неточно. Проверьте в окне Telegram."
+LONG_RECORDING = 8.0           # запись длиннее (с) …
+SHORT_TEXT_WORDS = 5           # … а в тексте слов меньше — вероятно, часть речи потерялась или исказилась
+# Повтор этих слов — обычная речь, признаком неточности не считается
+REPEAT_OK = {"да", "нет", "очень", "ну", "так", "вот", "ага", "угу", "давай", "пока", "стоп", "хватит", "ещё", "еще", "уже"}
+# Короткие слова, которыми предложение начаться может («Я иду», «И я тоже», «В магазин»)
+SHORT_START_OK = {"я", "ты", "мы", "вы", "он", "да", "нет", "ок", "ну", "и", "а", "но", "не", "ни", "в", "во", "на", "с", "со",
+                  "к", "ко", "у", "о", "об", "по", "до", "за", "из", "от", "же", "бы", "ли"}
+_PUNCT_RUN_RE = re.compile(r"[.,;:!?…\-]{3,}(?=\s*\w)")
+_SHORT_AFTER_DOT_RE = re.compile(r"\.\s+(\w{1,2})\b")
+_recording_seconds = None      # длина записи голосовой фразы (main.process_command); текстовый ввод и тесты — None
+
+
+def note_recording(seconds):
+    """main сообщает длину записи фразы, из которой собирается сообщение (None — текстовый ввод)."""
+    global _recording_seconds
+    _recording_seconds = seconds
+
+
+def inaccuracy_signs(text, seconds=None):
+    """Признаки того, что текст исказило распознавание речи (эвристика, отправку не запрещает):
+    слово повторяется подряд (от 2 букв) или через одно слово (от 4 букв), больше двух знаков препинания подряд внутри
+    предложения (не «...» и не «!!!»), слово короче 3 букв после точки, запись длиннее 8 с, а слов меньше 5."""
+    signs = []
+    words = re.findall(r"\w+", str(text).lower().replace("ё", "е"))
+    ok = {w.replace("ё", "е") for w in REPEAT_OK}
+    for i, word in enumerate(words):
+        if word in ok or len(word) < 2:
+            continue
+        if (i + 1 < len(words) and words[i + 1] == word) or (len(word) >= 4 and i + 2 < len(words) and words[i + 2] == word):
+            signs.append("повтор слова")
+            break
+    for run in _PUNCT_RUN_RE.findall(str(text)):
+        if len(set(run)) > 1 or len(run) >= 4:
+            signs.append("знаки препинания подряд")
+            break
+    if any(m.group(1).lower() not in SHORT_START_OK for m in _SHORT_AFTER_DOT_RE.finditer(str(text))):
+        signs.append("короткое слово после точки")
+    if seconds is not None and seconds > LONG_RECORDING and len(words) < SHORT_TEXT_WORDS:
+        signs.append("длинная запись, мало слов")
+    return signs
+
+
+def looks_inaccurate(text, seconds=None):
+    return bool(inaccuracy_signs(text, seconds))
+
+
 def _question(contact, text):
-    full = f"отправить {contact.title} сообщение: «{text}»"
+    signs = inaccuracy_signs(text, _recording_seconds)
+    verb = "отправить"
+    if signs:
+        log.info("Telegram: текст сообщения мог распознаться неточно (признаки: %s)", ", ".join(signs))
+        verb = f"{INACCURATE_WARNING} Отправить"     # предупреждение звучит до вопроса
+    full = f"{verb} {contact.title} сообщение: «{text}»"
     if len(text) <= VOICE_FULL:
         return full, full
     head = text[:VOICE_FULL].rstrip()
-    return (f"отправить {contact.title} сообщение: «{head}», и ещё {len(text) - len(head)} символов, "
+    return (f"{verb} {contact.title} сообщение: «{head}», и ещё {len(text) - len(head)} символов, "
             f"полный текст в окне"), full
 
 

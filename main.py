@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from core.engine import SpeechEngine
 from core.ai import BLOCKED_REPLY, AIClient, describe_action, normalize_ai_response, summarize_results
 from core.cache import CACHE_FILE, CLEARED_REPLY, CommandCache, is_forget_cache_command
-from core.apps import registry
+from core.apps import registry, telegram
 from core.fragments import CANCEL_WORDS, CONFIRM_WORDS
 from core.history import FORGET_REPLY, is_forget_command
 from core.links import parse_link_command, parse_read_command
@@ -244,6 +244,8 @@ class VoiceApp:
         уверенность распознавания голосовой фразы.
 
         Порядок: подтверждение → стоп/отмена → слово «Джарвис»/окно диалога → обрывки и обрезанные → остальное."""
+        # Длина записи нужна Telegram: длинная запись при коротком тексте — признак неточного распознавания
+        telegram.note_recording(phrase.audio_seconds if source == "voice" and phrase is not None else None)
         gate = self.wake if isinstance(getattr(self, "wake", None), WakeGate) else None
         pending = self.has_pending()
         in_window = False          # фраза принята окном диалога (слова-активатора не было): обрезанное начало не проверяем

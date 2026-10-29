@@ -78,6 +78,23 @@ class FallbackClient(LLMClient):
         log.error("LLM: все провайдеры недоступны")
         return LLMResponse(ok=False, text=NO_CONNECTION_REPLY)
 
+    def can_accept(self, messages, tools=None, json_messages=None):
+        """Есть ли провайдер, который примет этот запрос прямо сейчас: не в паузе, не у дневного лимита и не у лимита токенов
+        в минуту. Ничего не записывает и не ждёт: так AIClient решает, стоит ли делать необязательный повтор запроса."""
+        for provider in self.providers:
+            if self._clock() < self._down_until.get(provider.name, 0):
+                continue
+            use_json = bool(tools) and not getattr(provider, "supports_tools", True)
+            if use_json and json_messages is None:
+                continue
+            if self.usage.near_limit(provider.name):
+                continue
+            tokens = estimate_tokens(json_messages if use_json else messages, None if use_json else tools,
+                                     getattr(provider, "max_tokens", None))
+            if not self.usage.tpm_exceeded(provider.name, tokens):
+                return True
+        return False
+
     def _notify_wait(self):
         if self.on_wait is None:
             return

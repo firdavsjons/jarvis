@@ -6,7 +6,18 @@ LIST_VERBS = {"открой", "открыть", "откройте", "закро�
               "выйти"}
 LIST_FILLERS = {"приложение", "приложении", "приложения", "приложений", "программу", "программа", "программы",
                 "пожалуйста", "мне", "все", "всё", "ещё", "еще", "тоже", "также", "потом", "и"}
+# Слова в начале сегмента, которые названием приложения не бывают: «и телеграм», «в whatsapp», «на сафари»
+LEADING_WORDS = {"в", "во", "на", "и", "а", "с", "со", "к", "ко", "у", "о", "об", "про", "из", "также", "ещё", "еще",
+                 "потом", "тоже", "приложение", "приложении", "программу", "программа", "программы"}
 _LIST_SPLIT_RE = re.compile(r"\s*(?:,|;|\bа также\b|\bи\b)\s*", re.IGNORECASE)
+
+
+def strip_leading(segment):
+    """«в whatsapp» -> «whatsapp», «и телеграм» -> «телеграм»: предлоги и союзы в начале сегмента убираются."""
+    words = str(segment).split()
+    while len(words) > 1 and words[0].lower() in LEADING_WORDS:
+        words.pop(0)
+    return " ".join(words)
 
 
 def requested_apps(phrase):
@@ -20,5 +31,7 @@ def requested_apps(phrase):
     for part in _LIST_SPLIT_RE.split(text):
         kept = [w for w in re.findall(r"[\w\-]+", part) if w not in LIST_FILLERS and w not in LIST_VERBS]
         if kept:
-            segments.append(" ".join(kept))
+            segment = strip_leading(" ".join(kept))
+            if segment.lower() not in LEADING_WORDS:
+                segments.append(segment)
     return segments if len(segments) >= 2 else []
