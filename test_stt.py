@@ -24,7 +24,9 @@ from core.stt import whisper_cpp as cpp_module
 from core.stt.base import MIN_SECONDS, Audio, Engine, Loading, Recognition, Segment, SttError, Unavailable
 from core.stt.blacklist import BLACKLIST, is_blacklisted
 from core.stt.google import GoogleEngine, google_language
-from core.stt.prompt import PROMPT_TOKEN_LIMIT, PromptProvider, build_prompt, estimate_tokens
+from core.stt.prompt import (COMMAND_VERBS, PROMPT_TOKEN_LIMIT, PromptProvider, build_prompt, estimate_tokens,
+                             russian_app_names)
+from core.stt.repeats import collapse_repeats
 from core.stt.service import (FAILED_FALLBACK, FAILED_OFF, FAILED_REPLY, LOADING_REPLY, NOT_INSTALLED_FALLBACK,
                               NOT_INSTALLED_OFF, SpeechToText)
 from core.stt.truncated import TRUNCATED_REPLY, is_truncated
@@ -954,6 +956,134 @@ class TestPromptNeverGoesToGoogle(ServiceCase, PromptCase):
         recognizer.recognize_google.return_value = "привет"
         GoogleEngine(recognizer).recognize(make_audio(), prompt="Джарвис. Контакты: мама.")
         self.assertNotIn("Джарвис", repr(recognizer.recognize_google.call_args))
+
+
+class TestRussianPrompt(PromptCase):
+    """Этап 8.1.1: Whisper должен слышать «калькулятор», а не «Calculator»."""
+
+    def group(self, label, text=None):
+        text = text or build_prompt()
+        start = text.index(f"{label}: ") + len(label) + 2
+        return text[start:text.index(".", start)].split(", ")
+
+    def test_spoken_russian_names_of_installed_apps(self):
+        text = build_prompt()
+        for spoken in ("калькулятор", "сафари", "телеграм", "заметки", "терминал"):
+            self.assertIn(spoken, text)
+        self.assertIn("калькулятор", self.group("Приложения"))
+
+    def test_not_installed_app_has_no_russian_name(self):
+        with patch("core.installed_apps.list_installed_apps", return_value=["Safari", "Calculator"]):
+            text = build_prompt()
+        self.assertIn("сафари", text)
+        self.assertNotIn("телеграм", text)
+        self.assertNotIn("календарь", text)
+
+    def test_group_order(self):
+        self.write_contacts({"мама": {"username": "mama_user"}})
+        installed_apps.set_user_aliases({"мой браузер": "Safari"})
+        text = build_prompt()
+        order = [text.index(marker) for marker in ("Джарвис.", "Приложения:", "Команды:", "Контакты:",
+                                                   "Как я называю приложения:", "Программы:")]
+        self.assertEqual(order, sorted(order))
+
+    def test_command_verbs(self):
+        self.assertEqual(self.group("Команды"), list(COMMAND_VERBS))
+        self.assertEqual(COMMAND_VERBS, ("открой", "закрой", "включи", "выключи", "поставь", "напиши", "найди", "прочитай"))
+
+    def test_spoken_extras_only_if_installed(self):
+        installed = ["WhatsApp", "YouTube", "Google Chrome", "Viber", "zoom.us", "Slack", "Spotify"]
+        with patch("core.installed_apps.list_installed_apps", return_value=installed):
+            names = russian_app_names(installed)
+        for spoken in ("ватсап", "вотсап", "ютуб", "хром", "вайбер", "зум", "слак", "спотифай"):
+            self.assertIn(spoken, names)
+        self.assertEqual(russian_app_names(["Safari"]), ["сафари"])
+        self.assertEqual(russian_app_names([]), [])
+
+    def test_extras_do_not_touch_app_aliases(self):
+        from core.apps import APP_ALIASES
+        before = dict(APP_ALIASES)
+        build_prompt()
+        self.assertEqual(APP_ALIASES, before)
+        for spoken in ("ватсап", "ютуб", "вайбер", "зум", "слак"):
+            self.assertNotIn(spoken, APP_ALIASES)
+
+    def test_at_most_fifteen_russian_names(self):
+        installed = ["Calculator", "Safari", "Telegram", "Google Chrome", "Notes", "Music", "Mail", "Calendar",
+                     "System Settings", "Terminal", "Photos", "Messages", "Finder", "Spotify", "WhatsApp", "YouTube",
+                     "Viber", "zoom.us", "Slack"]
+        self.assertEqual(len(russian_app_names(installed)), 15)
+
+    def test_english_names_are_cut_first_when_the_limit_is_hit(self):
+        self.write_contacts({f"контакт номер {n} длинное имя": {"username": f"user_{n:05d}"} for n in range(80)})
+        installed_apps.set_user_aliases({f"псевдоним {n} очень длинный": "Safari" for n in range(40)})
+        text = build_prompt()
+        self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
+        self.assertIn("калькулятор", text)
+        self.assertIn("Команды:", text)
+        self.assertNotIn("Программы:", text)
+
+    def test_limit_with_everything_installed(self):
+        text = build_prompt()
+        self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
+
+    def test_no_username_or_phone_with_russian_names(self):
+        self.write_contacts({"мама": {"username": "mama_user", "phone": "+992900000001", "title": "Мама Иванова"}})
+        text = build_prompt()
+        for private in ("mama_user", "992900000001", "Иванова"):
+            self.assertNotIn(private, text)
+        self.assertIn("мама", text)
+
+
+class TestCollapseRepeats(unittest.TestCase):
+    def test_same_sentence_repeated_keeps_one(self):
+        self.assertEqual(collapse_repeats("Открой калькулятор. Открой калькулятор."), "Открой калькулятор.")
+        self.assertEqual(collapse_repeats("открой калькулятор. Открой Калькулятор! открой калькулятор"), "открой калькулятор.")
+        self.assertEqual(collapse_repeats("Включи свет в комнате. Включи свет в комнате. Включи свет в комнате."),
+                         "Включи свет в комнате.")
+
+    def test_phrase_repeated_three_times_keeps_one(self):
+        self.assertEqual(collapse_repeats("включи свет включи свет включи свет"), "включи свет")
+        self.assertEqual(collapse_repeats("включи свет, включи свет, включи свет."), "включи свет.")
+        self.assertEqual(collapse_repeats("скажи включи свет включи свет включи свет сейчас"), "скажи включи свет сейчас")
+        self.assertEqual(collapse_repeats("Открой почту. Открой почту. Открой почту."), "Открой почту.")
+        self.assertEqual(collapse_repeats("a б в a б в a б в a б в"), "a б в")
+
+    def test_comparison_ignores_case_yo_and_punctuation(self):
+        self.assertEqual(collapse_repeats("Всё сделано. всё, сделано!"), "Всё сделано.")
+
+    def test_single_word_repeats_are_never_touched(self):
+        for text in ("громче громче громче", "Громче, громче, громче!", "стоп стоп", "Стоп. Стоп.", "тише тише тише тише"):
+            with self.subTest(text=text):
+                self.assertEqual(collapse_repeats(text), text)
+
+    def test_ordinary_text_is_unchanged(self):
+        for text in ("открой калькулятор", "Открой калькулятор. Закрой сафари.", "раз два раз два", "включи свет включи свет",
+                     "поставь таймер на пять минут", "да да нет нет да да", "что-то", "", "   ", "Открой калькулятор. Открой сафари."):
+            with self.subTest(text=text):
+                self.assertEqual(collapse_repeats(text), text)
+
+    def test_two_copies_of_a_phrase_without_sentence_ends_stay(self):
+        self.assertEqual(collapse_repeats("позвони маме позвони маме"), "позвони маме позвони маме")
+
+    def test_applied_to_local_whisper_result_and_logged_without_text(self):
+        engine = ready_engine(good("Открой калькулятор. Открой калькулятор."))
+        with self.assertLogs("core.stt.whisper_local", level="INFO") as logs:
+            result = engine.recognize(make_audio())
+        self.assertEqual(result.text, "Открой калькулятор.")
+        self.assertNotIn("калькулятор", "\n".join(logs.output))
+
+    def test_repeat_across_segments(self):
+        engine = ready_engine(good("Открой калькулятор."), good("Открой калькулятор."))
+        self.assertEqual(engine.recognize(make_audio()).text, "Открой калькулятор.")
+
+    def test_repeated_single_word_survives_the_engine(self):
+        self.assertEqual(ready_engine(good("громче громче громче")).recognize(make_audio()).text, "громче громче громче")
+
+    def test_google_text_is_not_collapsed(self):
+        recognizer = MagicMock()
+        recognizer.recognize_google.return_value = "Открой калькулятор. Открой калькулятор."
+        self.assertEqual(GoogleEngine(recognizer).recognize(make_audio()).text, "Открой калькулятор. Открой калькулятор.")
 
 
 # --- обрезанные фразы --------------------------------------------------------------------------------------------

@@ -10,6 +10,8 @@
 3. Распознавание речи (Этап 8.1): загрузка настоящей модели Whisper (`_import_backend` в core/stt/whisper_cpp.py и
    core/stt/faster.py) и `Recognizer.recognize_google` (звук в интернет) бросают ForbiddenInTests, пока тест не подменил их
    фальшивкой. Микрофон тесты не открывают (`sr.Microphone` подменяется).
+4. Паузы FallbackClient по умолчанию (2 с после 5xx, ожидание окна токенов) в тестах мгновенные; тест, проверяющий
+   паузу, передаёт свой `sleep=`.
 Исключений (osacompile, py_compile) сейчас нет: тестам они не нужны. Если понадобятся — отдельным явным
 разрешением здесь, а не ослаблением защиты.
 
@@ -171,6 +173,8 @@ def install():
         setattr(os, name, two_paths(name))
     _redirect_app_paths()
     _block_speech_recognition()
+    from core.llm import router
+    router._real_sleep = lambda seconds: None    # паузы FallbackClient (повтор после 5xx, ожидание токенов) в тестах мгновенные
 
 
 def _block_speech_recognition():

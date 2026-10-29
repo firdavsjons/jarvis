@@ -7,13 +7,16 @@ import openai
 from core.llm.base import (NO_CONNECTION_REPLY, RATE_LIMIT_REPLY, LLMClient, LLMResponse, describe_error,
                            server_message)
 from core.llm.providers import ENV_FILE, build_providers, load_config
-from core.llm.usage import UsageTracker, estimate_tokens
+from core.llm.usage import TPM_WINDOW, UsageTracker, estimate_tokens
 
 log = logging.getLogger(__name__)
 
 COOLDOWN_SECONDS = 60
 BAD_REQUEST_PAUSE = 5  # 400 — ошибка самого запроса, сервис доступен: ждать минуту незачем
-TPM_WAIT = 10                    # все провайдеры на лимите токенов в минуту: подождать и повторить один раз
+TPM_MAX_WAIT = 12                # окно токенов освободится не позже чем через столько секунд — ждём и повторяем один раз
+TPM_MARGIN = 0.1                 # запас к ожиданию: запись выходит из окна ровно через минуту
+SERVER_RETRY_STATUSES = (500, 502, 503, 504)   # временные сбои сервера: тот же запрос повторяется один раз
+SERVER_RETRY_DELAY = 2           # через столько секунд
 TPM_REPLY = "Слишком много запросов подряд, подождите минуту."
 RATE_LIMIT_STREAK = 3            # столько 429 подряд…
 RATE_LIMIT_WINDOW = 10 * 60      # …за 10 минут
@@ -21,11 +24,20 @@ RATE_LIMIT_PAUSE = 15 * 60       # -> пауза 15 минут вместо 60 �
 DISPLAY_NAMES = {"gemini": "Gemini", "groq": "Groq", "local": "LM Studio"}
 
 
+def _real_sleep(seconds):
+    time.sleep(seconds)
+
+
+def is_transient_server_error(error):
+    return isinstance(error, openai.APIStatusError) and error.status_code in SERVER_RETRY_STATUSES
+
+
 class FallbackClient(LLMClient):
     name = "fallback"
+    on_wait = None   # callback() — пришлось ждать (повтор после 5xx, окно токенов): AIClient говорит «Секунду.»
 
     def __init__(self, providers, usage=None, clock=time.monotonic, rate_limit_pause=RATE_LIMIT_PAUSE,
-                 sleep=time.sleep):
+                 sleep=None):
         self.providers = list(providers)
         self.usage = usage or UsageTracker(
             {p.name: getattr(p, "daily_limit", None) for p in self.providers},
@@ -34,7 +46,7 @@ class FallbackClient(LLMClient):
             clock=clock,
         )
         self._clock = clock
-        self._sleep = sleep
+        self._sleep = sleep if sleep is not None else _real_sleep
         self._down_until = {}  # провайдер -> до какого момента не пробовать
         self.rate_limit_pause = rate_limit_pause
         self._rate_limits = {}  # провайдер -> моменты 429 подряд (сбрасываются успехом или другой ошибкой)
@@ -45,16 +57,20 @@ class FallbackClient(LLMClient):
         а если json_messages нет (2-й круг с результатами инструментов) — пропускается.
 
         Лимит токенов в минуту: провайдер, которого запрос выведет за 90%, пропускается (как при дневном лимите).
-        Если пропущены все — ждём TPM_WAIT секунд и пробуем один раз, потом «Слишком много запросов подряд»."""
-        response, reasons = self._try_providers(messages, tools, json_messages)
-        if response is None and reasons and all(r == "tpm" for r in reasons):
-            log.info("LLM: все провайдеры на лимите токенов в минуту, жду %s с", TPM_WAIT)
-            self._sleep(TPM_WAIT)
-            response, reasons = self._try_providers(messages, tools, json_messages)
+        Если ответа нет, а окно токенов хоть у одного освободится не позже чем через TPM_MAX_WAIT секунд — ждём ровно
+        столько и пробуем один раз; дольше ждать не будем. 5xx: тот же запрос повторяется один раз (см. _try_providers).
+        «Слишком много запросов подряд» — только если остальные провайдеры не просто недоступны: лимиты (токены,
+        сутки) без сетевых ошибок; иначе «Нет связи»."""
+        response, reasons, wait = self._try_providers(messages, tools, json_messages)
+        if response is None and wait is not None and wait <= TPM_MAX_WAIT:
+            log.info("LLM: лимит токенов в минуту, жду %.1f с", wait)
+            self._notify_wait()
+            self._sleep(wait + TPM_MARGIN)
+            response, reasons, wait = self._try_providers(messages, tools, json_messages)
         if response is not None:
             return response
         if reasons and "tpm" in reasons and all(r in ("tpm", "limit") for r in reasons):
-            log.error("LLM: лимит токенов в минуту у всех провайдеров")
+            log.error("LLM: лимит токенов в минуту, окно освободится через %.0f с", wait if wait is not None else 0)
             return LLMResponse(ok=False, text=TPM_REPLY)
         if reasons and all(r == "limit" for r in reasons):
             log.error("LLM: у всех провайдеров исчерпан лимит запросов")
@@ -62,9 +78,19 @@ class FallbackClient(LLMClient):
         log.error("LLM: все провайдеры недоступны")
         return LLMResponse(ok=False, text=NO_CONNECTION_REPLY)
 
+    def _notify_wait(self):
+        if self.on_wait is None:
+            return
+        try:
+            self.on_wait()
+        except Exception as e:
+            log.warning("LLM: оповещение об ожидании не удалось: %s", type(e).__name__)
+
     def _try_providers(self, messages, tools, json_messages):
-        """(ответ или None, причины пропуска каждого провайдера: "limit", "tpm" или "error")."""
+        """(ответ или None, причины пропуска каждого провайдера: "limit", "tpm" или "error", через сколько секунд
+        освободится окно токенов у ближайшего пропущенного по "tpm" провайдера — или None)."""
         reasons = []
+        wait = None
         for provider in self.providers:
             if self._clock() < self._down_until.get(provider.name, 0):
                 log.debug("LLM %s пропущен: недавно падал", provider.name)
@@ -83,18 +109,36 @@ class FallbackClient(LLMClient):
             if self.usage.tpm_exceeded(provider.name, tokens):
                 log.warning("лимит токенов в минуту, пропускаю %s", DISPLAY_NAMES.get(provider.name, provider.name))
                 reasons.append("tpm")
+                until = self.usage.seconds_until_fits(provider.name, tokens)
+                if until is not None and (wait is None or until < wait):
+                    wait = until
                 continue
 
-            self.usage.record(provider.name)
-            self.usage.record_tokens(provider.name, tokens)
             started = self._clock()
-            try:
-                if use_json:
-                    response = provider.chat(json_messages)
-                    response.mode = "json"
-                else:
-                    response = provider.chat(messages, tools)
-            except Exception as e:
+            response, error = None, None
+            for attempt in (1, 2):
+                self.usage.record(provider.name)
+                self.usage.record_tokens(provider.name, tokens)
+                try:
+                    if use_json:
+                        response = provider.chat(json_messages)
+                        response.mode = "json"
+                    else:
+                        response = provider.chat(messages, tools)
+                    error = None
+                    break
+                except Exception as e:
+                    error = e
+                    if attempt == 1 and is_transient_server_error(e):
+                        # 500/502/503/504: сервер споткнулся — тот же запрос тому же провайдеру ещё раз через 2 с
+                        log.warning("LLM %s: %s — повторяю тот же запрос через %s с", provider.name, describe_error(e),
+                                    SERVER_RETRY_DELAY)
+                        self._notify_wait()
+                        self._sleep(SERVER_RETRY_DELAY)
+                        continue
+                    break
+            if error is not None:
+                e = error
                 pause = self._pause_after(provider.name, e)
                 self._down_until[provider.name] = self._clock() + pause
                 self._down_reason[provider.name] = "limit" if isinstance(e, openai.RateLimitError) else "error"
@@ -112,8 +156,8 @@ class FallbackClient(LLMClient):
 
             log.info("LLM: ответ от %s (%s) за %.1f с", provider.name, getattr(provider, "model", "?"),
                      self._clock() - started)
-            return response, reasons
-        return None, reasons
+            return response, reasons, wait
+        return None, reasons, wait
 
     def _pause_after(self, name, error):
         """60 с; 400 — 5 с (ошибка запроса); 3 ответа 429 подряд за 10 минут — 15 минут (лимит исчерпан)."""

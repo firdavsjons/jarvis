@@ -15,6 +15,7 @@ import time
 
 from core.stt.base import Engine, Loading, Recognition, Segment, SttError, Unavailable
 from core.stt.blacklist import is_blacklisted
+from core.stt.repeats import collapse_repeats
 
 log = logging.getLogger(__name__)
 
@@ -197,5 +198,9 @@ class LocalWhisper(Engine):
             self._last_used = self._clock()
         kept, reason = filter_segments(segments)
         text = " ".join(s.text.strip() for s in kept).strip()
+        collapsed = collapse_repeats(text)
+        if collapsed != text:
+            log.info("Повтор в распознанном тексте схлопнут (было %d симв., стало %d)", len(text), len(collapsed))
+            text = collapsed
         return Recognition(text=text, engine=self.name, seconds=elapsed, audio_seconds=audio.seconds,
                            confidence=confidence_of(kept), discarded=reason)

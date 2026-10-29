@@ -206,5 +206,59 @@ class TestCheckOutput(unittest.TestCase):
         self.assertIn("типичный запрос", out.getvalue())
 
 
+class TestFuzzyTopics(unittest.TestCase):
+    """Этап 8.1.1: распознавание искажает слова; нет точных совпадений — нечёткое (difflib ≥ 0,8) вместо запасного набора."""
+
+    def select(self, phrase, **kwargs):
+        return topics.select(phrase, TOOLS, **kwargs)
+
+    def test_distorted_words_reach_their_topics(self):
+        cases = {"замтки": "personal", "колендарь на завтра": "personal",
+                 "пагода в душанбе": "web", "напиши в телеграмм": "messaging", "открой телеграмм": "messaging"}
+        for phrase, topic in cases.items():
+            with self.subTest(phrase=phrase):
+                _, info = self.select(phrase)
+                self.assertFalse(info["fallback"])
+                self.assertIn(topic, info["topics"])
+
+    def test_distorted_words_are_found_by_fuzzy_match_not_by_prefix(self):
+        for phrase in ("замтки", "пагода", "колендарь"):
+            with self.subTest(phrase=phrase):
+                tools, info = self.select(phrase)
+                self.assertTrue(info["fuzzy"])
+                self.assertNotIn(topics.MORE_TOOLS, names(tools))        # запасной набор не нужен
+
+    def test_exact_match_is_not_fuzzy(self):
+        _, info = self.select("какая погода")
+        self.assertFalse(info["fuzzy"])
+        _, info = self.select("телеграмм маме")                          # «телеграмм» начинается с «телеграм»
+        self.assertFalse(info["fuzzy"])
+        self.assertIn("messaging", info["topics"])
+
+    def test_nonsense_still_gets_the_fallback_set(self):
+        for phrase in ("абракадабра", "шшшшш ррррр", "открой колкулятор", "ы", ""):
+            with self.subTest(phrase=phrase):
+                tools, info = self.select(phrase)
+                self.assertTrue(info["fallback"])
+                self.assertFalse(info["fuzzy"])
+                self.assertIn(topics.MORE_TOOLS, names(tools))
+                self.assertEqual(info["topics"], ["web"])
+
+    def test_calculator_stays_in_the_base_set(self):
+        tools, _ = self.select("открой колкулятор")
+        self.assertIn("open_app", names(tools))
+
+    def test_short_words_and_keys_are_not_compared(self):
+        self.assertEqual(topics.fuzzy_hits(("вай", "ip", "диск"), ["вой", "ипп", "дом"]), 0)
+
+    def test_inflected_distorted_word(self):
+        self.assertGreaterEqual(topics.fuzzy_hits(("календар",), ["колендаря"]), 1)
+
+    def test_carry_and_extra_topics_skip_fuzzy(self):
+        tools, info = self.select("абракадабра", extra_topics=["memory"])
+        self.assertFalse(info["fuzzy"])
+        self.assertFalse(info["fallback"])
+
+
 if __name__ == "__main__":
     unittest.main()

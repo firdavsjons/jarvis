@@ -96,6 +96,24 @@ class UsageTracker:
             used = sum(t for _, t in window)
             return bool(window) and used + tokens > SWITCH_SHARE * limit
 
+    def seconds_until_fits(self, name, tokens):
+        """Через сколько секунд запрос в tokens токенов перестанет упираться в лимит токенов в минуту (из окна уйдут
+        самые старые записи). 0 — уже помещается; None — у провайдера нет лимита."""
+        limit = self.tpm_limits.get(name)
+        if not limit:
+            return None
+        with self._lock:
+            window = list(self._window(name))
+            used = sum(t for _, t in window)
+            if not window or used + tokens <= SWITCH_SHARE * limit:
+                return 0.0
+            now = self._clock()
+            for moment, amount in window:     # самые старые уходят первыми; пустое окно запрос пропускает
+                used -= amount
+                if used <= 0 or used + tokens <= SWITCH_SHARE * limit:
+                    return max(0.0, moment + TPM_WINDOW - now)
+        return 0.0
+
     def record_tokens(self, name, tokens):
         if not self.tpm_limits.get(name):
             return

@@ -87,6 +87,7 @@ MORE_ACTIONS = {"more_tools"}   # подключение схем темы: вы
 CARRY_TURNS = 2     # сколько следующих реплик инструменты прошлой реплики остаются в наборе («а завтра?», «себе»)
 MAX_DIALOG_PHRASES = 3   # реплик пользователя, из которых собирается фраза для проверок в диалоге о сообщении
 SLOW_TOOL_REPLY = "Секунду, ищу."
+WAIT_REPLY = "Секунду."   # пришлось ждать модель: повтор после сбоя сервера или окно токенов в минуту
 SLOW_TOOL_AFTER = 2.0  # веб-инструмент дольше — «Секунду, ищу.» (один раз за фразу, не блокируя инструмент)
 # Признаки того, что модель честно сообщила о неудаче (страховка от «Готово» после ошибки инструмента)
 _ADMITS_FAILURE_RE = re.compile(r"(?<!\w)не(?!\w)|нельзя|невозможн|ошибк|сожалени|увы|не удалось|не получилось",
@@ -446,6 +447,15 @@ class AIClient:
         self.links = SearchLinks()  # ссылки последнего поиска — только в памяти процесса
         self.on_slow_tool = None    # callback(фраза) — main озвучивает «Секунду, ищу.»
         self._slow_said = threading.Event()
+        self._wait_said = threading.Event()
+        if hasattr(llm, "on_wait"):
+            llm.on_wait = self._say_wait   # FallbackClient сообщает, что придётся подождать
+
+    def _say_wait(self):
+        """«Секунду.» — один раз за фразу, в отдельном потоке: ожидание модели не ждёт конца озвучки."""
+        if self.on_slow_tool and not self._wait_said.is_set():
+            self._wait_said.set()
+            threading.Thread(target=self.on_slow_tool, args=(WAIT_REPLY,), daemon=True).start()
 
     def _memory_changed(self, aliases_changed):
         installed_apps.set_user_aliases(self.memory.aliases)
@@ -470,6 +480,7 @@ class AIClient:
     def respond(self, text):
         """Фраза пользователя -> Turn. Сначала кэш команд; иначе модель (инструменты или режим JSON)."""
         self._slow_said.clear()  # «Секунду, ищу.» — не больше одного раза за фразу
+        self._wait_said.clear()  # и «Секунду.» при ожидании модели — тоже
         reply = self.bare_confirmation_reply(text)
         if reply:
             return Turn(reply)

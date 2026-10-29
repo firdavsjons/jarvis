@@ -2,8 +2,10 @@
 
 Ключевые слова — основы русских слов: слово фразы подходит, если начинается с основы. Инструменты реестра
 (core/apps/) приносят свои слова и тему; для старых инструментов таблица LEGACY ниже.
-Не нашлось ничего — базовый набор + веб + more_tools(area): модель сама просит нужную тему (один лишний запрос).
+Не нашлось ничего — сначала нечёткое совпадение слов фразы с ключами (распознавание искажает слова: «замтки»,
+«пагода»), и только потом базовый набор + веб + more_tools(area): модель сама просит нужную тему (один лишний запрос).
 """
+import difflib
 import json
 
 from core.apps import registry
@@ -14,6 +16,8 @@ MORE_TOOLS = "more_tools"
 MAX_REQUEST_CHARS = 6500      # схемы одного запроса
 TYPICAL_REQUEST_CHARS = 3500  # типичный запрос по одной теме
 CHARS_PER_TOKEN = 3.5
+FUZZY_CUTOFF = 0.8    # нечёткое совпадение слова фразы с ключом темы (difflib)
+FUZZY_MIN_WORD = 4    # слова короче и ключи короче не сравниваем: «вай», «ip» дали бы случайные совпадения
 
 # имя -> (тема, ключевые слова). Новые инструменты сюда не добавлять: у них есть файл в core/apps/
 LEGACY = {
@@ -47,6 +51,24 @@ def catalog():
     return items
 
 
+def fuzzy_hits(keywords, words):
+    """Сколько слов фразы похожи (≥ FUZZY_CUTOFF) на однословные ключи: слово целиком или его начало длиной в ключ
+    (падежи: «колендаря» ≈ «календар»). Вызывается, только когда точных совпадений не нашлось."""
+    hits = 0
+    for key in (k.replace("ё", "е") for k in keywords):
+        if " " in key or len(key) < FUZZY_MIN_WORD:
+            continue
+        for word in words:
+            if len(word) < FUZZY_MIN_WORD:
+                continue
+            ratio = max(difflib.SequenceMatcher(None, word, key).ratio(),
+                        difflib.SequenceMatcher(None, word[:len(key)], key).ratio())
+            if ratio >= FUZZY_CUTOFF:
+                hits += 1
+                break
+    return hits
+
+
 def size(tools):
     return len(json.dumps(tools, ensure_ascii=False))
 
@@ -76,6 +98,14 @@ def select(phrase, all_tools, extra_topics=(), carry=()):
     chosen = sorted(scores, key=lambda n: (-scores[n], n))
     for topic in extra_topics:
         chosen += [n for n in topic_tools(topic) if n not in chosen]
+    fuzzy = False
+    if not chosen and not extra_topics:
+        for name, (_, keywords) in items.items():
+            score = fuzzy_hits(keywords, words)
+            if score > 0:
+                scores[name] = score
+        chosen = sorted(scores, key=lambda n: (-scores[n], n))
+        fuzzy = bool(chosen)
     fallback = not chosen
     if fallback:
         chosen = topic_tools("web")
@@ -91,5 +121,5 @@ def select(phrase, all_tools, extra_topics=(), carry=()):
         dropped.append(chosen.pop())   # меньше всего совпадений — последним
         with_more = True
         tools = build(chosen, with_more)
-    return tools, {"topics": sorted({items[n][0] for n in chosen}), "fallback": fallback, "dropped": dropped,
+    return tools, {"topics": sorted({items[n][0] for n in chosen}), "fallback": fallback, "fuzzy": fuzzy, "dropped": dropped,
                    "chosen": list(chosen)}

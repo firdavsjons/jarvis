@@ -1,4 +1,4 @@
-"""Лимит токенов в минуту: скользящее окно, пропуск на 90%, ожидание 10 с, итоговая фраза. Часы подменены."""
+"""Лимит токенов в минуту: скользящее окно, пропуск на 90%, ожидание окна (не дольше 12 с), итоговая фраза. Часы подменены."""
 import json
 import os
 import sys
@@ -11,7 +11,7 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 import tests_base  # noqa: F401 — защита от настоящих запусков и записи в домашние папки
 from core.llm import FallbackClient, LLMClient, LLMResponse
 from core.llm.providers import DEFAULTS, build_providers, load_config
-from core.llm.router import TPM_REPLY, TPM_WAIT
+from core.llm.router import TPM_MAX_WAIT, TPM_REPLY
 from core.llm.usage import UsageTracker, estimate_tokens
 
 
@@ -105,15 +105,15 @@ class TestRouter(unittest.TestCase):
         clock.t += 61
         self.assertEqual(client.chat(big(600)).provider, "groq")
 
-    def test_all_over_tpm_waits_10_seconds_and_retries_once(self):
+    def test_window_frees_later_than_12_seconds_no_waiting_at_all(self):
         clock, sleeps = Clock(), []
         groq = Provider("groq", tpm=1000)
         client = self.client([groq], clock, sleeps)
         client.usage.record_tokens("groq", 800)
-        # 10 секунд мало: окно ещё держит 800 токенов -> «Слишком много запросов подряд»
+        # окно держит 800 токенов ещё 60 секунд: ждать дольше TPM_MAX_WAIT не будем -> «Слишком много запросов подряд»
         response = client.chat(big(300))
-        self.assertEqual(sleeps, [TPM_WAIT])
-        self.assertEqual(TPM_WAIT, 10)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(TPM_MAX_WAIT, 12)
         self.assertFalse(response.ok)
         self.assertEqual(response.text, "Слишком много запросов подряд, подождите минуту.")
         self.assertEqual(response.text, TPM_REPLY)
@@ -124,9 +124,10 @@ class TestRouter(unittest.TestCase):
         groq = Provider("groq", tpm=1000)
         client = self.client([groq], clock, sleeps)
         client.usage.record_tokens("groq", 800)
-        clock.t += 55                      # до конца окна осталось 5 секунд, ждём 10
+        clock.t += 55                      # до конца окна осталось 5 секунд: ждём ровно столько (плюс запас)
         response = client.chat(big(300))
-        self.assertEqual(sleeps, [TPM_WAIT])
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 5.1, places=3)
         self.assertTrue(response.ok)
         self.assertEqual(groq.calls, 1)
 
