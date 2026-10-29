@@ -214,7 +214,7 @@ class TestFuzzyTopics(unittest.TestCase):
 
     def test_distorted_words_reach_their_topics(self):
         cases = {"замтки": "personal", "колендарь на завтра": "personal",
-                 "пагода в душанбе": "web", "напиши в телеграмм": "messaging", "открой телеграмм": "messaging"}
+                 "пагода в душанбе": "web", "напиши в телеграмм": "messaging"}
         for phrase, topic in cases.items():
             with self.subTest(phrase=phrase):
                 _, info = self.select(phrase)
@@ -231,7 +231,7 @@ class TestFuzzyTopics(unittest.TestCase):
     def test_exact_match_is_not_fuzzy(self):
         _, info = self.select("какая погода")
         self.assertFalse(info["fuzzy"])
-        _, info = self.select("телеграмм маме")                          # «телеграмм» начинается с «телеграм»
+        _, info = self.select("напиши маме")
         self.assertFalse(info["fuzzy"])
         self.assertIn("messaging", info["topics"])
 

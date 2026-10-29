@@ -321,7 +321,7 @@ class TestListOfApps(AppCase):
         self.assertEqual(requested_apps("закрой safari, пожалуйста, и mail"), ["safari", "mail"])
 
     def test_three_apps_one_call_says_what_is_left(self):
-        llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Safari"})))
+        llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Safari"})), final("Готово."))    # повтор ничего не добавил
         client = AIClient(llm=llm)
         turn = client.respond("закрой Safari, Mail и Notes")
         self.assertEqual(turn.speech, "Закрыто приложение Safari. Остальное я не сделал: Mail, Notes.")
@@ -345,7 +345,7 @@ class TestListOfApps(AppCase):
 
     def test_live_example_app_store_and_clock(self):
         with patch("core.installed_apps.list_installed_apps", return_value=["Calculator", "App Store", "Clock"]):
-            llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Calculator"})))
+            llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Calculator"})), final("Готово."))
             turn = AIClient(llm=llm).respond("закрой калькулятор, app store и часы")
         self.assertEqual(turn.speech, "Закрыто приложение Calculator. Остальное я не сделал: App Store, Часы.")
 
@@ -375,7 +375,11 @@ class TestListOfApps(AppCase):
     def test_descriptions_ask_for_separate_calls(self):
         for name in ("open_app", "quit_app"):
             schema = next(t for t in TOOLS if t["function"]["name"] == name)
-            self.assertIn("вызывай инструмент отдельно для каждого приложения из фразы", schema["function"]["description"].lower())
+            text = schema["function"]["description"].lower()
+            self.assertIn("в одном ответе вызывай столько инструментов, сколько приложений", text)
+            self.assertIn("по одному вызову на каждое", text)
+        opening = next(t for t in TOOLS if t["function"]["name"] == "open_app")["function"]["description"]
+        self.assertIn("«открой калькулятор и закрой телеграм» — два вызова: open_app(Calculator) и quit_app(Telegram)", opening)
 
     def test_template_path_ignores_second_model_answer(self):
         llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Safari"})), final("Закрыл Safari, остальное пока не смог."))

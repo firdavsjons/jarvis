@@ -36,6 +36,9 @@ AI_ERROR_REPLY = "Произошла ошибка при обращении к �
 PROMISE_RETRY_NOTE = "Вызови инструмент или скажи, что не можешь. Не сообщай о результате без вызова."
 PROMISE_FAIL_REPLY = "Не получилось: действие не было выполнено."
 CONFIRM_RETRY_NOTE = "Вызови telegram(action=send); подтверждение запросит сам Jarvis, не проси его словами."
+APPS_RETRY_NOTE = "В фразе названы ещё приложения: {apps}. Вызови инструменты для них."
+CANT_READ_CHATS_REPLY = "Читать ваши чаты я не умею."
+CHAT_READ_BLOCKED = {"web_search", "read_page"}      # поиск и чтение страниц не подменяют чтение личных сообщений
 HISTORY_IN_DIALOG = 4   # сообщений истории, пока открыт диалог о сообщении (2 обмена): важна фраза пользователя
 # Модель обещает действие («Открываю Safari»), но не вызвала ни одного инструмента
 _PROMISE_RE = re.compile(r"(?<!\w)(открываю|закрываю|запускаю|устанавливаю|выполняю|перемещаю)(?!\w)", re.IGNORECASE)
@@ -155,13 +158,26 @@ def spoken_app_name(segment):
     return segment.capitalize() if re.search(r"[а-яё]", segment.lower()) else resolved
 
 
-def incomplete_note(phrase, results):
-    """«Остальное я не сделал: чатгпт, настройки.» — если в фразе перечислено несколько приложений, а вызваны
-    open_app / quit_app только для части. Нет вызовов вовсе — модель отвечала о другом, ничего не добавляем."""
+_MESSENGER_RE = re.compile(r"телеграм|telegram|ватсап|whatsapp|вотсап|сообщен|\bчат|переписк|мессенджер", re.IGNORECASE)
+_READ_CUE_RE = re.compile(r"прочита|прочти|почита|что нового|что новог|\bнового\b|\bновые\b|\bновое\b|непрочитан|пришло|"
+                          r"мне написал|написал[аи]? мне|мои сообщен|мои чат|последние сообщен", re.IGNORECASE)
+_SEND_CUE_RE = re.compile(r"напиши|написать|отправь|отправить|напишите|отправьте", re.IGNORECASE)
+
+
+def reads_personal_messages(phrase):
+    """Просьба прочитать личные сообщения или чаты: «что нового в телеграме», «прочитай мои сообщения». Отправка («напиши
+    маме в телеграм привет») сюда не относится."""
+    text = str(phrase or "")
+    return bool(_MESSENGER_RE.search(text) and _READ_CUE_RE.search(text) and not _SEND_CUE_RE.search(text))
+
+
+def unfinished_segments(phrase, results):
+    """Сегменты фразы-перечисления («закрой календарь, чатгпт и настройки»), для которых нет выполненных open_app /
+    quit_app: как сказано в фразе. Пусто — перечисления нет, вызовов нет (модель отвечала о другом) или всё сделано."""
     segments = requested_apps(phrase)
     actions = [r["action"] for r in results if isinstance(r.get("action"), dict)]
     if not segments or not any(a.get("name") in ("open_app", "quit_app") for a in actions):
-        return ""
+        return []
 
     def squeeze(value):
         return "".join(re.findall(r"\w+", str(value).casefold()))
@@ -184,7 +200,14 @@ def incomplete_note(phrase, results):
                      or (resolved is not None and squeeze(resolved) in handled)
                      or any(len(h) >= 2 and h in squeezed for h in handled))
         if not mentioned:
-            left.append(spoken_app_name(segment))
+            left.append(segment)
+    return left
+
+
+def incomplete_note(phrase, results):
+    """«Остальное я не сделал: чатгпт, настройки.» — если в фразе перечислено несколько приложений, а вызваны
+    open_app / quit_app только для части. Нет вызовов вовсе — модель отвечала о другом, ничего не добавляем."""
+    left = [spoken_app_name(segment) for segment in unfinished_segments(phrase, results)]
     return f"Остальное я не сделал: {', '.join(left)}." if left else ""
 
 
@@ -562,6 +585,7 @@ class AIClient:
         executed = []
         tool_rounds, requests, retried, web_seen = 0, 0, False, False
         confirm_retried = False
+        apps_retried = False       # «В фразе названы ещё приложения…» — повтор не больше одного раза за фразу
 
         while True:
             try:
@@ -594,6 +618,10 @@ class AIClient:
                                                {"role": "user", "content": PROMISE_RETRY_NOTE}]
                         continue
                     return self._finish(text, Turn(PROMISE_FAIL_REPLY))
+                if apps_retried and executed and all(r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS
+                                                     for r in executed):
+                    # После повтора модель только сказала текст: говорим по выполненному сами, «Остальное…» добавит _finish
+                    return self._finish(text, Turn(template_speech(self._distinct(executed)), results=executed))
                 return self._finish(text, Turn(self._honest(strip_service_marks(response.text), executed),
                                                results=executed))
             if tool_rounds == MAX_TOOL_ROUNDS:
@@ -614,6 +642,17 @@ class AIClient:
             # Чужие данные в этой фразе (интернет, события, заметки, напоминания, Быстрые команды — уже получены или
             # запрошены в этом же круге): запрет на память, ссылки, удаление, закрытие, delete/send/move/run и
             # создание записей с чужим текстом — он мог подсказать модели такие вызовы
+            if not confirm and reads_personal_messages(text) and any(a.get("name") in CHAT_READ_BLOCKED for a in actions):
+                # «Что нового в телеграме»: веб-поиск не читает ваши чаты и не должен выдавать себя за них
+                log.info("Просьба прочитать личные сообщения: веб-инструмент не выполняю")
+                self.reject_actions([a for a in actions if a.get("name") in CHAT_READ_BLOCKED], text,
+                                    "чтение личных сообщений не поддерживается")
+                others = self.run_actions([a for a in safe if a.get("name") not in CHAT_READ_BLOCKED], phrase=text)
+                executed += others
+                done = [r for r in others if r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS]
+                return self._finish(text, Turn(" ".join(p for p in [template_speech(done) if done else "",
+                                                                    CANT_READ_CHATS_REPLY] if p), results=executed),
+                                    with_note=False)      # «прочитай мои сообщения» — не приложение из перечисления
             restricted = self._restricted(actions, text, web_seen)
             web_seen = web_seen or any(is_external(a) for a in actions)
             if restricted:
@@ -640,7 +679,18 @@ class AIClient:
             if self._template_ok(calls, round_results):
                 # Всё простое и успешное — фраза по шаблону, второй запрос к модели не нужен
                 executed += round_results
-                return self._finish(text, Turn(template_speech(round_results), results=executed))
+                left = self._known_unfinished_apps(text, executed)
+                if left and not apps_retried and tool_rounds < MAX_TOOL_ROUNDS:
+                    # Модель сделала не всё, а оставшиеся приложения известны: один повтор, только потом «Остальное…»
+                    log.warning("LLM: в фразе названы ещё приложения — повторяю запрос один раз")
+                    apps_retried = True
+                    messages = messages + [assistant_message(response), *self._tool_messages(calls, round_results),
+                                           {"role": "user", "content": APPS_RETRY_NOTE.format(apps=", ".join(left))}]
+                    continue
+                speech = template_speech(self._distinct(executed)) if apps_retried and all(
+                    r["ok"] and r["action"].get("name") in TEMPLATE_ACTIONS for r in executed) else \
+                    template_speech(round_results)
+                return self._finish(text, Turn(speech, results=executed))
             if self._direct_reply(calls, round_results):
                 # Отказ с готовой фразой («Нужно разрешение…», «Создайте команду Jarvis Alarm…») — без модели
                 executed += round_results
@@ -657,6 +707,29 @@ class AIClient:
                 executed.append(result)
                 messages.append(tool_message(call["id"], result["ok"], result=result.get("result"),
                                              error=result["short"], web=result.get("web", False)))
+
+    @staticmethod
+    def _known_unfinished_apps(text, executed):
+        """Названия приложений из фразы-перечисления, которые модель не обработала и которые известны системе
+        (resolve_app_name): для них стоит повторить запрос. Неизвестные попадут только в «Остальное я не сделал»."""
+        return [spoken_app_name(s) for s in unfinished_segments(text, executed) if installed_apps.resolve_app_name(s)]
+
+    @staticmethod
+    def _distinct(results):
+        """Одинаковые действия подряд (модель повторила вызов при повторном запросе) в фразе называются один раз."""
+        seen, unique = set(), []
+        for r in results:
+            key = json.dumps(r["action"], sort_keys=True, ensure_ascii=False)
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return unique
+
+    @staticmethod
+    def _tool_messages(calls, round_results):
+        results = iter(round_results)
+        return [tool_message(call["id"], (result := next(results))["ok"], result=result.get("result"),
+                             error=result["short"], web=result.get("web", False)) for call, _, _ in calls]
 
     def _asks_confirmation_in_words(self, phrase, answer):
         """Тема messaging, ответ без вызова просит подтверждение словами («Подтвердите отправку…», «Отправить?»), а
@@ -787,13 +860,13 @@ class AIClient:
         ok, summary = summarize_results(executed)
         return Turn(summary if not ok else (summary or "Готово."), results=executed)
 
-    def _finish(self, text, turn):
+    def _finish(self, text, turn, with_note=True):
         used = {r["action"].get("name") for r in turn.results if isinstance(r.get("action"), dict)}
         # Ответ целиком по шаблону Jarvis («Закрыто приложение X.») в историю не идёт: вместо него «[действие: …]»
         templated = bool(turn.results) and not turn.pending and all(
             r.get("ok") and isinstance(r.get("action"), dict) and r["action"].get("name") in TEMPLATE_ACTIONS
             for r in turn.results)
-        note = incomplete_note(text, turn.results) if templated else ""
+        note = incomplete_note(text, turn.results) if templated and with_note else ""
         if note:
             turn.speech = f"{turn.speech} {note}".strip()     # перечислено несколько приложений, сделано не всё
         said = " ".join(p for p in [turn.speech, confirmation_question(turn.pending) if turn.pending else ""] if p)

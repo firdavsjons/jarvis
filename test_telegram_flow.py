@@ -304,12 +304,14 @@ class TestSchemasAndTopics(unittest.TestCase):
         self.assertIn("messaging", registry.TOPICS)
         tool = registry.get("telegram")
         self.assertEqual(tool.topic, "messaging")
-        for word in ("телеграм", "сообщение", "напиши", "отправь", "чат"):
+        for word in ("сообщение", "напиши", "написать", "отправь", "чат", "переписка", "контакты"):
             self.assertGreater(registry.keyword_hits(tool.keywords, [word]), 0, word)
+        for word in ("телеграм", "telegram", "телеграме", "ватсап"):   # название приложения темой messaging не является
+            self.assertEqual(registry.keyword_hits(tool.keywords, [word]), 0, word)
 
     def test_selected_for_messaging_phrases(self):
         for phrase in ["напиши маме в телеграм привет", "отправь сообщение Ане", "открой чат с мамой",
-                       "что в телеграме"]:
+                       "открой переписку с мамой", "покажи контакты", "хочу написать Ане", "открой телеграм и напиши маме привет"]:
             tools, info = topics.select(phrase, TOOLS)
             self.assertIn("telegram", [t["function"]["name"] for t in tools], phrase)
             self.assertLessEqual(topics.size(tools), 3500)

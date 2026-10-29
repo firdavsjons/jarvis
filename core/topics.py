@@ -2,6 +2,8 @@
 
 Ключевые слова — основы русских слов: слово фразы подходит, если начинается с основы. Инструменты реестра
 (core/apps/) приносят свои слова и тему; для старых инструментов таблица LEGACY ниже.
+Название мессенджера рядом с глаголом открытия или закрытия («открой калькулятор и закрой телеграм») — команда
+приложению, а не просьба о сообщении: тема messaging не включается и запасной набор не нужен (хватает базового).
 Не нашлось ничего — сначала нечёткое совпадение слов фразы с ключами (распознавание искажает слова: «замтки»,
 «пагода»), и только потом базовый набор + веб + more_tools(area): модель сама просит нужную тему (один лишний запрос).
 """
@@ -16,6 +18,9 @@ MORE_TOOLS = "more_tools"
 MAX_REQUEST_CHARS = 6500      # схемы одного запроса
 TYPICAL_REQUEST_CHARS = 3500  # типичный запрос по одной теме
 CHARS_PER_TOKEN = 3.5
+MESSENGER_NAMES = ("телеграм", "telegram", "ватсап", "whatsapp", "вотсап")
+APP_VERBS = {"открой", "открыть", "откройте", "закрой", "закрыть", "закройте", "запусти", "запустить", "выйди", "выйти",
+             "выключи", "заверши", "завершить"}
 FUZZY_CUTOFF = 0.8    # нечёткое совпадение слова фразы с ключом темы (difflib)
 FUZZY_MIN_WORD = 4    # слова короче и ключи короче не сравниваем: «вай», «ip» дали бы случайные совпадения
 
@@ -49,6 +54,11 @@ def catalog():
     for tool in registry.tools().values():
         items[tool.name] = (tool.topic, tool.keywords)
     return items
+
+
+def is_messenger_app_command(words):
+    """Название мессенджера стоит после глагола открытия/закрытия: «закрой телеграм», «выйди из ватсап»."""
+    return any(w.startswith(MESSENGER_NAMES) and any(v in APP_VERBS for v in words[:i]) for i, w in enumerate(words))
 
 
 def fuzzy_hits(keywords, words):
@@ -98,15 +108,16 @@ def select(phrase, all_tools, extra_topics=(), carry=()):
     chosen = sorted(scores, key=lambda n: (-scores[n], n))
     for topic in extra_topics:
         chosen += [n for n in topic_tools(topic) if n not in chosen]
+    app_command = not chosen and not extra_topics and is_messenger_app_command(words)
     fuzzy = False
-    if not chosen and not extra_topics:
+    if not chosen and not extra_topics and not app_command:
         for name, (_, keywords) in items.items():
             score = fuzzy_hits(keywords, words)
             if score > 0:
                 scores[name] = score
         chosen = sorted(scores, key=lambda n: (-scores[n], n))
         fuzzy = bool(chosen)
-    fallback = not chosen
+    fallback = not chosen and not app_command
     if fallback:
         chosen = topic_tools("web")
 
@@ -121,5 +132,5 @@ def select(phrase, all_tools, extra_topics=(), carry=()):
         dropped.append(chosen.pop())   # меньше всего совпадений — последним
         with_more = True
         tools = build(chosen, with_more)
-    return tools, {"topics": sorted({items[n][0] for n in chosen}), "fallback": fallback, "fuzzy": fuzzy, "dropped": dropped,
+    return tools, {"topics": sorted({items[n][0] for n in chosen}), "fallback": fallback, "fuzzy": fuzzy, "app_command": app_command, "dropped": dropped,
                    "chosen": list(chosen)}
