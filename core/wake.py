@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from core import contacts, installed_apps
 from core.settings import env_float, env_value
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,11 @@ PROMPT_WAKE_MAX_RECORDING = 1.2          # запись короче (с) — с
 WAKE_PROMPT_MIN_CONFIDENCE = 0.3         # оценочный, по живым логам: уверенность ниже — слову из подсказки не верим
 WAKE_PROMPT_MIN_CONFIDENCE_ONE_WORD = 0.4    # оценочный, по живым логам: для команды из одного слова («Джарвис, громче»)
 WAKE_LISTEN_WINDOW_MIN_CONFIDENCE = 0.4  # оценочный, по живым логам: окно после «Слушаю.» открывается от этой уверенности
+
+# Whisper слышит глагол после «Джарвис» искажённо. Узкая замена: только первое слово остатка после снятого слова-активатора и
+# только если дальше идёт название приложения или контакт («открою калькулятор» -> «открой калькулятор»)
+LEADING_VERB_FIXES = {"открою": "открой", "закрою": "закрой", "включу": "включи", "отправься": "отправь",
+                      "напишу": "напиши", "крой": "закрой"}
 
 DROPPED_LOG = "Отброшено (нет слова «Джарвис»)"
 LISTENING_REPLY = "Слушаю."
@@ -221,6 +227,30 @@ def judge(text, from_prompt=False, confidence=None, words=WAKE_WORDS):
     return result
 
 
+def _names_app_or_contact(following):
+    """Сразу за глаголом названо приложение (одно или два слова) или контакт из contacts.json."""
+    for count in (1, 2):
+        candidate = " ".join(following[:count])
+        if len(following) >= count and installed_apps.resolve_app_name(candidate):
+            return True
+    if contacts.CONTACTS_FILE.exists():          # файл при этом не создаётся (load_contacts создал бы пример)
+        return bool(contacts.find(following[0], contacts.load_contacts()))
+    return False
+
+
+def fix_leading_verb(text):
+    """(текст, исправлен ли глагол). «открою калькулятор» -> «открой калькулятор»: только первое слово остатка и только
+    если за ним идёт приложение или контакт; «я открою позже», «открою» и «закрой» не меняются."""
+    match = re.match(r"(\s*)(\w+)(\s+)(.*)", str(text), re.S)
+    if not match:
+        return text, False
+    fixed = LEADING_VERB_FIXES.get(normalize_word(match.group(2)))
+    following = [t.word for t in tokens(match.group(4))]
+    if not fixed or not following or not _names_app_or_contact(following):
+        return text, False
+    return f"{match.group(1)}{fixed}{match.group(3)}{match.group(4)}", True
+
+
 def is_stop_phrase(text):
     words = _words(text)
     return bool(words) and all(w in STOP_WORDS for w in words)
@@ -246,6 +276,7 @@ class Decision:
     action: str          # "process" | "drop" | "listen" | "stop"
     text: str = ""
     opens_window: bool = True    # для "listen": открывать ли окно диалога после «Слушаю.»
+    in_window: bool = False      # для "process": фраза принята только потому, что открыто окно диалога (слова не было)
 
 
 class WakeGate:
@@ -295,13 +326,16 @@ class WakeGate:
                 if is_cancel_phrase(result.rest):
                     self._stop_speech()
                     self.close_window()
-                return Decision("process", result.rest)
+                rest, fixed = fix_leading_verb(result.rest)
+                if fixed:
+                    log.info("Глагол после слова-активатора исправлен")
+                return Decision("process", rest)
             log.info("Слово «Джарвис» не засчитано: %s", result.reason)
             if result.rest and in_window:
-                return Decision("process", result.rest)
+                return Decision("process", result.rest, in_window=True)
             return self._drop()
         if in_window:
-            return Decision("process", text)
+            return Decision("process", text, in_window=True)
         return self._drop()
 
     def _listen(self, phrase):

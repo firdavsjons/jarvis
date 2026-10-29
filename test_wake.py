@@ -1,5 +1,6 @@
 """Этап 8.2: слово-активатор «Джарвис». Без сети, микрофона и модели: движки, часы и озвучка подменены."""
 import inspect
+import logging
 import math
 import os
 import sys
@@ -314,7 +315,7 @@ class TestWindow(unittest.TestCase):
         self.hooks.anchor = 100.0
         for text in ("громче", "да", "нет", "который час", "открой калькулятор"):
             with self.subTest(text=text):
-                self.assertEqual(self.check(text, 103.0), Decision("process", text))
+                self.assertEqual(self.check(text, 103.0), Decision("process", text, in_window=True))
         self.assertEqual(self.check("громче", 108.0).action, "process")           # ровно 8 с — ещё открыто
 
     def test_closed_after_the_timeout(self):
@@ -336,7 +337,7 @@ class TestWindow(unittest.TestCase):
 
     def test_a_question_keeps_the_window_open_for_twenty_seconds(self):
         self.hooks.anchor, self.hooks.expects = 100.0, True                      # «Кому именно?»
-        self.assertEqual(self.check("маме", 119.0), Decision("process", "маме"))
+        self.assertEqual(self.check("маме", 119.0), Decision("process", "маме", in_window=True))
         with self.assertLogs("core.wake", level="INFO"):
             self.assertEqual(self.check("маме", 121.0).action, "drop")
 
@@ -371,7 +372,7 @@ class TestWindow(unittest.TestCase):
 
     def test_the_word_inside_the_window_is_still_cut(self):
         self.hooks.anchor = 100.0
-        self.assertEqual(self.check("Джарвис, громче", 101.0), Decision("process", "громче"))
+        self.assertEqual(self.check("Джарвис, громче", 101.0), Decision("process", "громче"))      # слово засчитано — не окно
 
 
 # --- слово, пришедшее из подсказки ------------------------------------------------------------------------------------
@@ -470,8 +471,8 @@ class TestWordFromPrompt(unittest.TestCase):
         self.hooks.anchor = 100.0
         phrase = Phrase(started_at=102.0, audio_seconds=3.0, confidence=0.25, from_prompt=True)
         with self.assertLogs("core.wake", level="INFO"):
-            self.assertEqual(self.gate.check("Джарвис, открой калькулятор", phrase), Decision("process",
-                                                                                           "открой калькулятор"))
+            self.assertEqual(self.gate.check("Джарвис, открой калькулятор", phrase),
+                             Decision("process", "открой калькулятор", in_window=True))
 
     def test_unsure_bare_prompt_word_inside_the_window_is_dropped_not_sent_to_the_model(self):
         self.hooks.anchor = 100.0
@@ -985,6 +986,213 @@ class TestWiring(unittest.TestCase):
         scheduler.make_missed_handler(lambda text: spoken.append(text))([{"kind": "timer", "label": "", "id": 1,
                                                                           "due": 0, "created": 0}])
         self.assertEqual(len(spoken), 1)
+
+
+# --- Этап 8.2.2: глагол после слова-активатора и обрезанное начало ------------------------------------------------------
+class VerbCase(unittest.TestCase):
+    INSTALLED = ["Calculator", "Safari", "Telegram", "Clock", "App Store", "Mail", "Notes"]
+
+    def setUp(self):
+        patcher = patch("core.installed_apps.list_installed_apps", return_value=list(self.INSTALLED))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(installed_apps.set_user_aliases, {})
+        self.addCleanup(lambda: wake.contacts.CONTACTS_FILE.unlink(missing_ok=True))
+        self.hooks = Hooks()
+        self.gate = self.hooks.gate()
+
+    def write_contacts(self, data):
+        import json
+        wake.contacts.CONTACTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        wake.contacts.CONTACTS_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+class TestLeadingVerbFix(VerbCase):
+    def process(self, text, **phrase):
+        with self.assertLogs("core.wake", level="INFO"):
+            decision = self.gate.check(text, Phrase(audio_seconds=3.0, confidence=0.9, **phrase))
+            log = logging.getLogger("core.wake")
+            log.info("отметка")
+        return decision
+
+    def test_every_substitution_before_an_app(self):
+        for heard, fixed in (("открою калькулятор", "открой калькулятор"), ("закрою сафари", "закрой сафари"),
+                             ("включу телеграм", "включи телеграм"), ("крой часы", "закрой часы"),
+                             ("открою app store", "открой app store"), ("закрою заметки", "закрой заметки")):
+            with self.subTest(heard=heard):
+                decision = self.process(f"Джарвис, {heard}")
+                self.assertEqual(decision, Decision("process", fixed))
+
+    def test_every_substitution_before_a_contact(self):
+        self.write_contacts({"мама": {"username": "mama_user"}})
+        for heard, fixed in (("отправься маме привет", "отправь маме привет"), ("напишу маме привет", "напиши маме привет")):
+            with self.subTest(heard=heard):
+                self.assertEqual(self.process(f"Джарвис, {heard}"), Decision("process", fixed))
+
+    def test_the_table_of_substitutions(self):
+        self.assertEqual(wake.LEADING_VERB_FIXES, {"открою": "открой", "закрою": "закрой", "включу": "включи",
+                                                    "отправься": "отправь", "напишу": "напиши", "крой": "закрой"})
+
+    def test_works_when_the_word_is_at_the_end_too(self):
+        self.assertEqual(self.process("открою калькулятор, Джарвис"), Decision("process", "открой калькулятор"))
+
+    def test_works_after_a_distorted_wake_word(self):
+        self.assertEqual(self.process("Червис, закрою сафари"), Decision("process", "закрой сафари"))
+
+    def test_phrases_that_must_not_change(self):
+        for rest in ("я открою позже", "открою позже", "открою", "закрой", "закрою", "крой", "скажи что открою калькулятор",
+                     "закрой сафари", "открой калькулятор", "включу свет потом", "напишу позже", "я напишу маме"):
+            with self.subTest(rest=rest):
+                self.assertEqual(self.process(f"Джарвис, {rest}"), Decision("process", rest))
+
+    def test_unknown_word_after_the_verb_is_not_an_app(self):
+        self.assertEqual(self.process("Джарвис, открою пайтон"), Decision("process", "открою пайтон"))
+
+    def test_a_verb_in_the_middle_is_untouched(self):
+        self.assertEqual(self.process("Джарвис, сначала открою калькулятор"), Decision("process", "сначала открою калькулятор"))
+
+    def test_untouched_inside_the_window_without_the_word(self):
+        self.hooks.anchor = 100.0
+        decision = self.gate.check("открою калькулятор", Phrase(started_at=101.0))
+        self.assertEqual(decision, Decision("process", "открою калькулятор", in_window=True))
+
+    def test_untouched_when_the_word_was_not_counted(self):
+        self.hooks.anchor = 100.0
+        phrase = Phrase(started_at=101.0, audio_seconds=3.0, confidence=0.2, from_prompt=True)
+        with self.assertLogs("core.wake", level="INFO"):
+            decision = self.gate.check("Джарвис, открою калькулятор", phrase)
+        self.assertEqual(decision.text, "открою калькулятор")
+
+    def test_text_input_is_not_touched(self):
+        app = MagicMock()
+        app.wake = self.gate
+        app.has_pending.return_value = False
+        app.pending_is_private.return_value = False
+        app.ai.message_dialog_open.return_value = False
+        app.ai.bare_confirmation_reply.return_value = None
+        app.ai.quick_confirm.return_value = None
+        app.mac.execute.return_value = None
+        main.VoiceApp.process_command(app, "открою калькулятор", source="text")
+        app.ai.respond.assert_called_once_with("открою калькулятор")
+
+    def test_log_line_has_no_text(self):
+        with self.assertLogs("core.wake", level="INFO") as logs:
+            self.gate.check("Джарвис, закрою секретный сафари", Phrase(audio_seconds=3.0, confidence=0.9))
+            self.gate.check("Джарвис, закрою сафари", Phrase(audio_seconds=3.0, confidence=0.9))
+        self.assertIn("INFO:core.wake:Глагол после слова-активатора исправлен", logs.output)
+        self.assertNotIn("сафари", "\n".join(logs.output).lower())
+
+    def test_missing_contacts_file_is_not_created(self):
+        wake.contacts.CONTACTS_FILE.unlink(missing_ok=True)
+        self.assertEqual(wake.fix_leading_verb("напишу маме привет"), ("напишу маме привет", False))
+        self.assertFalse(wake.contacts.CONTACTS_FILE.exists())
+
+    def test_fix_leading_verb_directly(self):
+        self.assertEqual(wake.fix_leading_verb("открою калькулятор"), ("открой калькулятор", True))
+        self.assertEqual(wake.fix_leading_verb("открою  калькулятор и сафари"), ("открой  калькулятор и сафари", True))
+        self.assertEqual(wake.fix_leading_verb(""), ("", False))
+        self.assertEqual(wake.fix_leading_verb("открою"), ("открою", False))
+
+    def test_user_alias_counts_as_an_app(self):
+        installed_apps.set_user_aliases({"мой браузер": "Safari"})
+        self.assertEqual(self.process("Джарвис, открою мой браузер"), Decision("process", "открой мой браузер"))
+
+
+class TestTruncatedStart(VerbCase):
+    def test_cut_starts(self):
+        from core.stt.truncated import is_truncated
+        for text in ("крой часы", "ключи свет", "ставь таймер", "пиши маме", "правь маме привет", "крой часы и app store",
+                     "Ключи свет!", "ставь таймер на пять минут"):
+            with self.subTest(text=text):
+                self.assertTrue(is_truncated(text))
+
+    def test_normal_phrases_are_untouched(self):
+        from core.stt.truncated import is_truncated
+        for text in ("открой часы", "кто ты", "закрой часы", "включи свет", "поставь таймер", "напиши маме",
+                     "скажи сколько времени", "делай как знаешь", "будь здоров", "иди сюда", "читай вслух", "помни пароль",
+                     "что это", "где ключи", "какая погода", "ключи", "крой", "громче", "покажи ключи"):
+            with self.subTest(text=text):
+                self.assertFalse(is_truncated(text))
+
+    def test_the_verb_tails(self):
+        from core.stt.truncated import KNOWN_STARTS, REAL_WORDS, VERB_TAILS
+        for tail in ("крой", "ключи", "ставь", "пиши", "правь"):
+            self.assertIn(tail, VERB_TAILS)
+        for word in ("скажи", "делай", "читай", "помни", "будь", "иди"):
+            self.assertNotIn(word, VERB_TAILS)
+            self.assertIn(word, REAL_WORDS)
+        self.assertFalse(VERB_TAILS & KNOWN_STARTS)
+        for word in ("открой", "закрой", "включи", "выключи", "поставь", "напиши", "найди", "прочитай", "отправь", "покажи",
+                     "сделай", "запомни", "забудь", "расскажи", "какая", "какой", "сколько", "что", "где", "когда", "кто"):
+            self.assertIn(word, KNOWN_STARTS)
+        self.assertTrue(all(4 <= len(t) <= 5 for t in VERB_TAILS))
+
+    def test_not_applied_inside_the_dialog_window(self):
+        from core.stt.truncated import is_truncated
+        for text in ("ставь таймер", "ключи свет", "пиши маме"):
+            self.assertTrue(is_truncated(text))
+            self.assertFalse(is_truncated(text, in_window=True))
+
+    def test_the_end_rule_works_in_the_window_too(self):
+        from core.stt.truncated import is_truncated
+        self.assertTrue(is_truncated("напиши себе в", in_window=True))
+
+    def app(self, pending=False):
+        app = MagicMock()
+        app.wake = self.gate
+        app.has_pending.return_value = pending
+        app.pending_is_private.return_value = False
+        app.ai.message_dialog_open.return_value = False
+        app.ai.bare_confirmation_reply.return_value = None
+        app.ai.quick_confirm.return_value = None
+        app.mac.execute.return_value = None
+        return app
+
+    def test_after_the_wake_word_the_cut_start_is_reported(self):
+        for text in ("Джарвис, ключи свет", "Джарвис, ставь таймер", "Джарвис, пиши маме"):
+            with self.subTest(text=text):
+                app = self.app()
+                main.VoiceApp.process_command(app, text, phrase=Phrase(audio_seconds=3.0, confidence=0.9))
+                app.engine.speak.assert_called_once_with(TRUNCATED_REPLY)
+                app.ai.respond.assert_not_called()
+
+    def test_inside_the_window_the_cut_start_is_not_checked(self):
+        for text in ("ставь таймер", "ключи свет", "пиши маме"):
+            with self.subTest(text=text):
+                app = self.app()
+                self.hooks.anchor = 100.0
+                main.VoiceApp.process_command(app, text, phrase=Phrase(started_at=102.0))
+                app.engine.speak.assert_not_called()
+                app.ai.respond.assert_called_once_with(text)
+
+    def test_without_the_window_and_without_the_word_the_phrase_is_dropped_not_truncated(self):
+        app = self.app()
+        with self.assertLogs("core.wake", level="INFO"):
+            main.VoiceApp.process_command(app, "ставь таймер", phrase=Phrase(started_at=5.0))
+        app.engine.speak.assert_not_called()
+
+    def test_wake_off_the_cut_start_is_checked(self):
+        app = self.app()
+        app.wake = None
+        main.VoiceApp.process_command(app, "ставь таймер")
+        app.engine.speak.assert_called_once_with(TRUNCATED_REPLY)
+
+    def test_text_input_is_not_checked(self):
+        app = self.app()
+        main.VoiceApp.process_command(app, "ставь таймер", source="text")
+        app.ai.respond.assert_called_once_with("ставь таймер")
+
+    def test_word_plus_fixed_verb_is_not_truncated(self):
+        """«Джарвис, крой часы»: «часы» — известное приложение, глагол чинится до проверки обрезанности."""
+        app = self.app()
+        main.VoiceApp.process_command(app, "Джарвис, крой часы", phrase=Phrase(audio_seconds=3.0, confidence=0.9))
+        app.ai.respond.assert_called_once_with("закрой часы")
+        app.engine.speak.assert_not_called()
+
+    def test_word_plus_cut_start_without_a_known_app_is_truncated(self):
+        app = self.app()
+        main.VoiceApp.process_command(app, "Джарвис, крой незнакомое", phrase=Phrase(audio_seconds=3.0, confidence=0.9))
+        app.engine.speak.assert_called_once_with(TRUNCATED_REPLY)
 
 
 # --- core.stt.check --wake --------------------------------------------------------------------------------------------

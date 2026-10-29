@@ -213,6 +213,133 @@ class TestCacheable(unittest.TestCase):
             self.assertIsNone(cacheable_actions([result], "включи тёмную тему"))
 
 
+class TestMessagesAndPartialPhrasesAreNotCached(unittest.TestCase):
+    """Этап 8.2.2. Живой случай: «закрой калькулятор и закрой телеграм» — выполнено одно действие, а в кэш записалась вся
+    фраза → «закрыть калькулятор». В логе при этом печатался маскированный текст — это только строка лога, ключ в кэше
+    настоящий."""
+    CLOSE_CALC = [{"name": "quit_app", "args": {"app": "Calculator"}}]
+
+    def ok(self, name, args):
+        return {"ok": True, "action": {"name": name, "args": args}, "result": "x"}
+
+    def client(self, *replies, cache=None):
+        llm = ScriptedLLM(*replies)
+        return AIClient(llm=llm, cache=cache if cache is not None else CommandCache()), llm
+
+    def test_message_phrase_creates_no_entry_at_all(self):
+        with patch("core.ai.subprocess.run") as run:
+            run.return_value.returncode = 0
+            client, _ = self.client(tools_reply(call("quit_app", {"app": "Calculator"})))
+            with self.assertLogs("core.ai", level="INFO") as logs:
+                client.respond("закрой калькулятор и напиши маме в телеграм привет")
+        self.assertEqual(len(client.cache), 0)                                  # ни «(сообщение…)», ни настоящей записи
+        self.assertFalse(any("запомнил" in line for line in logs.output))
+
+    def test_log_still_masks_the_phrase_while_the_key_is_the_real_one(self):
+        from core.journal import loggable_phrase
+        self.assertEqual(loggable_phrase("закрой калькулятор и закрой телеграм"), "(сообщение, 36 символов)")
+        self.assertEqual(normalize_phrase("закрой калькулятор и закрой телеграм"), "закрой калькулятор и закрой телеграм")
+        cache = CommandCache()
+        self.assertTrue(cache.store("закрой калькулятор", self.CLOSE_CALC))
+        self.assertEqual(list(cache._data), ["закрой калькулятор"])             # ключ — настоящая нормализованная фраза
+
+    def test_partial_execution_of_a_list_is_not_remembered(self):
+        with patch("core.ai.subprocess.run") as run:
+            run.return_value.returncode = 0
+            client, _ = self.client(tools_reply(call("quit_app", {"app": "Calculator"})))
+            with self.assertLogs("core.ai", level="INFO"):
+                turn = client.respond("закрой калькулятор и закрой телеграм")
+        self.assertIn("Остальное я не сделал", turn.speech)
+        self.assertEqual(len(client.cache), 0)
+        self.assertIsNone(client.cache.lookup("закрой калькулятор и закрой телеграм"))
+
+    def test_extra_unexplained_words_are_not_remembered(self):
+        for phrase in ("закрой калькулятор потом включи музыку", "закрой калькулятор через минуту", "закрой калькулятор и всё"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(cacheable_actions([self.ok("quit_app", {"app": "Calculator"})], phrase))
+
+    def test_full_commands_are_still_cached(self):
+        for phrase, results in (("закрой калькулятор", [self.ok("quit_app", {"app": "Calculator"})]),
+                                ("Закрой, пожалуйста, калькулятор!", [self.ok("quit_app", {"app": "Calculator"})]),
+                                ("открой телеграм", [self.ok("open_app", {"app": "Telegram"})]),
+                                ("открой safari и mail", [self.ok("open_app", {"app": "Safari"}),
+                                                          self.ok("open_app", {"app": "Mail"})]),
+                                ("закрой приложение сафари", [self.ok("quit_app", {"app": "Safari"})])):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(cacheable_actions(results, phrase))
+
+    def test_message_words_block_the_cache(self):
+        for phrase in ("закрой калькулятор и напиши маме в телеграм привет", "открой сообщения", "отправь сафари",
+                       "напиши привет и закрой калькулятор"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(cacheable_actions([self.ok("quit_app", {"app": "Calculator"})], phrase))
+                self.assertFalse(CommandCache().store(phrase, self.CLOSE_CALC))
+
+    def test_keys_starting_with_a_masked_message_are_rejected_on_store(self):
+        cache = CommandCache()
+        for key in ("(сообщение, 36 символов)", "  (сообщение, 5 символов)"):
+            self.assertFalse(cache.store(key, self.CLOSE_CALC))
+        self.assertEqual(len(cache), 0)
+
+    def test_masked_message_keys_are_ignored_on_read(self):
+        cache = CommandCache()
+        cache._data["(сообщение, 36 символов)"] = {"actions": self.CLOSE_CALC, "uses": 1, "created": 0, "last_used": 0}
+        cache._data["сообщение 36 символов"] = {"actions": self.CLOSE_CALC, "uses": 1, "created": 0, "last_used": 0}
+        self.assertIsNone(cache.lookup("(сообщение, 36 символов)"))
+        self.assertIsNone(cache.lookup("сообщение 36 символов"))
+
+    def write(self, data):
+        import json
+        path = Path(tempfile.mkdtemp(dir=tests_base.TEMP_ROOT)) / "command_cache.json"
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def entry(actions):
+        return {"actions": actions, "uses": 1, "created": 1_000_000.0, "last_used": 1_000_000.0}
+
+    def test_bad_entries_are_removed_on_load_and_counted(self):
+        path = self.write({
+            "(сообщение, 36 символов)": self.entry(self.CLOSE_CALC),                 # маскированный ключ
+            "закрой калькулятор и напиши маме в телеграм привет": self.entry(self.CLOSE_CALC),    # текст сообщения на диске
+            "закрой калькулятор и закрой телеграм": self.entry(self.CLOSE_CALC),     # неполная: выполнено одно из двух
+            "открой сообщения": self.entry([{"name": "open_app", "args": {"app": "Messages"}}]),
+            "открой safari": self.entry([{"name": "open_app", "args": {"app": "Safari"}}]),               # хорошая
+            "открой телеграм": self.entry([{"name": "open_app", "args": {"app": "Telegram"}}]),           # хорошая
+        })
+        with self.assertLogs("core.cache", level="INFO") as logs:
+            cache = CommandCache(path)
+        self.assertEqual(cache.removed_on_load, 4)
+        self.assertEqual(sorted(cache._data), ["открой safari", "открой телеграм"])
+        self.assertIn("INFO:core.cache:Кэш команд: при загрузке удалено записей: 4 (про сообщения или неполные)", logs.output)
+        self.assertNotIn("калькулятор", "\n".join(logs.output))                    # в логе только число
+        import json
+        on_disk = json.loads(path.read_text(encoding="utf-8"))                      # и из файла они пропали
+        self.assertEqual(sorted(on_disk), ["открой safari", "открой телеграм"])
+
+    def test_clean_file_is_left_alone(self):
+        path = self.write({"открой safari": self.entry([{"name": "open_app", "args": {"app": "Safari"}}])})
+        before = path.read_text(encoding="utf-8")
+        cache = CommandCache(path)
+        self.assertEqual(cache.removed_on_load, 0)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_no_entry_with_message_words_remains_after_loading(self):
+        from core.cache import has_message_words
+        path = self.write({"закрой калькулятор и закрой телеграм": self.entry(self.CLOSE_CALC),
+                           "напиши привет": self.entry(self.CLOSE_CALC), "отправь файл": self.entry(self.CLOSE_CALC),
+                           "открой сообщения": self.entry(self.CLOSE_CALC), "закрой safari": self.entry(
+                               [{"name": "quit_app", "args": {"app": "Safari"}}])})
+        cache = CommandCache(path)
+        self.assertEqual(list(cache._data), ["закрой safari"])
+        self.assertFalse(any(has_message_words(key) for key in cache._data))
+
+    def test_other_pre_existing_entries_are_not_cleaned(self):
+        """Прочие старые записи (даже сомнительные) по-прежнему удаляются только командой «забудь кэш команд»."""
+        path = self.write({"главный экран": self.entry([{"name": "open_app", "args": {"app": "Preview"}}])})
+        self.assertEqual(len(CommandCache(path)), 1)
+
+
 @patch('core.ai.subprocess.run')
 class TestCacheInAIClient(unittest.TestCase):
     def client(self, *replies):

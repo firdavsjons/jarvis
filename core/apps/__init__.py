@@ -10,6 +10,7 @@ APP_ALIASES = {
     "календарь": "Calendar",
     "настройки": "System Settings",
     "терминал": "Terminal",
+    "часы": "Clock",
     "фото": "Photos",
     "сообщения": "Messages",
     "файндер": "Finder",

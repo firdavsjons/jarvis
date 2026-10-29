@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from urllib.parse import urlparse
 
+from core.phrase_lists import requested_apps  # noqa: F401 — также используется кэшем команд
 from core import durations, installed_apps, journal, prompts, safety, topics, web
 from core.apps import registry
 from core.apps import resolve_app
@@ -144,26 +145,14 @@ def strip_service_marks(text):
     return _SERVICE_MARK_RE.sub("", str(text or "")).strip()
 
 
-_LIST_VERBS = {"открой", "открыть", "откройте", "закрой", "закрыть", "закройте", "запусти", "запустить", "выйди",
-               "выйти"}
-_LIST_FILLERS = {"приложение", "приложении", "приложения", "приложений", "программу", "программа", "программы",
-                 "пожалуйста", "мне", "все", "всё", "ещё", "еще", "тоже", "также", "потом", "и"}
-_LIST_SPLIT_RE = re.compile(r"\s*(?:,|;|\bа также\b|\bи\b)\s*", re.IGNORECASE)
-
-
-def requested_apps(phrase):
-    """Что перечислено в «закрой календарь, чатгпт и настройки»: сегменты после глагола (≥2), иначе []."""
-    words = re.findall(r"[\w\-]+|[,;]", str(phrase).lower())
-    start = next((i for i, w in enumerate(words) if w in _LIST_VERBS), None)
-    if start is None:
-        return []
-    text = " ".join(words[start + 1:]).replace(" ,", ",").replace(" ;", ";")
-    segments = []
-    for part in _LIST_SPLIT_RE.split(text):
-        kept = [w for w in re.findall(r"[\w\-]+", part) if w not in _LIST_FILLERS and w not in _LIST_VERBS]
-        if kept:
-            segments.append(" ".join(kept))
-    return segments if len(segments) >= 2 else []
+def spoken_app_name(segment):
+    """Как назвать невыполненное приложение: известное (resolve_app_name) — по-русски, как сказал пользователь, с большой
+    буквы («часы» -> «Часы»), или каноническим именем, если сказано латиницей («app store» -> «App Store»); неизвестное
+    остаётся как сказано."""
+    resolved = installed_apps.resolve_app_name(segment)
+    if not resolved:
+        return segment
+    return segment.capitalize() if re.search(r"[а-яё]", segment.lower()) else resolved
 
 
 def incomplete_note(phrase, results):
@@ -195,7 +184,7 @@ def incomplete_note(phrase, results):
                      or (resolved is not None and squeeze(resolved) in handled)
                      or any(len(h) >= 2 and h in squeezed for h in handled))
         if not mentioned:
-            left.append(segment)
+            left.append(spoken_app_name(segment))
     return f"Остальное я не сделал: {', '.join(left)}." if left else ""
 
 

@@ -56,12 +56,17 @@ def redact(value):
 _MESSAGE_STEMS = ("телеграм", "telegram", "сообщен", "напиш", "отправ")
 
 
+def is_message_phrase(phrase):
+    """Во фразе есть слова про сообщения (телеграм, сообщение, напиши, отправь): её текст личный — в лог и журнал только
+    длина, в кэш команд она не попадает."""
+    return any(w.startswith(_MESSAGE_STEMS) for w in re.findall(r"\w+", str(phrase or "").lower()))
+
+
 def loggable_phrase(phrase, private=False):
     """Фраза для лога: про сообщение — «(сообщение, N символов)», остальные как есть. private=True — идёт диалог
     о сообщении (ассистент спросил получателя или текст, либо ждёт подтверждения отправки): любая реплика скрыта."""
     text = str(phrase or "")
-    words = re.findall(r"\w+", text.lower())
-    if private or any(w.startswith(_MESSAGE_STEMS) for w in words):
+    if private or is_message_phrase(text):
         return f"(сообщение, {len(text)} символов)"
     return text
 

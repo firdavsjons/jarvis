@@ -324,13 +324,30 @@ class TestListOfApps(AppCase):
         llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Safari"})))
         client = AIClient(llm=llm)
         turn = client.respond("закрой Safari, Mail и Notes")
-        self.assertEqual(turn.speech, "Закрыто приложение Safari. Остальное я не сделал: mail, notes.")
-        self.assertIn("Остальное я не сделал: mail, notes.", client.history.messages()[-1]["content"])
+        self.assertEqual(turn.speech, "Закрыто приложение Safari. Остальное я не сделал: Mail, Notes.")
+        self.assertIn("Остальное я не сделал: Mail, Notes.", client.history.messages()[-1]["content"])
 
     def test_log_example_calendar_chatgpt_settings(self):
         llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Notes"})))
         turn = AIClient(llm=llm).respond("закрой заметки, чатгпт и календарь")
         self.assertEqual(turn.speech, "Закрыто приложение Notes. Остальное я не сделал: чатгпт, календарь.")
+
+    def test_named_by_the_known_app_not_by_the_raw_word(self):
+        """Известное приложение называется по-русски с большой буквы или каноническим именем; неизвестное — как сказано."""
+        from core.ai import spoken_app_name
+        with patch("core.installed_apps.list_installed_apps", return_value=["Calendar", "Clock", "App Store", "Safari"]):
+            self.assertEqual(spoken_app_name("часы"), "Часы")                 # «часы» -> Clock (алиас)
+            self.assertEqual(spoken_app_name("app store"), "App Store")
+            self.assertEqual(spoken_app_name("календарь"), "Календарь")
+            self.assertEqual(spoken_app_name("safari"), "Safari")
+            self.assertEqual(spoken_app_name("чатгпт"), "чатгпт")              # нет среди установленных
+            self.assertEqual(spoken_app_name("абракадабра"), "абракадабра")
+
+    def test_live_example_app_store_and_clock(self):
+        with patch("core.installed_apps.list_installed_apps", return_value=["Calculator", "App Store", "Clock"]):
+            llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Calculator"})))
+            turn = AIClient(llm=llm).respond("закрой калькулятор, app store и часы")
+        self.assertEqual(turn.speech, "Закрыто приложение Calculator. Остальное я не сделал: App Store, Часы.")
 
     def test_all_called_no_note(self):
         llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Safari"}, "a"), call("quit_app", {"app": "Mail"}, "b"),
@@ -341,7 +358,7 @@ class TestListOfApps(AppCase):
     def test_two_of_three_note_lists_the_third(self):
         llm = ScriptedLLM(tools_reply(call("quit_app", {"app": "Safari"}, "a"), call("quit_app", {"app": "Mail"}, "b")))
         turn = AIClient(llm=llm).respond("закрой Safari, Mail и Notes")
-        self.assertTrue(turn.speech.endswith("Остальное я не сделал: notes."), turn.speech)
+        self.assertTrue(turn.speech.endswith("Остальное я не сделал: Notes."), turn.speech)
 
     def test_other_tools_cover_their_segment(self):
         llm = ScriptedLLM(tools_reply(call("open_app", {"app": "Safari"}, "a"), call("set_volume", {"level": 50}, "b")))

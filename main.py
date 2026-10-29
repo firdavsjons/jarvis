@@ -246,6 +246,7 @@ class VoiceApp:
         Порядок: подтверждение → стоп/отмена → слово «Джарвис»/окно диалога → обрывки и обрезанные → остальное."""
         gate = self.wake if isinstance(getattr(self, "wake", None), WakeGate) else None
         pending = self.has_pending()
+        in_window = False          # фраза принята окном диалога (слова-активатора не было): обрезанное начало не проверяем
         if source == "voice" and gate is not None and not pending:
             # До первой записи фразы в лог: отброшенное (нет обращения) не пишется нигде
             decision = gate.check(text, phrase)
@@ -259,7 +260,7 @@ class VoiceApp:
                 self.engine.speak(LISTENING_REPLY, opens_window=decision.opens_window)
                 self.set_idle_status()
                 return
-            text = decision.text
+            text, in_window = decision.text, decision.in_window
 
         # Идёт диалог о сообщении (спросили получателя или текст) или ждём подтверждения отправки — любая реплика скрыта
         private = self.ai.message_dialog_open() is True or self.pending_is_private() is True
@@ -272,7 +273,7 @@ class VoiceApp:
             return
 
         # Обрезанная фраза («позвонить ма», «напиши себе в»): модель не спрашиваем, она бы догадалась за пользователя
-        if source == "voice" and is_truncated(text):
+        if source == "voice" and is_truncated(text, in_window=in_window):
             log.info("Отброшено (обрезанная фраза)")
             self.engine.speak(TRUNCATED_REPLY)
             self.set_idle_status()

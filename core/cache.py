@@ -2,8 +2,16 @@
 
 ~/Library/Application Support/Jarvis/command_cache.json — до 500 записей (вытесняются давно не использованные),
 срок жизни 90 дней. Записывается только после успешного выполнения.
+
+Ключ — РЕАЛЬНАЯ нормализованная фраза пользователя (маскированный текст из журнала и лога — «(сообщение, N символов)» —
+годится только для печати). В кэш не попадают: фразы про сообщения (слова сообщение / напиши / отправь: их текст личный и
+лежал бы на диске открыто), фразы с невыполненной частью («закрой калькулятор и закрой телеграм», выполнено одно: иначе
+вся фраза закрепилась бы как «закрыть калькулятор») и ключи вида «(сообщение…». При загрузке такие записи удаляются сами.
+«Телеграм» как название приложения в полностью выполненной команде («открой телеграм») кэшируется: текста сообщения в
+такой фразе быть не может (leftover_words), а без кэша команда не работала бы без интернета.
 """
 import copy
+import logging
 import re
 import time
 from threading import Lock
@@ -11,9 +19,12 @@ from threading import Lock
 from urllib.parse import urlparse
 
 from core import installed_apps, safety
+from core.phrase_lists import requested_apps
 from core.apps import registry
 from core.apps import ALIAS_PREFIX_MIN, APP_ALIASES
 from core.storage import DATA_DIR, atomic_write_json, read_json
+
+log = logging.getLogger(__name__)
 
 CACHE_FILE = DATA_DIR / "command_cache.json"
 MAX_ENTRIES = 500
@@ -21,6 +32,7 @@ TTL_SECONDS = 90 * 24 * 3600
 MAX_ACTIONS = 3
 
 FILLER_WORDS = {"пожалуйста", "мне", "а", "ну", "давай"}
+MESSAGE_STEMS = ("сообщен", "напиш", "отправ")       # слова про отправку сообщения: такая фраза не кэшируется никогда
 # Фразы, смысл которых зависит от разговора: «открой его», «запусти снова» — не кэшируем
 CONTEXT_WORDS = {"его", "её", "ее", "это", "этот", "эту", "эти", "то", "тот", "ту", "их", "там", "тут",
                  "снова", "ещё", "еще", "опять"}
@@ -44,6 +56,8 @@ def is_forget_cache_command(text):
 # модель могла ошибиться («главный экран» -> Preview), и ошибка закрепилась бы навсегда.
 OPEN_WORDS = {"открой", "открыть", "запусти", "запустить", "включи", "зайди", "перейди", "на", "в", "сайт",
               "страницу", "страница"}
+CLOSE_WORDS = {"закрой", "закрыть", "закройте", "выйди", "выйти", "заверши", "завершить"}
+APP_NOISE_WORDS = {"приложение", "приложения", "программу", "программа", "и"}   # слова фразы без смысла для действия
 VOLUME_WORDS = {"поставь", "установи", "сделай", "выставь", "громкость", "звук", "на", "до", "в", "процент",
                 "процента", "процентов"}
 TLD_WORDS = {"com", "ru", "org", "net", "tj", "io", "точка", "ком", "ру", "орг"}
@@ -51,25 +65,68 @@ SITE_NAMES = {"ютуб": "youtube", "гугл": "google", "яндекс": "yand
               "вк": "vk"}
 
 
-def app_in_phrase(app, phrase_words, normalized):
-    """Приложение действительно названо во фразе: его слово (если оно однозначное), русское название
-    из словаря (с падежом), псевдоним пользователя. Нечёткого сравнения нет."""
+def app_words_in_phrase(app, phrase_words, normalized):
+    """Слова фразы, которыми названо приложение: его слово (если оно однозначное), русское название из словаря (с
+    падежом), псевдоним пользователя. Пусто — приложение во фразе не названо. Нечёткого сравнения нет."""
     resolved = installed_apps.resolve_app_name(app)
     if not resolved:
-        return False
+        return set()
     installed = installed_apps.list_installed_apps()
+    found = set()
     for word in installed_apps.words_of(resolved):
         # «chrome» в «Google Chrome» годится, «code» (Visual Studio Code и Claude Code) — нет
         if len(word) >= 3 and word in phrase_words \
                 and sum(1 for a in installed if word in installed_apps.words_of(a)) == 1:
-            return True
+            found.add(word)
     for key, value in APP_ALIASES.items():
-        if value.casefold() == resolved.casefold() and any(
-                w == key or (len(key) >= ALIAS_PREFIX_MIN and w.startswith(key)) for w in phrase_words):
-            return True
+        if value.casefold() == resolved.casefold():
+            found |= {w for w in phrase_words if w == key or (len(key) >= ALIAS_PREFIX_MIN and w.startswith(key))}
     padded = f" {normalized} "
-    return any(f" {k} " in padded and (installed_apps.resolve_app_name(v, use_user_aliases=False) or "").casefold()
-               == resolved.casefold() for k, v in installed_apps.user_aliases().items())
+    for key, value in installed_apps.user_aliases().items():
+        if f" {key} " in padded and (installed_apps.resolve_app_name(value, use_user_aliases=False) or "").casefold() \
+                == resolved.casefold():
+            found |= set(key.split())
+    return found
+
+
+def app_in_phrase(app, phrase_words, normalized):
+    return bool(app_words_in_phrase(app, phrase_words, normalized))
+
+
+def leftover_words(phrase, actions):
+    """Слова фразы, которые не объяснены ни глаголом открытия/закрытия, ни названием приложения из действий. Только для
+    фраз из open_app / quit_app; иначе пусто. Остаток значит, что часть фразы не выполнена («… и закрой телеграм»)."""
+    if not actions or any(a.get("name") not in ("open_app", "quit_app") for a in actions):
+        return []
+    words = re.findall(r"\w+", normalize_phrase(phrase))
+    normalized = " ".join(words)
+    explained = OPEN_WORDS | CLOSE_WORDS | APP_NOISE_WORDS
+    for action in actions:
+        app = (action.get("args") or {}).get("app")
+        if isinstance(app, str):
+            explained |= app_words_in_phrase(app, set(words), normalized)
+    return [w for w in words if w not in explained]
+
+
+def has_message_words(text):
+    return any(w.startswith(MESSAGE_STEMS) for w in re.findall(r"\w+", str(text).lower()))
+
+
+def may_keep(phrase, actions):
+    """Запись можно хранить и использовать: не про сообщения, не маскированный ключ «(сообщение…», перечисление во фразе
+    совпадает с числом действий («закрой калькулятор и телеграм» с одним действием — неполная запись). Проверяется при
+    записи, чтении и загрузке файла."""
+    key = normalize_phrase(phrase)
+    if not key or str(phrase).strip().startswith("(сообщение") or has_message_words(key):
+        return False
+    segments = requested_apps(phrase)
+    return not segments or len(segments) == len(actions)
+
+
+def is_complete(phrase, actions):
+    """Фразу можно запомнить как короткую команду: запись допустима и фраза вся выполнена этими действиями (нет
+    лишних слов: «закрой калькулятор потом включи музыку» с одним действием не запоминается)."""
+    return may_keep(phrase, actions) and not leftover_words(phrase, actions)
 
 
 def volume_template(level, phrase_words):
@@ -112,7 +169,7 @@ def action_follows_phrase(action, phrase, single):
 
 def cacheable_actions(results, phrase):
     """Действия из результатов, если их можно кэшировать для этой фразы; иначе None."""
-    if not results or len(results) > MAX_ACTIONS:
+    if not results or len(results) > MAX_ACTIONS or has_message_words(phrase):
         return None
     actions = []
     for r in results:
@@ -124,7 +181,7 @@ def cacheable_actions(results, phrase):
         if not action_follows_phrase(action, phrase, single=len(results) == 1):
             return None
         actions.append({"name": action["name"], "args": dict(action.get("args") or {})})
-    return actions
+    return actions if is_complete(phrase, actions) else None
 
 
 class CommandCache:
@@ -138,6 +195,18 @@ class CommandCache:
         data = read_json(path, {}) if path else {}
         self._data = {k: v for k, v in data.items() if isinstance(v, dict) and isinstance(v.get("actions"), list)} \
             if isinstance(data, dict) else {}
+        self.removed_on_load = self._drop_unsafe()
+
+    def _drop_unsafe(self):
+        """Удаляет записи, которых в кэше быть не должно: ключ «(сообщение, N символов)», фразы про сообщения (их текст
+        лежит на диске открыто), неполные фразы. Возвращает, сколько удалено (число, без текста)."""
+        bad = [key for key, entry in self._data.items() if not may_keep(key, entry["actions"])]
+        for key in bad:
+            del self._data[key]
+        if bad:
+            self._save()
+            log.info("Кэш команд: при загрузке удалено записей: %d (про сообщения или неполные)", len(bad))
+        return len(bad)
 
     def __len__(self):
         with self._lock:
@@ -152,7 +221,7 @@ class CommandCache:
         key = normalize_phrase(text)
         with self._lock:
             entry = self._data.get(key)
-            if entry is None:
+            if entry is None or has_message_words(key):
                 return None
             if self._clock() - entry.get("created", 0) > self.ttl:  # 90 дней с создания, даже если пользуются
                 del self._data[key]
@@ -172,6 +241,8 @@ class CommandCache:
     def store(self, text, actions):
         key = normalize_phrase(text)
         if not key or not actions or len(actions) > MAX_ACTIONS or CONTEXT_WORDS & set(key.split()):
+            return False
+        if not may_keep(text, actions):         # про сообщения, ключ «(сообщение…» или перечислено больше, чем выполнено
             return False
         now = self._clock()
         with self._lock:

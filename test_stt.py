@@ -861,7 +861,7 @@ class TestPrompt(PromptCase):
         self.write_contacts({"мама": {"username": "mama_user"}})
         text = build_prompt()
         self.assertTrue(text.startswith("Джарвис, открой "))
-        for part in ("Закрой ", "Напиши маме в телеграм привет.", "Поставь таймер на пять минут.", "Какая погода в Душанбе?"):
+        for part in ("Джарвис, закрой ", "Напиши маме в телеграм привет.", "Поставь таймер на пять минут.", "Какая погода в Душанбе?"):
             self.assertIn(part, text)
 
     def test_no_colons_and_no_enumerations(self):
@@ -869,9 +869,9 @@ class TestPrompt(PromptCase):
         for rotation in range(6):
             text = build_prompt(rotation)
             self.assertNotIn(":", text)
-            self.assertLessEqual(text.count(","), 1)                    # только после «Джарвис»
-            if "," in text:
-                self.assertTrue(text.startswith("Джарвис,"))
+            for index in [i for i, c in enumerate(text) if c == ","]:   # запятая бывает только сразу после «Джарвис»
+                self.assertTrue(text[:index].endswith("Джарвис"), text)
+            self.assertTrue(text.startswith("Джарвис"))
             for label in ("Контакты", "Приложения", "Команды", "Программы", "Как я называю"):
                 self.assertNotIn(label, text)
 
@@ -892,6 +892,22 @@ class TestPrompt(PromptCase):
         text = build_prompt(0)
         self.assertIn("калькулятор", text)
         self.assertIn("сафари", text)
+
+    def test_open_and_close_alternate_after_the_name(self):
+        """Этап 8.2.2: Whisper слышал «открою», «крой»; в образце рядом с «Джарвис» оба глагола в императиве, порядок чередуется."""
+        first = build_prompt(0)
+        second = build_prompt(1)
+        self.assertTrue(first.startswith("Джарвис, открой "))
+        self.assertTrue(second.startswith("Джарвис, закрой "))
+        for text in (first, second):
+            self.assertIn("Джарвис, открой ", text)
+            self.assertIn("Джарвис, закрой ", text)
+        self.assertEqual(build_prompt(2).split(".")[0].split()[1], first.split(".")[0].split()[1])      # дальше по кругу
+        for rotation in range(6):
+            text = build_prompt(rotation)
+            self.assertTrue(text.startswith("Джарвис"))
+            self.assertLessEqual(estimate_tokens(text), PROMPT_TOKEN_LIMIT)
+            self.assertNotIn(":", text)
 
     def test_no_english_names_and_no_memory_aliases(self):
         installed_apps.set_user_aliases({"мой браузер": "Safari", "рабочий чат": "Telegram"})
@@ -928,7 +944,8 @@ class TestPrompt(PromptCase):
 
     def test_one_app_fills_all_app_slots(self):
         with patch("core.installed_apps.list_installed_apps", return_value=["Safari"]):
-            self.assertIn("Закрой сафари.", build_prompt())
+            self.assertIn("Джарвис, закрой сафари.", build_prompt())
+            self.assertIn("Джарвис, открой сафари.", build_prompt())
 
     def test_no_username_phone_or_title(self):
         self.write_contacts({"мама": {"username": "mama_user", "phone": "+992900000001", "title": "Мама Иванова"},
