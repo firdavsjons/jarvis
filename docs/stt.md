@@ -41,10 +41,12 @@ Jarvis распознаёт речь локально: звук остаётся
 
 Проверено по метаданным PyPI и Hugging Face для Python 3.14 на Apple Silicon; **на вашем Mac живьём ещё не запускалось**.
 
+> В .venv скрипты (pip и др.) указывают на старый путь после переноса проекта; запускайте только `python -m pip`. Пересоздание окружения — Этап 13.
+
 1. **Пакет** (основной движок whisper.cpp): готовое колесо без сборки и без torch, Metal внутри; вместе с зависимостями
    (numpy, requests, tqdm, platformdirs) ≈ 17 МБ.
    ```bash
-   .venv/bin/pip install pywhispercpp==1.5.1
+   .venv/bin/python -m pip install pywhispercpp==1.5.1
    ```
 2. **Модель** — файл ggml в папку моделей Jarvis. Выбор:
 
@@ -73,14 +75,14 @@ Jarvis распознаёт речь локально: звук остаётся
    .venv/bin/python -m core.stt.check --wav фраза.wav # распознать файл: текст, время, уверенность
    .venv/bin/python -m core.stt.check --mic           # записать одну фразу с микрофона и распознать
    ```
-   Первая загрузка модели на M1, по открытым данным, занимает несколько секунд (Metal готовит шейдеры); реальное время покажет эта команда.
+   Первая загрузка и прогрев на вашем M1 заняли 18,0 с (Metal готовит шейдеры; Metal задействован); реальное время каждой загрузки покажет эта команда и лог.
 
 ### Запасной движок: faster-whisper
 
 Работает на процессоре (Metal нет), поэтому большие модели медленнее; зато умеет `no_speech_prob`. Вместе с зависимостями
 ≈ 63 МБ.
 ```bash
-.venv/bin/pip install faster-whisper==1.2.1
+.venv/bin/python -m pip install faster-whisper==1.2.1
 .venv/bin/python -c "import os, huggingface_hub as h; h.snapshot_download('Systran/faster-whisper-small', \
 local_dir=os.path.expanduser('~/Library/Application Support/Jarvis/models/faster-whisper/small'))"   # ≈ 484 МБ
 ```

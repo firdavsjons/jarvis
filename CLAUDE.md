@@ -152,7 +152,7 @@ VoiceApp.process_command            (main.py)
 
 ```bash
 brew install portaudio          # нужен для pyaudio
-pip install -r requirements.txt  # openai, python-dotenv, SpeechRecognition, pyaudio, httpx, ddgs;
+python -m pip install -r requirements.txt  # openai, python-dotenv, SpeechRecognition, pyaudio, httpx, ddgs;
                                  #   pyobjc и keyboard не нужны: озвучка — системный say, клавиатура не используется
 cp .env.example .env            # вписать GEMINI_API_KEY и GROQ_API_KEY
 python -m core.stt.check        # локальное распознавание: пакет, модель, загрузка (docs/stt.md); микрофон не включается
@@ -162,6 +162,8 @@ python -m core.llm.check        # связь с провайдерами (--mode
 # LM Studio (выключен по умолчанию; LLM_PROVIDERS=gemini,groq,local): модель → Developer → Start Server (1234)
 python main.py
 ```
+
+В .venv скрипты (pip и др.) указывают на старый путь после переноса проекта; запускайте только `python -m pip`. Пересоздание окружения — Этап 13.
 
 Разрешения macOS: «Микрофон» и «Автоматизация» для терминала/IDE, из которого запускается приложение (иначе `osascript` и запись звука молча не работают).
 
