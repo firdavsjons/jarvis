@@ -139,7 +139,7 @@ class TestLoop(unittest.TestCase):
     def test_real_command_goes_through(self):
         app = self.make_app(["поставь таймер на пять минут"], echo=(False,))
         main.VoiceApp.background_loop(app)
-        app.process_command.assert_called_once_with("поставь таймер на пять минут", source="voice")
+        app.process_command.assert_called_once_with("поставь таймер на пять минут", source="voice", phrase=app.engine.last_phrase)
 
     def test_notices_flushed_after_checks_and_before_command(self):
         app = self.make_app(["открой сафари"], echo=(False,))
@@ -157,7 +157,7 @@ class TestLoop(unittest.TestCase):
     def test_answers_reach_command_processing(self):
         app = self.make_app(["да"], echo=(False,))
         main.VoiceApp.background_loop(app)
-        app.process_command.assert_called_once_with("да", source="voice")
+        app.process_command.assert_called_once_with("да", source="voice", phrase=app.engine.last_phrase)
 
     def test_does_not_listen_during_tail_pause(self):
         app = self.make_app(["привет"], tail=(0.5, 0.4, 0.0))

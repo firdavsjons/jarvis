@@ -11,6 +11,7 @@
 import logging
 import time
 
+from core import wake
 from core.stt.base import MIN_SECONDS, Engine, Loading, SttError, Unavailable
 
 log = logging.getLogger(__name__)
@@ -68,7 +69,11 @@ class SpeechToText:
         prompt = ""
         if engine.uses_prompt and self.prompt_provider is not None:
             prompt = self.prompt_provider.get()
-        return engine.recognize(audio, prompt)
+        result = engine.recognize(audio, prompt)
+        if prompt and result.text:
+            # Подсказка начинается с «Джарвис»: Whisper может дописать слово к посторонней речи
+            result.wake_from_prompt = wake.prompt_induced(result.text, result.audio_seconds, result.confidence)
+        return result
 
     def _finish(self, result):
         log.info("Распознавание (%s): запись %.1f с, обработка %.1f с", result.engine, result.audio_seconds, result.seconds)

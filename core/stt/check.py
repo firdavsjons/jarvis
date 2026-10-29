@@ -1,11 +1,12 @@
-"""Проверка локального распознавания вручную: `python -m core.stt.check [--wav файл] [--mic] [--no-prompt] [--repeat N]`.
+"""Проверка локального распознавания вручную: `python -m core.stt.check [--wav файл] [--mic] [--no-prompt] [--repeat N] [--wake]`.
 
 Запускает пользователь, не тесты. Без параметров: показывает настройки, наличие пакета и файла модели, загружает
 модель (время загрузки и прогрева) — микрофон не включается, звук никуда не уходит. `--wav` распознаёт файл (любой
 WAV/AIFF/FLAC; текст печатается в консоль), `--mic` записывает фразы с микрофона: `--repeat N` фраз подряд (по умолчанию
 3), для каждой печатаются текст, длина записи и время. `--no-prompt` отключает подсказку Whisper — так сравнивают
 качество с подсказкой и без неё (STT_PROMPT=off в .env делает то же самое). Откат на Google здесь отключён: проверяется
-только локальный движок. Ничего не скачивает.
+только локальный движок. `--wake` для каждой записи показывает, засчитано ли слово «Джарвис» и почему (окно диалога
+в проверке не учитывается). Ничего не скачивает.
 """
 import argparse
 import importlib.util
@@ -13,6 +14,7 @@ import sys
 import time
 
 from core import storage
+from core import wake
 from core.stt.base import Audio, SttError
 from core.stt.factory import models_dir, stt_settings
 from core.stt.faster import FasterWhisperEngine
@@ -53,6 +55,7 @@ def main(argv=None, out=print):
     parser.add_argument("--wav", help="распознать этот аудиофайл")
     parser.add_argument("--mic", action="store_true", help="записать фразы с микрофона")
     parser.add_argument("--no-prompt", action="store_true", help="не передавать Whisper подсказку (сравнить качество)")
+    parser.add_argument("--wake", action="store_true", help="для каждой записи показать, засчитано ли слово «Джарвис»")
     parser.add_argument("--repeat", type=int, metavar="N",
                         help="сколько фраз записать с микрофона (по умолчанию 3) или раз распознать файл (по умолчанию 1)")
     args = parser.parse_args(argv)
@@ -108,6 +111,14 @@ def main(argv=None, out=print):
         reasons = {"noise": "шум/галлюцинация", "prompt_echo": "эхо подсказки"}
         out(f"[{number}] отброшено: {reasons.get(result.discarded, result.discarded)}" if result.discarded
             else f"[{number}] текст: {result.text}")
+        if args.wake and not result.discarded:
+            from_prompt = bool(prompt) and wake.prompt_induced(result.text, result.audio_seconds, result.confidence)
+            verdict = wake.judge(result.text, from_prompt, result.confidence)
+            if verdict.found and verdict.counted:
+                out(f"[{number}] слово «Джарвис»: ЗАСЧИТАНО — {verdict.reason}; команда: «{verdict.rest}»"
+                    if verdict.rest else f"[{number}] слово «Джарвис»: ЗАСЧИТАНО — {verdict.reason}; команды нет, ответ «Слушаю.»")
+            else:
+                out(f"[{number}] слово «Джарвис»: не засчитано — {verdict.reason}")
     return status
 
 

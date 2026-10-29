@@ -8,10 +8,10 @@ from collections import deque
 
 import speech_recognition as sr
 
-from core import journal
 from core.settings import env_float
 from core.speech_text import prepare_for_speech
 from core.stt.base import Audio
+from core.wake import Phrase
 from core.stt.factory import build_stt
 
 log = logging.getLogger(__name__)
@@ -93,6 +93,10 @@ class SpeechEngine:
         self.speaking = threading.Event()
         self.tail_pause = speech_tail_pause()
         self.recent_spoken = deque(maxlen=ECHO_PHRASES)   # последние озвученные фразы — для фильтра эха
+        # Слово-активатор (core/wake.py): конец последней озвучки, открывающей окно диалога (time.monotonic), и сведения
+        # о последней распознанной фразе
+        self.window_opened_at = None
+        self.last_phrase = None
         # Распознавание речи (core/stt): модель не грузится, пока не вызван start_stt(). Голосовые оповещения движка
         # («не установлено, использую Google») откладываются до flush_notices(): озвученные внутри listen(), они
         # заставили бы цикл отбросить саму фразу как «ассистент говорил во время записи»
@@ -103,13 +107,15 @@ class SpeechEngine:
         """Озвучивает накопленные оповещения распознавания; вызывает цикл прослушивания после проверок фразы."""
         notices, self.notices[:] = list(self.notices), []
         for text in notices:
-            self.speak(text)
+            self.speak(text, opens_window=False)
 
     def start_stt(self):
         """Запускает фоновую загрузку локальной модели (с Google модель не нужна)."""
         self.stt.start()
 
-    def speak(self, text):
+    def speak(self, text, opens_window=True):
+        """opens_window=False — оповещение, а не ответ на команду или вопрос («Секунду.», таймер, будильник,
+        «Локальное распознавание не установлено…»): слово-активатор после него не отменяется на время окна."""
         # В лог — исходный текст, в say — без ссылок, путей, Markdown и эмодзи
         spoken = prepare_for_speech(text)
         if not spoken:
@@ -130,6 +136,8 @@ class SpeechEngine:
             finally:
                 self._proc = None
                 self._last_speech_end = time.monotonic()
+                if opens_window and generation == self._stop_generation:    # прерванная речь окно не открывает
+                    self.window_opened_at = self._last_speech_end
                 self.speaking.clear()
 
     def stop_speaking(self):
@@ -138,6 +146,10 @@ class SpeechEngine:
         proc = self._proc
         if proc and proc.poll() is None:
             proc.terminate()
+
+    def close_window(self):
+        """Окно диалога закрыто («стоп», «отмена»): следующая фраза снова требует слово-активатор."""
+        self.window_opened_at = None
 
     def tail_remaining(self):
         """Сколько ещё секунд после конца озвучки не слушать (SPEECH_TAIL_PAUSE)."""
@@ -178,12 +190,16 @@ class SpeechEngine:
                 log.error("Ошибка микрофона: %s", e)
                 return None
         # Микрофон уже свободен: распознавание (до нескольких секунд) его не держит
+        recorded = Audio(audio)
+        ended = time.monotonic()
         try:
-            result = self.stt.recognize(Audio(audio))
+            result = self.stt.recognize(recorded)
         except Exception as e:
             log.error("Ошибка распознавания: %s", type(e).__name__)
             return None
         if result is None:
             return None
-        log.info("👤 Вы: %s", journal.loggable_phrase(result.text))
+        # Текст в лог не пишется: сначала main решает, обращена ли фраза к Jarvis (отброшенное не пишется нигде)
+        self.last_phrase = Phrase(started_at=ended - recorded.seconds, audio_seconds=result.audio_seconds,
+                                  confidence=result.confidence, from_prompt=result.wake_from_prompt)
         return result.text.lower()

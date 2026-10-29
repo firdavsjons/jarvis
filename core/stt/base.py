@@ -40,6 +40,7 @@ class Recognition:
     audio_seconds: float = 0.0               # длина записи
     confidence: Optional[float] = None       # 0–1, exp(avg_logprob) по оставшимся кускам
     discarded: Optional[str] = None          # "noise": шум или галлюцинация (текст пуст)
+    wake_from_prompt: bool = False           # слово «Джарвис» в начале, возможно, пришло из подсказки (core/wake.py)
 
 
 class Audio:

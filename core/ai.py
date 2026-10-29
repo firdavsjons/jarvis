@@ -509,6 +509,10 @@ class AIClient:
             return None    # признак сбросит respond, когда модель получит фразу
         return NOTHING_TO_CONFIRM
 
+    def expects_answer(self):
+        """Ассистент задал вопрос и ждёт ответа («Кому именно?», «Какой текст?»): слово-активатор держит окно дольше."""
+        return bool(self._last_question) or self._dialog is not None
+
     def message_dialog_open(self):
         """Ассистент спросил получателя или текст сообщения и ждёт ответа: реплики пользователя не пишем в лог."""
         return self._dialog is not None

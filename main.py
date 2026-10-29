@@ -19,6 +19,7 @@ from core.llm import build_default_client
 from core.logger import LOG_DIR, setup_logging
 from core.speech_text import confirmation_question
 from core.stt.truncated import TRUNCATED_REPLY, is_truncated
+from core.wake import LISTENING_REPLY, WakeGate, build_gate, is_stop_phrase
 from modules.mac_control import MacControl
 
 log = logging.getLogger(__name__)
@@ -73,13 +74,15 @@ class VoiceApp:
         self.ai = AIClient(llm=build_default_client(usage_path=LOG_DIR / "llm_usage.json"),
                            memory=UserMemory(MEMORY_FILE), cache=CommandCache(CACHE_FILE))
         # «Секунду, ищу.» — из таймера, параллельно с медленным веб-инструментом
-        self.ai.on_slow_tool = self.engine.speak
+        self.ai.on_slow_tool = self.quiet_speak
         self.mac = MacControl()
-        # Таймеры и будильники: фоновый планировщик; озвучка через общий замок SpeechEngine.speak
+        # Таймеры и будильники: фоновый планировщик; озвучка через общий замок SpeechEngine.speak, окно диалога не открывает
         self.scheduler = timers.set_scheduler(timers.Scheduler(timers.TIMERS_FILE))
-        self.scheduler.on_fire = timers.make_fire_handler(self.engine.speak)
-        self.scheduler.on_missed = timers.make_missed_handler(self.engine.speak)
+        self.scheduler.on_fire = timers.make_fire_handler(self.quiet_speak)
+        self.scheduler.on_missed = timers.make_missed_handler(self.quiet_speak)
         self.scheduler.start()
+        # Слово-активатор «Джарвис» (WAKE_WORD=off — None): голосовая фраза без обращения вне окна диалога отбрасывается
+        self.wake = build_gate(self.engine, self.ai, CONFIRM_TIMEOUT)
         self.is_listening = False
         self.stop_event = Event()
         self.listen_thread = None
@@ -91,6 +94,10 @@ class VoiceApp:
         # Виджеты меняет только главный поток: остальные кладут сообщения в очередь
         self.ui_queue = queue.Queue()
         self.root.after(UI_POLL_MS, self.poll_ui)
+
+    def quiet_speak(self, text):
+        """Оповещение, а не ответ на команду («Секунду.», таймер, будильник): окно слова-активатора не открывается."""
+        self.engine.speak(text, opens_window=False)
 
     def start_listening(self):
         if self.is_listening:
@@ -232,15 +239,34 @@ class VoiceApp:
             tools = [registry.get(a.get("name")) for a in self.pending_actions if isinstance(a, dict)]
         return any(t is not None and t.private for t in tools)
 
-    def process_command(self, text, source="voice"):
-        """Единая точка входа для обработки команд (голос или текст)."""
+    def process_command(self, text, source="voice", phrase=None):
+        """Единая точка входа для обработки команд (голос или текст). phrase — core.wake.Phrase: длина записи и
+        уверенность распознавания голосовой фразы.
+
+        Порядок: подтверждение → стоп/отмена → слово «Джарвис»/окно диалога → обрывки и обрезанные → остальное."""
+        gate = self.wake if isinstance(getattr(self, "wake", None), WakeGate) else None
+        pending = self.has_pending()
+        if source == "voice" and gate is not None and not pending:
+            # До первой записи фразы в лог: отброшенное (нет обращения) не пишется нигде
+            decision = gate.check(text, phrase)
+            if decision.action == "drop":
+                return
+            if decision.action == "stop":
+                self.set_idle_status()
+                return
+            if decision.action == "listen":
+                self.engine.speak(LISTENING_REPLY, opens_window=True)   # после одного «Джарвис» окно нужно
+                self.set_idle_status()
+                return
+            text = decision.text
+
         # Идёт диалог о сообщении (спросили получателя или текст) или ждём подтверждения отправки — любая реплика скрыта
         private = self.ai.message_dialog_open() is True or self.pending_is_private() is True
         log.info("Обработка (%s): %s", source, loggable_phrase(text, private))
 
-        # 0. Если ждём подтверждения — это ответ на вопрос
+        # 0. Если ждём подтверждения — это ответ на вопрос («стоп» и «хватит» — отмена, слово не нужно)
         if self.has_pending():
-            self.handle_confirmation(text)
+            self.handle_confirmation("отмена" if gate is not None and is_stop_phrase(text) else text)
             self.ai.close_message_dialog()
             return
 
@@ -372,7 +398,7 @@ class VoiceApp:
                 continue
             if self.engine.speech_overlaps(started):
                 # Во время записи ассистент заговорил — микрофон мог услышать его самого
-                log.info("Отброшено (ассистент говорил во время записи): %s", loggable_phrase(text))
+                log.info("Отброшено (ассистент говорил во время записи)")
                 self.engine.flush_notices()
                 continue
 
@@ -384,7 +410,7 @@ class VoiceApp:
 
             # Оповещения распознавания (один раз за запуск) звучат после проверок: иначе сама фраза была бы отброшена
             self.engine.flush_notices()
-            self.process_command(text, source="voice")
+            self.process_command(text, source="voice", phrase=self.engine.last_phrase)
         log.info("Цикл прослушивания остановлен")
 
 

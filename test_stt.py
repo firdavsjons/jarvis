@@ -1526,11 +1526,11 @@ class TestListen(unittest.TestCase):
             engine.start_stt()
         start.assert_called_once_with()
 
-    def test_recognized_text_not_in_log_for_private_phrases(self, *_):
+    def test_recognized_text_is_not_logged_by_listen(self, *_):
+        """Текст пишет в лог только main, после проверки слова-активатора (отброшенное не пишется нигде)."""
         engine = self.engine("напиши маме в телеграм привет")
-        with self.assertLogs("core.engine", level="INFO") as logs:
-            engine.listen()
-        self.assertNotIn("привет", "\n".join(logs.output))
+        with self.assertNoLogs("core.engine", level="INFO"):
+            self.assertEqual(engine.listen(), "напиши маме в телеграм привет")
 
 
 # --- check.py ----------------------------------------------------------------------------------------------------
