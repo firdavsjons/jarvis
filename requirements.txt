@@ -9,3 +9,6 @@ ddgs==9.16.1
 # Локальное распознавание речи (Этап 8.1). Не устанавливать без docs/stt.md: пакеты и модель ставятся вручную.
 # pywhispercpp==1.5.1      # основной движок whisper_cpp: whisper.cpp с Metal, ≈17 МБ вместе с numpy, requests, tqdm, platformdirs
 # faster-whisper==1.2.1    # запасной движок faster_whisper: на процессоре, ≈63 МБ
+
+# Нейронный голос (Этап 9.2). Не устанавливать без docs/tts.md: пакет и модель ставятся вручную.
+# sherpa-onnx==2.0.1       # TTS_ENGINE=sherpa: sherpa-onnx (+ sherpa-onnx-core), ≈ 25 МБ; numpy уже установлен для эффекта

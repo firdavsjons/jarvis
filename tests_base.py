@@ -10,6 +10,9 @@
 3. Распознавание речи (Этап 8.1): загрузка настоящей модели Whisper (`_import_backend` в core/stt/whisper_cpp.py и
    core/stt/faster.py) и `Recognizer.recognize_google` (звук в интернет) бросают ForbiddenInTests, пока тест не подменил их
    фальшивкой. Микрофон тесты не открывают (`sr.Microphone` подменяется).
+   Озвучка (Этап 9.2): загрузка настоящего sherpa_onnx (`core.tts.sherpa._import_backend`) бросает ForbiddenInTests;
+   запись в ~/Library/Application Support/Jarvis/tts_samples запрещена общей защитой папки Jarvis; `afplay` и `say`
+   без подмены Popen/run тоже (защита процессов). Тесты используют фальшивые движок и плеер.
 4. Паузы FallbackClient по умолчанию (2 с после 5xx, ожидание окна токенов) в тестах мгновенные; тест, проверяющий
    паузу, передаёт свой `sleep=`.
 Исключений (osacompile, py_compile) сейчас нет: тестам они не нужны. Если понадобятся — отдельным явным
@@ -184,6 +187,9 @@ def _block_speech_recognition():
         REAL_IMPORT_BACKEND[module.__name__] = module._import_backend     # чтобы проверить сообщение «пакет не установлен»
         module._import_backend = _blocked_call(f"{module.__name__}._import_backend (загрузка модели Whisper)")
     sr.Recognizer.recognize_google = _blocked_call("recognize_google (звук ушёл бы в интернет)")
+    from core.tts import sherpa
+    REAL_IMPORT_BACKEND["core.tts.sherpa"] = sherpa._import_backend
+    sherpa._import_backend = _blocked_call("core.tts.sherpa._import_backend (загрузка нейронного голоса sherpa-onnx)")
 
 
 install()

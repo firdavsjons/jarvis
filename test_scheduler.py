@@ -204,7 +204,10 @@ class TestFireHandler(unittest.TestCase):
         engine = SpeechEngine.__new__(SpeechEngine)
         engine._speak_lock = threading.Lock()
         engine._stop_generation = 0
-        engine._proc = None
+        from core.tts.factory import SpeechVoice
+        from core.tts.say import SayEngine
+        engine.say = SayEngine(None)               # озвучка (core/tts): say без нейронного голоса
+        engine.tts = SpeechVoice(engine.say)
         engine.speaking = threading.Event()
         engine._last_speech_end = 0.0
         engine.recent_spoken = __import__("collections").deque(maxlen=3)

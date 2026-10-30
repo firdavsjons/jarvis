@@ -11,12 +11,13 @@ import speech_recognition as sr
 from core.settings import env_float
 from core.speech_text import prepare_for_speech
 from core.stt.base import Audio
+from core.tts.factory import build_tts
+from core.tts.say import SayEngine, pick_voice, say_command  # noqa: F401 — имена прежние, тесты импортируют их отсюда
 from core.wake import Phrase
 from core.stt.factory import build_stt
 
 log = logging.getLogger(__name__)
 
-PREFERRED_VOICE = "Milena"
 DEFAULT_SPEECH_PAUSE = 1.2
 DEFAULT_TAIL_PAUSE = 0.8      # SPEECH_TAIL_PAUSE: пауза после озвучки перед прослушиванием
 DEFAULT_PHRASE_LIMIT = 20     # SPEECH_PHRASE_LIMIT: самая длинная фраза, секунд (раньше 5)
@@ -42,30 +43,6 @@ def speech_phrase_limit():
     return env_float("SPEECH_PHRASE_LIMIT", DEFAULT_PHRASE_LIMIT, 3.0, 60.0)
 
 
-def pick_voice(say_voices_output):
-    """Голос из вывода `say -v '?'`: Milena, иначе любой ru_RU, иначе None (системный)."""
-    russian = []
-    for line in say_voices_output.splitlines():
-        # Формат строки: "Milena              ru_RU    # Здравствуйте! Меня зовут Милена."
-        head = line.split("#", 1)[0].split()
-        if len(head) < 2:
-            continue
-        name, locale = " ".join(head[:-1]), head[-1]
-        if locale.replace("-", "_").lower().startswith("ru_"):
-            russian.append(name)
-    if PREFERRED_VOICE in russian:
-        return PREFERRED_VOICE
-    return russian[0] if russian else None
-
-
-def say_command(text, voice):
-    """Аргументы для say. Текст после "--", чтобы "-v ..." в тексте не стал опцией."""
-    args = ["say"]
-    if voice:
-        args += ["-v", voice]
-    return args + ["--", text]
-
-
 def _detect_voice():
     try:
         result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10)
@@ -87,7 +64,10 @@ class SpeechEngine:
         log.info("Голос озвучки: %s", self.voice or "системный по умолчанию")
 
         self._speak_lock = threading.Lock()  # одновременно звучит только одна фраза
-        self._proc = None
+        # Озвучка (core/tts): say всегда под рукой; нейронный голос (TTS_ENGINE=sherpa) грузится в start_stt() и до готовности
+        # или при сбое уступает say. При TTS_ENGINE=say (по умолчанию) нейронная часть не импортируется
+        self.say = SayEngine(self.voice)
+        self.tts = build_tts(self.say)
         self._stop_generation = 0  # растёт при stop_speaking: фразы в очереди отменяются
         self._last_speech_end = 0.0
         self.speaking = threading.Event()
@@ -109,9 +89,19 @@ class SpeechEngine:
         for text in notices:
             self.speak(text, opens_window=False)
 
+    @property
+    def _proc(self):
+        """Процесс say (прежнее имя: тесты и stop_speaking смотрят сюда)."""
+        return self.say._proc
+
+    @_proc.setter
+    def _proc(self, value):
+        self.say._proc = value
+
     def start_stt(self):
-        """Запускает фоновую загрузку локальной модели (с Google модель не нужна)."""
+        """Запускает фоновую загрузку локальных моделей: распознавания (с Google модель не нужна) и нейронного голоса."""
         self.stt.start()
+        self.tts.start()
 
     def speak(self, text, opens_window=True):
         """opens_window=False — оповещение, а не ответ на команду или вопрос («Секунду.», таймер, будильник,
@@ -127,15 +117,18 @@ class SpeechEngine:
                 return  # речь прервали, пока фраза ждала своей очереди
             log.info("🗣 Assistant: %s", text)
             self.speaking.set()
+            tail = 0.0
             try:
-                # Popen, а не run: процесс нужен, чтобы stop_speaking мог его прервать
-                self._proc = subprocess.Popen(say_command(spoken, self.voice))
-                self._proc.wait()
+                notice = self.tts.take_notice()
+                if notice:
+                    # «Нейронный голос не установлен…» — один раз за запуск, голосом say (не нейронным: не зациклиться)
+                    self.recent_spoken.append(notice)
+                    self.say.speak(notice)
+                tail = self.tts.speak(spoken)       # блокирует до конца речи; хвост реверберации — к концу речи
             except OSError as e:
                 log.error("Ошибка озвучки: %s", e)
             finally:
-                self._proc = None
-                self._last_speech_end = time.monotonic()
+                self._last_speech_end = time.monotonic() + tail
                 if opens_window and generation == self._stop_generation:    # прерванная речь окно не открывает
                     self.window_opened_at = self._last_speech_end
                 self.speaking.clear()
@@ -143,9 +136,7 @@ class SpeechEngine:
     def stop_speaking(self):
         """Прерывает текущую фразу и отменяет ждущие."""
         self._stop_generation += 1
-        proc = self._proc
-        if proc and proc.poll() is None:
-            proc.terminate()
+        self.tts.stop()      # say: terminate процесса; нейронный голос: очередь предложений и текущий afplay
 
     def close_window(self):
         """Окно диалога закрыто («стоп», «отмена»): следующая фраза снова требует слово-активатор."""

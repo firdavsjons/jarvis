@@ -223,6 +223,54 @@ class TestSpeechRecognitionIsGuarded(BaseCase):
             self.assertEqual(whisper_cpp._import_backend(), "фальшивка")
 
 
+class TestSpeechOutputIsGuarded(BaseCase):
+    """Этап 9.2: настоящий sherpa_onnx, запись в tts_samples, afplay и say без подмены в тестах запрещены."""
+
+    def test_loading_a_real_neural_voice_raises(self):
+        from core.tts import sherpa
+        with self.assertRaises(ForbiddenInTests) as ctx:
+            sherpa._import_backend()
+        self.assertIn("загрузка нейронного голоса", str(ctx.exception))
+
+    def test_load_error_in_the_engine_is_not_swallowed(self):
+        """Загрузчик голоса ловит Exception, но не BaseException: нарушение защиты не превращается в «недоступно»."""
+        from core.tts.sherpa import SherpaEngine
+        folder = TEMP_ROOT / "tts-guard" / "voice"
+        folder.mkdir(parents=True)
+        (folder / "m.onnx").write_bytes(b"x")
+        (folder / "tokens.txt").write_text("a 1\n", encoding="utf-8")
+        (folder / "espeak-ng-data").mkdir()
+        engine = SherpaEngine(voice="voice", models_dir=TEMP_ROOT / "tts-guard")
+        with self.assertRaises(ForbiddenInTests):
+            engine.load()
+
+    def test_writing_into_the_real_tts_samples_folder_raises(self):
+        target = tests_base.HOME / "Library" / "Application Support" / "Jarvis" / "tts_samples" / "x.wav"
+        with self.assertRaises(ForbiddenInTests):
+            open(target, "wb")
+        with self.assertRaises(ForbiddenInTests):
+            os.makedirs(target.parent / "sub")
+        self.assertFalse(target.exists())
+
+    def test_afplay_and_say_without_a_mock_raise(self):
+        with self.assertRaises(ForbiddenInTests):
+            subprocess.Popen(["afplay", "/tmp/x.wav"])
+        with self.assertRaises(ForbiddenInTests):
+            subprocess.run(["say", "--", "привет"])
+        from core.tts.player import AfplayPlayer
+        with self.assertRaises(ForbiddenInTests):
+            AfplayPlayer().play("/tmp/x.wav")
+
+    def test_the_samples_folder_of_the_app_is_redirected(self):
+        from core import storage
+        self.assertTrue(str(storage.DATA_DIR / "tts_samples").startswith(str(TEMP_ROOT)))
+
+    def test_patched_backend_is_allowed(self):
+        from core.tts import sherpa
+        with patch("core.tts.sherpa._import_backend", return_value="фальшивка"):
+            self.assertEqual(sherpa._import_backend(), "фальшивка")
+
+
 class TestEveryTestFileIsProtected(unittest.TestCase):
     def test_all_test_files_import_tests_base(self):
         files = sorted(ROOT.glob("test_*.py")) + [ROOT / "verify_local_ai.py"]
