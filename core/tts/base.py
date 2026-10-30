@@ -1,14 +1,16 @@
 """Общие типы озвучки и настройки TTS из .env."""
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.settings import env_value
 
 log = logging.getLogger(__name__)
 
 DEFAULT_ENGINE = "say"
-ENGINES = ("say", "sherpa")
+ENGINES = ("say", "sherpa", "silero")
+SILERO_VOICES = ("eugene", "aidar")           # голоса Silero v5_ru, подходящие Jarvis (мужские); первый — по умолчанию
+DEFAULT_UNLOAD_MINUTES = 10
 SPEED_RANGE = (0.8, 1.5)
 PITCH_RANGE = (-6.0, 0.0)
 REVERB_RANGE = (0.0, 0.3)
@@ -21,6 +23,16 @@ class TTSUnavailable(Exception):
     def __init__(self, reason, kind="not_installed"):
         super().__init__(reason)
         self.reason, self.kind = reason, kind
+
+
+@dataclass
+class NeuralResult:
+    """Итог речи нейронного движка: что читали, сколько предложений прозвучало, чем кончилось, хвост эффекта (секунды)."""
+    sentences: list = field(default_factory=list)
+    done: int = 0
+    error: bool = False
+    stopped: bool = False
+    tail: float = 0.0
 
 
 class TTSEngine:
@@ -45,6 +57,9 @@ class TTSSettings:
     effect: bool = False
     pitch: float = DEFAULT_PITCH
     reverb: float = DEFAULT_REVERB
+    unload_minutes: int = DEFAULT_UNLOAD_MINUTES      # Silero: через сколько минут простоя воркер завершается (0 — не завершать)
+    silero_python: str = ""                           # пустое — по умолчанию (factory.silero_python)
+    silero_model: str = ""
 
 
 def _number(name, default, lo, hi, path=None):
@@ -68,7 +83,7 @@ def _number(name, default, lo, hi, path=None):
 def tts_settings(path=None):
     engine = (env_value("TTS_ENGINE", DEFAULT_ENGINE, path) or DEFAULT_ENGINE).strip().lower()
     if engine not in ENGINES:
-        log.warning("TTS_ENGINE=%s не поддерживается (допустимо say, sherpa), использую %s", engine, DEFAULT_ENGINE)
+        log.warning("TTS_ENGINE=%s не поддерживается (допустимо say, sherpa, silero), использую %s", engine, DEFAULT_ENGINE)
         engine = DEFAULT_ENGINE
     effect_raw = (env_value("TTS_EFFECT", "off", path) or "off").strip().lower()
     if effect_raw not in ("off", "jarvis"):
@@ -78,7 +93,21 @@ def tts_settings(path=None):
     threads = int(_number("TTS_THREADS", DEFAULT_THREADS, 1, 64, path))
     if threads > half:
         log.info("TTS_THREADS=%d ограничено половиной ядер: %d", threads, half)
-    return TTSSettings(engine=engine, voice=(env_value("TTS_VOICE", "", path) or "").strip(),
-                       speed=_number("TTS_SPEED", DEFAULT_SPEED, *SPEED_RANGE, path), threads=min(threads, half),
+    voice = (env_value("TTS_VOICE", "", path) or "").strip()
+    speed = _number("TTS_SPEED", DEFAULT_SPEED, *SPEED_RANGE, path)
+    if engine == "silero":
+        if voice.lower() not in SILERO_VOICES:
+            if voice:
+                log.warning("TTS_VOICE=%s: для Silero допустимы %s, использую %s", voice, ", ".join(SILERO_VOICES),
+                            SILERO_VOICES[0])
+            voice = SILERO_VOICES[0]
+        voice = voice.lower()
+        if speed != DEFAULT_SPEED:
+            log.warning("TTS_SPEED=%s: Silero скорость не меняет, использую %s", speed, DEFAULT_SPEED)
+            speed = DEFAULT_SPEED
+    return TTSSettings(engine=engine, voice=voice, speed=speed, threads=min(threads, half),
                        effect=effect_raw == "jarvis", pitch=_number("TTS_PITCH", DEFAULT_PITCH, *PITCH_RANGE, path),
-                       reverb=_number("TTS_REVERB", DEFAULT_REVERB, *REVERB_RANGE, path))
+                       reverb=_number("TTS_REVERB", DEFAULT_REVERB, *REVERB_RANGE, path),
+                       unload_minutes=int(_number("TTS_UNLOAD_MINUTES", DEFAULT_UNLOAD_MINUTES, 0, 240, path)),
+                       silero_python=(env_value("TTS_SILERO_PYTHON", "", path) or "").strip(),
+                       silero_model=(env_value("TTS_SILERO_MODEL", "", path) or "").strip())

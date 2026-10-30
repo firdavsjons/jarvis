@@ -1,7 +1,9 @@
 """Выбор голоса из .env и `SpeechVoice` — единая точка озвучки для SpeechEngine.
 
-TTS_ENGINE=say|sherpa (по умолчанию say; нейронная часть при say не импортируется), TTS_VOICE (папка модели), TTS_SPEED
-(0.8–1.5), TTS_THREADS (по умолчанию 2), TTS_EFFECT=off|jarvis, TTS_PITCH (−6…0 полутонов), TTS_REVERB (0–0.3).
+TTS_ENGINE=say|sherpa|silero (по умолчанию say; нейронная часть при say не импортируется), TTS_VOICE (для sherpa — папка
+модели, для silero — eugene или aidar), TTS_SPEED (0.8–1.5; Silero скорость не меняет), TTS_THREADS (по умолчанию 2),
+TTS_EFFECT=off|jarvis, TTS_PITCH (−6…0 полутонов), TTS_REVERB (0–0.3); только Silero: TTS_SILERO_PYTHON, TTS_SILERO_MODEL,
+TTS_UNLOAD_MINUTES (по умолчанию 10, 0 — не выгружать воркер).
 """
 import logging
 
@@ -67,19 +69,24 @@ class SpeechVoice:
 
 
 def build_neural(settings, models=None, player=None):
-    """SherpaEngine по настройкам (импорт модуля только здесь, чтобы TTS_ENGINE=say его не загружал)."""
+    """SherpaEngine или SileroEngine по настройкам (импорт модуля только здесь, чтобы TTS_ENGINE=say его не загружал)."""
     from core.tts import effect
-    from core.tts.sherpa import SherpaEngine
     use_effect = settings.effect
     if use_effect and not effect.available():
         log.warning("TTS_EFFECT=jarvis: numpy недоступен, эффект выключен")
         use_effect = False
+    if settings.engine == "silero":
+        from core.tts.silero import SileroEngine
+        return SileroEngine(voice=settings.voice, threads=settings.threads, python=settings.silero_python or None,
+                            model=settings.silero_model or None, unload_minutes=settings.unload_minutes,
+                            effect_on=use_effect, pitch=settings.pitch, reverb=settings.reverb, player=player)
+    from core.tts.sherpa import SherpaEngine
     return SherpaEngine(voice=settings.voice, speed=settings.speed, threads=settings.threads, effect_on=use_effect,
                         pitch=settings.pitch, reverb=settings.reverb, models_dir=models or models_dir(), player=player)
 
 
 def build_tts(say, settings=None, models=None, player=None):
     settings = settings or tts_settings()
-    if settings.engine == "sherpa":
+    if settings.engine in ("sherpa", "silero"):
         return SpeechVoice(say, build_neural(settings, models, player))
     return SpeechVoice(say)

@@ -11,11 +11,10 @@ import importlib
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.tts import effect
-from core.tts.base import TTSEngine, TTSUnavailable
+from core.tts.base import NeuralResult, TTSEngine, TTSUnavailable  # noqa: F401 — NeuralResult импортируют отсюда
 from core.tts.player import AfplayPlayer, PlayResult, SentenceQueue, split_sentences
 
 log = logging.getLogger(__name__)
@@ -29,15 +28,6 @@ def _import_backend():
         return importlib.import_module("sherpa_onnx")
     except ImportError as e:
         raise TTSUnavailable("пакет sherpa-onnx не установлен") from e
-
-
-@dataclass
-class NeuralResult:
-    sentences: list = field(default_factory=list)
-    done: int = 0
-    error: bool = False
-    stopped: bool = False
-    tail: float = 0.0
 
 
 class SherpaEngine(TTSEngine):

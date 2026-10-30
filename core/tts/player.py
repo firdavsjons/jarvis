@@ -194,7 +194,8 @@ class PlayResult:
 
 
 class SentenceQueue:
-    """Синтез в фоне + воспроизведение по порядку. synthesize(sentence) -> (samples, rate); оба вызываются не в одном потоке."""
+    """Синтез в фоне + воспроизведение по порядку. synthesize(sentence) -> (samples, rate) или путь к готовому WAV (его удаляет
+    очередь после проигрывания); синтез и проигрывание идут в разных потоках."""
 
     def __init__(self, synthesize, player, wavs=None, lookahead=LOOKAHEAD):
         self.synthesize, self.player = synthesize, player
@@ -232,10 +233,13 @@ class SentenceQueue:
                 if self.generation != generation:
                     return
                 try:
-                    samples, rate = self.synthesize(sentence)
+                    result = self.synthesize(sentence)
                     if self.generation != generation:
+                        if isinstance(result, str):
+                            self.wavs.remove(result)
                         return                                    # запоздалый синтез после stop() отбрасывается
-                    path = self.wavs.write(samples, rate)
+                    # Движок отдаёт либо (samples, rate), либо путь к готовому WAV (Silero: файл пишет его процесс)
+                    path = result if isinstance(result, str) else self.wavs.write(*result)
                 except Exception as e:
                     log.warning("Нейронный голос: синтез предложения %d не удался (%s)", index + 1, type(e).__name__)
                     put(("error", index, None))

@@ -13,6 +13,8 @@
    Озвучка (Этап 9.2): загрузка настоящего sherpa_onnx (`core.tts.sherpa._import_backend`) бросает ForbiddenInTests;
    запись в ~/Library/Application Support/Jarvis/tts_samples запрещена общей защитой папки Jarvis; `afplay` и `say`
    без подмены Popen/run тоже (защита процессов). Тесты используют фальшивые движок и плеер.
+   Silero (Этап 9.4): запуск воркера (`core.tts.silero._spawn_worker`, процесс с интерпретатором окружения Silero и torch)
+   бросает ForbiddenInTests; тесты подменяют его фальшивым процессом с эмуляцией JSON-протокола.
 4. Паузы FallbackClient по умолчанию (2 с после 5xx, ожидание окна токенов) в тестах мгновенные; тест, проверяющий
    паузу, передаёт свой `sleep=`.
 Исключений (osacompile, py_compile) сейчас нет: тестам они не нужны. Если понадобятся — отдельным явным
@@ -190,6 +192,9 @@ def _block_speech_recognition():
     from core.tts import sherpa
     REAL_IMPORT_BACKEND["core.tts.sherpa"] = sherpa._import_backend
     sherpa._import_backend = _blocked_call("core.tts.sherpa._import_backend (загрузка нейронного голоса sherpa-onnx)")
+    from core.tts import silero
+    REAL_IMPORT_BACKEND["core.tts.silero"] = silero._spawn_worker
+    silero._spawn_worker = _blocked_call("core.tts.silero._spawn_worker (запуск воркера Silero с torch)")
 
 
 install()
